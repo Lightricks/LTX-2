@@ -363,6 +363,12 @@ Examples:
         default=0.3,
         help="Amount of noise to add before refinement (0=none, 1=full denoise). Default: 0.3",
     )
+    v2v_group.add_argument(
+        "--refine-steps",
+        type=int,
+        default=10,
+        help="Number of refinement steps for refine-only mode. Default: 10",
+    )
 
     # ==========================================================================
     # Advanced Options
@@ -586,6 +592,7 @@ class LTXVideoGeneratorWithOffloading:
         disable_audio: bool = False,
         input_video: str | None = None,
         refine_strength: float = 0.3,
+        refine_steps: int = 10,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None]:
         """
         Generate video with optional audio.
@@ -1011,7 +1018,15 @@ class LTXVideoGeneratorWithOffloading:
             )
             transformer = stage_2_ledger.transformer()
 
-        distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
+        # For refine-only mode, use the configurable refine_steps
+        # For normal two-stage, use the fixed distilled sigma values
+        if self.refine_only and input_video:
+            distilled_sigmas = LTX2Scheduler().execute(steps=refine_steps).to(
+                dtype=torch.float32, device=self.device
+            )
+            print(f">>> Using {refine_steps} refinement steps")
+        else:
+            distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
 
         # Define denoising function for stage 2 (no CFG, just positive)
         def second_stage_denoising_loop(
@@ -1192,6 +1207,7 @@ def main():
         disable_audio=args.disable_audio,
         input_video=args.input_video,
         refine_strength=args.refine_strength,
+        refine_steps=args.refine_steps,
     )
 
     # Encode and save video

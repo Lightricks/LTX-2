@@ -422,6 +422,8 @@ def format_metadata_display(metadata):
         lines.append(f"- **Input Video:** {metadata['input_video']}")
         if metadata.get("refine_strength") is not None:
             lines.append(f"- **Refine Strength:** {metadata['refine_strength']}")
+        if metadata.get("refine_steps") is not None:
+            lines.append(f"- **Refine Steps:** {metadata['refine_steps']}")
 
     # LoRA
     if metadata.get("user_lora"):
@@ -483,6 +485,7 @@ def generate_ltx_video(
     # Video input (for V2V / refine)
     input_video: str,
     refine_strength: float,
+    refine_steps: int,
     # Audio & prompt
     disable_audio: bool,
     enhance_prompt: bool,
@@ -604,6 +607,7 @@ def generate_ltx_video(
         if input_video:
             command.extend(["--input-video", str(input_video)])
             command.extend(["--refine-strength", str(float(refine_strength))])
+            command.extend(["--refine-steps", str(int(refine_steps))])
 
         # Image conditioning (I2V)
         if mode == "i2v" and input_image:
@@ -742,6 +746,7 @@ def generate_ltx_video(
                     "end_image_strength": float(end_image_strength) if end_image else None,
                     "input_video": os.path.basename(input_video) if input_video else None,
                     "refine_strength": float(refine_strength) if input_video else None,
+                    "refine_steps": int(refine_steps) if input_video else None,
                     "generation_time_seconds": round(elapsed, 2),
                 }
 
@@ -914,6 +919,11 @@ def create_interface():
                                     minimum=0.0, maximum=1.0, value=0.3, step=0.05,
                                     label="Refine Strength",
                                     info="Amount of noise to add before refinement (0=none, 1=full denoise)"
+                                )
+                                refine_steps = gr.Slider(
+                                    minimum=1, maximum=30, value=10, step=1,
+                                    label="Refine Steps",
+                                    info="Number of refinement denoising steps"
                                 )
 
 
@@ -1144,7 +1154,7 @@ def create_interface():
                 cfg_guidance_scale, num_inference_steps, seed,
                 input_image, image_frame_idx, image_strength,
                 end_image, end_image_strength,
-                input_video, refine_strength,
+                input_video, refine_strength, refine_steps,
                 disable_audio, enhance_prompt,
                 offload, enable_fp8, enable_block_swap, blocks_in_memory,
                 text_encoder_blocks_in_memory,
@@ -1174,7 +1184,7 @@ def create_interface():
         def send_to_generation_handler(metadata):
             """Send loaded metadata to generation tab parameters."""
             if not metadata:
-                return [gr.update()] * 17 + ["No metadata loaded - load a video first"]
+                return [gr.update()] * 18 + ["No metadata loaded - load a video first"]
 
             # Return updates for all generation parameters
             return [
@@ -1192,6 +1202,7 @@ def create_interface():
                 gr.update(value=metadata.get("image_strength", 0.9)),  # image_strength
                 gr.update(value=metadata.get("end_image_strength", 0.9)),  # end_image_strength
                 gr.update(value=metadata.get("refine_strength", 0.3)),  # refine_strength
+                gr.update(value=metadata.get("refine_steps", 10)),  # refine_steps
                 gr.update(value=metadata.get("offload", False)),  # offload
                 gr.update(value=metadata.get("enable_fp8", False)),  # enable_fp8
                 gr.update(value=metadata.get("enable_block_swap", True)),  # enable_block_swap
@@ -1205,7 +1216,7 @@ def create_interface():
                 prompt, negative_prompt, mode, pipeline,
                 width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, seed,
-                image_strength, end_image_strength, refine_strength,
+                image_strength, end_image_strength, refine_strength, refine_steps,
                 offload, enable_fp8, enable_block_swap,
                 info_status
             ]
