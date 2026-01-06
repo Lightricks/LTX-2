@@ -339,6 +339,116 @@ def update_video_dimensions(video_path):
     return "", gr.update(), gr.update(), gr.update(), gr.update()
 
 
+def load_video_metadata(video_path):
+    """Load metadata from video's JSON sidecar file."""
+    if not video_path:
+        return None, "No video selected"
+
+    # Try to find the metadata JSON file
+    meta_path = video_path.replace(".mp4", "_meta.json")
+    if not os.path.exists(meta_path):
+        # Try without extension replacement
+        meta_path = video_path + "_meta.json"
+
+    if not os.path.exists(meta_path):
+        return None, f"No metadata file found for: {os.path.basename(video_path)}"
+
+    try:
+        with open(meta_path, 'r') as f:
+            metadata = json.load(f)
+        return metadata, None
+    except Exception as e:
+        return None, f"Error reading metadata: {e}"
+
+
+def format_metadata_display(metadata):
+    """Format metadata for display in the UI."""
+    if not metadata:
+        return "No metadata available"
+
+    lines = []
+    lines.append("## Generation Parameters\n")
+
+    # Basic info
+    if metadata.get("model_type"):
+        lines.append(f"**Model:** {metadata['model_type']}")
+    if metadata.get("pipeline"):
+        lines.append(f"**Pipeline:** {metadata['pipeline']}")
+    if metadata.get("mode"):
+        lines.append(f"**Mode:** {metadata['mode']}")
+
+    lines.append("")
+
+    # Prompt
+    if metadata.get("prompt"):
+        lines.append(f"**Prompt:**\n> {metadata['prompt']}")
+    if metadata.get("negative_prompt"):
+        lines.append(f"\n**Negative Prompt:**\n> {metadata['negative_prompt']}")
+
+    lines.append("")
+    lines.append("### Settings")
+
+    # Resolution and frames
+    if metadata.get("width") and metadata.get("height"):
+        lines.append(f"- **Resolution:** {metadata['width']}x{metadata['height']}")
+    if metadata.get("num_frames"):
+        lines.append(f"- **Frames:** {metadata['num_frames']}")
+    if metadata.get("frame_rate"):
+        lines.append(f"- **Frame Rate:** {metadata['frame_rate']} fps")
+    if metadata.get("seed") is not None:
+        lines.append(f"- **Seed:** {metadata['seed']}")
+
+    # Generation settings
+    if metadata.get("cfg_guidance_scale"):
+        lines.append(f"- **CFG Scale:** {metadata['cfg_guidance_scale']}")
+    if metadata.get("num_inference_steps"):
+        lines.append(f"- **Steps:** {metadata['num_inference_steps']}")
+
+    # Image conditioning
+    if metadata.get("input_image"):
+        lines.append(f"- **Input Image:** {metadata['input_image']}")
+        if metadata.get("image_frame_idx") is not None:
+            lines.append(f"- **Image Frame Index:** {metadata['image_frame_idx']}")
+        if metadata.get("image_strength") is not None:
+            lines.append(f"- **Image Strength:** {metadata['image_strength']}")
+
+    if metadata.get("end_image"):
+        lines.append(f"- **End Image:** {metadata['end_image']}")
+        if metadata.get("end_image_strength") is not None:
+            lines.append(f"- **End Image Strength:** {metadata['end_image_strength']}")
+
+    # Video input
+    if metadata.get("input_video"):
+        lines.append(f"- **Input Video:** {metadata['input_video']}")
+        if metadata.get("refine_strength") is not None:
+            lines.append(f"- **Refine Strength:** {metadata['refine_strength']}")
+
+    # LoRA
+    if metadata.get("user_lora"):
+        lines.append(f"- **User LoRA:** {metadata['user_lora']}")
+        if metadata.get("user_lora_strength") is not None:
+            lines.append(f"- **LoRA Strength:** {metadata['user_lora_strength']}")
+
+    # Memory settings
+    lines.append("")
+    lines.append("### Memory Settings")
+    if metadata.get("offload") is not None:
+        lines.append(f"- **CPU Offloading:** {metadata['offload']}")
+    if metadata.get("enable_fp8") is not None:
+        lines.append(f"- **FP8 Mode:** {metadata['enable_fp8']}")
+    if metadata.get("enable_block_swap") is not None:
+        lines.append(f"- **Block Swapping:** {metadata['enable_block_swap']}")
+        if metadata.get("blocks_in_memory"):
+            lines.append(f"- **Blocks in Memory:** {metadata['blocks_in_memory']}")
+
+    # Generation time
+    if metadata.get("generation_time_seconds"):
+        lines.append("")
+        lines.append(f"**Generation Time:** {metadata['generation_time_seconds']:.1f}s")
+
+    return "\n".join(lines)
+
+
 # =============================================================================
 # Video Generation
 # =============================================================================
@@ -873,7 +983,26 @@ def create_interface():
                             save_path = gr.Textbox(label="Output Folder", value="outputs")                                       
 
             # =================================================================
-            # Settings Tab
+            # Video Info Tab
+            # =================================================================
+            with gr.Tab("Video Info"):
+                gr.Markdown("## Video Metadata Viewer\nLoad a generated video to view its parameters and optionally send them to the generation tab.")
+
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        info_video_input = gr.Video(label="Select Video", sources=["upload"])
+                        info_load_btn = gr.Button("Load Metadata", variant="primary")
+                        info_send_btn = gr.Button("Send to Generation", variant="secondary")
+                        info_status = gr.Textbox(label="Status", interactive=False)
+
+                    with gr.Column(scale=2):
+                        info_metadata_display = gr.Markdown("Select a video and click 'Load Metadata' to view its generation parameters.")
+
+                # Hidden state to store loaded metadata
+                info_metadata_state = gr.State(value=None)
+
+            # =================================================================
+            # Help Tab
             # =================================================================
             with gr.Tab("Help"):
                 gr.Markdown("""
@@ -1023,6 +1152,63 @@ def create_interface():
                 save_path, batch_size
             ],
             outputs=[output_gallery, gr.State(), status_text, progress_text]
+        )
+
+        # =================================================================
+        # Video Info Tab Event Handlers
+        # =================================================================
+        def load_metadata_handler(video_path):
+            """Load and display metadata for selected video."""
+            metadata, error = load_video_metadata(video_path)
+            if error:
+                return None, error, "No metadata loaded"
+            display_text = format_metadata_display(metadata)
+            return metadata, "Metadata loaded successfully", display_text
+
+        info_load_btn.click(
+            fn=load_metadata_handler,
+            inputs=[info_video_input],
+            outputs=[info_metadata_state, info_status, info_metadata_display]
+        )
+
+        def send_to_generation_handler(metadata):
+            """Send loaded metadata to generation tab parameters."""
+            if not metadata:
+                return [gr.update()] * 17 + ["No metadata loaded - load a video first"]
+
+            # Return updates for all generation parameters
+            return [
+                gr.update(value=metadata.get("prompt", "")),  # prompt
+                gr.update(value=metadata.get("negative_prompt", "")),  # negative_prompt
+                gr.update(value=metadata.get("mode", "t2v")),  # mode
+                gr.update(value=metadata.get("pipeline", "two-stage")),  # pipeline
+                gr.update(value=metadata.get("width", 1024)),  # width
+                gr.update(value=metadata.get("height", 1024)),  # height
+                gr.update(value=metadata.get("num_frames", 121)),  # num_frames
+                gr.update(value=metadata.get("frame_rate", 24)),  # frame_rate
+                gr.update(value=metadata.get("cfg_guidance_scale", 4.0)),  # cfg_guidance_scale
+                gr.update(value=metadata.get("num_inference_steps", 40)),  # num_inference_steps
+                gr.update(value=metadata.get("seed", -1)),  # seed
+                gr.update(value=metadata.get("image_strength", 0.9)),  # image_strength
+                gr.update(value=metadata.get("end_image_strength", 0.9)),  # end_image_strength
+                gr.update(value=metadata.get("refine_strength", 0.3)),  # refine_strength
+                gr.update(value=metadata.get("offload", False)),  # offload
+                gr.update(value=metadata.get("enable_fp8", False)),  # enable_fp8
+                gr.update(value=metadata.get("enable_block_swap", True)),  # enable_block_swap
+                "Parameters sent to Generation tab"  # status
+            ]
+
+        info_send_btn.click(
+            fn=send_to_generation_handler,
+            inputs=[info_metadata_state],
+            outputs=[
+                prompt, negative_prompt, mode, pipeline,
+                width, height, num_frames, frame_rate,
+                cfg_guidance_scale, num_inference_steps, seed,
+                image_strength, end_image_strength, refine_strength,
+                offload, enable_fp8, enable_block_swap,
+                info_status
+            ]
         )
 
         return demo
