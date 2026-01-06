@@ -753,11 +753,11 @@ def create_interface():
         gr.Markdown("# LTX-2 Video Generator")
         gr.Markdown("Two-stage pipeline with joint audio-video generation")
 
-        with gr.Tabs():
+        with gr.Tabs() as tabs:
             # =================================================================
             # Generation Tab
             # =================================================================
-            with gr.Tab("Generation"):
+            with gr.Tab("Generation", id="gen_tab"):
                 with gr.Row():
                     # Left column - Inputs
                     with gr.Column(scale=3):
@@ -1010,7 +1010,7 @@ def create_interface():
 
         # Random seed button
         random_seed_btn.click(
-            fn=lambda: random.randint(0, 2**32 - 1),
+            fn=lambda: -1,
             outputs=[seed]
         )
 
@@ -1119,15 +1119,16 @@ def create_interface():
         )
 
         def send_to_generation_handler(metadata):
-            """Send loaded metadata to generation tab parameters."""
+            """Send loaded metadata to generation tab parameters and switch to Generation tab."""
             if not metadata:
-                return [gr.update()] * 21 + ["No metadata loaded - upload a video first"]
+                return [gr.update()] * 22 + ["No metadata loaded - upload a video first"]
 
             # Handle legacy metadata that used single enable_block_swap
             legacy_block_swap = metadata.get("enable_block_swap", True)
 
-            # Return updates for all generation parameters
+            # Return updates for all generation parameters (first output switches tab)
             return [
+                gr.Tabs(selected="gen_tab"),  # Switch to Generation tab
                 gr.update(value=metadata.get("prompt", "")),  # prompt
                 gr.update(value=metadata.get("negative_prompt", "")),  # negative_prompt
                 gr.update(value=metadata.get("mode", "t2v")),  # mode
@@ -1155,6 +1156,7 @@ def create_interface():
             fn=send_to_generation_handler,
             inputs=[info_metadata_output],
             outputs=[
+                tabs,  # Switch tab
                 prompt, negative_prompt, mode, pipeline,
                 width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, seed,
