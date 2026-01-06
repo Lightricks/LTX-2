@@ -28,6 +28,7 @@ import re
 from typing import Generator, List, Tuple, Optional, Dict
 import threading
 import json
+from PIL import Image
 
 # Global state
 stop_event = threading.Event()
@@ -50,6 +51,16 @@ def parse_ltx_progress_line(line: str) -> Optional[str]:
         return "Enhancing prompt with Gemma..."
     if ">>> Encoding prompts" in line:
         return "Encoding text prompts..."
+    # One-stage pipeline
+    if ">>> One-stage: Loading" in line:
+        return "One-stage: Loading models..."
+    if ">>> One-stage: Generating" in line:
+        return "One-stage: Generating at full resolution..."
+    if ">>> One-stage completed" in line:
+        match = re.search(r'(\d+\.?\d*)s', line)
+        if match:
+            return f"One-stage completed ({match.group(1)}s)"
+    # Two-stage pipeline
     if ">>> Stage 1: Loading" in line:
         return "Stage 1: Loading models..."
     if ">>> Stage 1: Generating" in line:
@@ -140,14 +151,20 @@ def validate_resolution(width: int, height: int) -> Optional[str]:
 
 
 def validate_model_paths(checkpoint_path: str, spatial_upsampler_path: str,
-                         distilled_lora_path: str, gemma_root: str) -> Optional[str]:
+                         distilled_lora_path: str, gemma_root: str,
+                         is_one_stage: bool = False) -> Optional[str]:
     """Validate all required model paths exist."""
+    # Core paths required for all pipelines
     paths = [
         ("LTX Checkpoint", checkpoint_path),
-        ("Spatial Upsampler", spatial_upsampler_path),
-        ("Distilled LoRA", distilled_lora_path),
         ("Gemma Root", gemma_root),
     ]
+    # Two-stage specific paths
+    if not is_one_stage:
+        paths.extend([
+            ("Spatial Upsampler", spatial_upsampler_path),
+            ("Distilled LoRA", distilled_lora_path),
+        ])
     for name, path in paths:
         if not path or not path.strip():
             return f"Error: {name} path is required"
@@ -172,6 +189,7 @@ def generate_ltx_video(
     distilled_lora_strength: float,
     # Generation parameters
     mode: str,
+    pipeline: str,
     width: int,
     height: int,
     num_frames: int,
@@ -221,8 +239,10 @@ def generate_ltx_video(
         yield [], None, error, ""
         return
 
+    is_one_stage = (pipeline == "one-stage")
     error = validate_model_paths(checkpoint_path, spatial_upsampler_path,
-                                  distilled_lora_path, gemma_root)
+                                  distilled_lora_path, gemma_root,
+                                  is_one_stage=is_one_stage)
     if error:
         yield [], None, error, ""
         return
@@ -261,8 +281,6 @@ def generate_ltx_video(
             sys.executable, "ltx_generate_video.py",
             "--checkpoint-path", checkpoint_path,
             "--gemma-root", gemma_root,
-            "--spatial-upsampler-path", spatial_upsampler_path,
-            "--distilled-lora", distilled_lora_path, str(distilled_lora_strength),
             "--prompt", str(prompt),
             "--negative-prompt", str(negative_prompt),
             "--num-frames", str(int(num_frames)),
@@ -274,6 +292,14 @@ def generate_ltx_video(
             "--seed", str(current_seed),
             "--output-path", output_filename,
         ]
+
+        # Pipeline selection
+        if is_one_stage:
+            command.append("--one-stage")
+        else:
+            # Two-stage specific: spatial upsampler and distilled LoRA
+            command.extend(["--spatial-upsampler-path", spatial_upsampler_path])
+            command.extend(["--distilled-lora", distilled_lora_path, str(distilled_lora_strength)])
 
         # Image conditioning (I2V)
         if mode == "i2v" and input_image:
@@ -382,7 +408,7 @@ def generate_ltx_video(
                 # Save metadata
                 params_for_meta = {
                     "model_type": "LTX-2",
-                    "pipeline": "two_stage",
+                    "pipeline": pipeline,
                     "mode": mode,
                     "prompt": prompt,
                     "negative_prompt": negative_prompt,
@@ -545,12 +571,19 @@ def create_interface():
 
                         # Generation Parameters
                         with gr.Accordion("Generation Parameters", open=True):
-                            mode = gr.Dropdown(
-                                label="Mode",
-                                choices=["t2v", "i2v"],
-                                value="t2v",
-                                info="t2v = text-to-video, i2v = image-to-video"
-                            )
+                            with gr.Row():
+                                mode = gr.Dropdown(
+                                    label="Mode",
+                                    choices=["t2v", "i2v"],
+                                    value="t2v",
+                                    info="t2v = text-to-video, i2v = image-to-video"
+                                )
+                                pipeline = gr.Dropdown(
+                                    label="Pipeline",
+                                    choices=["two-stage", "one-stage"],
+                                    value="two-stage",
+                                    info="two-stage = higher quality, one-stage = faster"
+                                )
                             with gr.Row():
                                 width = gr.Number(label="Width", value=1024, step=64, info="Must be divisible by 64")
                                 height = gr.Number(label="Height", value=1024, step=64, info="Must be divisible by 64")
@@ -624,11 +657,19 @@ def create_interface():
                 ## LTX-2 Video Generation Help
 
                 ### Required Model Files
-                You need 4 model files to run LTX-2:
+                **For two-stage pipeline** (default, higher quality):
                 1. **LTX Checkpoint** - Main 19B model (.safetensors)
                 2. **Gemma Root** - Text encoder directory
                 3. **Spatial Upsampler** - For 2x resolution upscaling
                 4. **Distilled LoRA** - For stage 2 refinement
+
+                **For one-stage pipeline** (faster):
+                1. **LTX Checkpoint** - Main 19B model (.safetensors)
+                2. **Gemma Root** - Text encoder directory
+
+                ### Pipeline Options
+                - **Two-stage** (default): Generates at half resolution, upsamples 2x, then refines with distilled LoRA. Higher quality output.
+                - **One-stage**: Generates directly at full resolution in a single pass. Faster but may have less detail.
 
                 ### Generation Modes
                 - **T2V (Text-to-Video)**: Generate video from text prompt only
@@ -697,7 +738,7 @@ def create_interface():
                 prompt, negative_prompt,
                 checkpoint_path, gemma_root, spatial_upsampler_path,
                 distilled_lora_path, distilled_lora_strength,
-                mode, width, height, num_frames, frame_rate,
+                mode, pipeline, width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, seed,
                 input_image, image_frame_idx, image_strength,
                 disable_audio, enhance_prompt,

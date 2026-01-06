@@ -331,6 +331,17 @@ Examples:
     )
 
     # ==========================================================================
+    # Pipeline Selection
+    # ==========================================================================
+    pipeline_group = parser.add_argument_group("Pipeline Selection")
+    pipeline_group.add_argument(
+        "--one-stage",
+        action="store_true",
+        help="Use one-stage pipeline (faster, generates at full resolution directly). "
+             "Default is two-stage (half res + upsample + refine).",
+    )
+
+    # ==========================================================================
     # Advanced Options
     # ==========================================================================
     adv_group = parser.add_argument_group("Advanced Options")
@@ -491,6 +502,7 @@ class LTXVideoGeneratorWithOffloading:
         enable_block_swap: bool = False,
         blocks_in_memory: int = 6,
         text_encoder_blocks_in_memory: int = 6,
+        one_stage: bool = False,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
@@ -498,6 +510,7 @@ class LTXVideoGeneratorWithOffloading:
         self.enable_block_swap = enable_block_swap
         self.blocks_in_memory = blocks_in_memory
         self.text_encoder_blocks_in_memory = text_encoder_blocks_in_memory
+        self.one_stage = one_stage
 
         # Create model ledger for stage 1
         self.stage_1_model_ledger = ModelLedger(
@@ -554,7 +567,7 @@ class LTXVideoGeneratorWithOffloading:
             Tuple of (video_iterator, audio_tensor or None)
         """
         # Validate resolution
-        assert_resolution(height=height, width=width, is_two_stage=True)
+        assert_resolution(height=height, width=width, is_two_stage=not self.one_stage)
 
         # Initialize diffusion components
         generator = torch.Generator(device=self.device).manual_seed(seed)
@@ -700,14 +713,23 @@ class LTXVideoGeneratorWithOffloading:
                 ),
             )
 
-        # Stage 1 output shape (half resolution)
-        stage_1_output_shape = VideoPixelShape(
-            batch=1,
-            frames=num_frames,
-            width=width // 2,
-            height=height // 2,
-            fps=frame_rate,
-        )
+        # Stage 1 output shape (half resolution for two-stage, full for one-stage)
+        if self.one_stage:
+            stage_1_output_shape = VideoPixelShape(
+                batch=1,
+                frames=num_frames,
+                width=width,
+                height=height,
+                fps=frame_rate,
+            )
+        else:
+            stage_1_output_shape = VideoPixelShape(
+                batch=1,
+                frames=num_frames,
+                width=width // 2,
+                height=height // 2,
+                fps=frame_rate,
+            )
 
         # Image conditioning for stage 1
         stage_1_conditionings = image_conditionings_by_replacing_latent(
@@ -719,7 +741,8 @@ class LTXVideoGeneratorWithOffloading:
             device=self.device,
         )
 
-        print(f">>> Stage 1: Generating at {stage_1_output_shape.width}x{stage_1_output_shape.height}...")
+        stage_label = "One-stage" if self.one_stage else "Stage 1"
+        print(f">>> {stage_label}: Generating at {stage_1_output_shape.width}x{stage_1_output_shape.height}...")
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_1_output_shape,
             conditionings=stage_1_conditionings,
@@ -732,7 +755,7 @@ class LTXVideoGeneratorWithOffloading:
             device=self.device,
         )
 
-        print(f">>> Stage 1 completed in {time.time() - stage1_start:.1f}s", flush=True)
+        print(f">>> {stage_label} completed in {time.time() - stage1_start:.1f}s", flush=True)
 
         # Cleanup stage 1 transformer
         if block_swap_manager:
@@ -754,8 +777,39 @@ class LTXVideoGeneratorWithOffloading:
         transformer = None
         cleanup_memory()
 
+        # For one-stage, skip upsampling and stage 2 refinement
+        if self.one_stage:
+            # Cleanup video encoder
+            video_encoder = None
+            cleanup_memory()
+
+            # Skip directly to VAE decoding
+            print(">>> Decoding video...")
+            decode_start = time.time()
+
+            decoded_video = vae_decode_video(
+                video_state.latent,
+                self.stage_1_model_ledger.video_decoder(),
+                tiling_config,
+            )
+
+            if not disable_audio:
+                print(">>> Decoding audio...")
+                decoded_audio = vae_decode_audio(
+                    audio_state.latent,
+                    self.stage_1_model_ledger.audio_decoder(),
+                    self.stage_1_model_ledger.vocoder(),
+                )
+            else:
+                decoded_audio = None
+
+            print(f">>> Decoding completed in {time.time() - decode_start:.1f}s")
+            print(f">>> Total generation time: {time.time() - start_time:.1f}s")
+
+            return decoded_video, decoded_audio
+
         # =====================================================================
-        # Phase 3: Spatial Upsampling
+        # Phase 3: Spatial Upsampling (two-stage only)
         # =====================================================================
         print(">>> Upsampling latents (2x)...", flush=True)
         upsample_start = time.time()
@@ -772,7 +826,7 @@ class LTXVideoGeneratorWithOffloading:
         print(f">>> Upsampling completed in {time.time() - upsample_start:.1f}s", flush=True)
 
         # =====================================================================
-        # Phase 4: Stage 2 - High Resolution Refinement
+        # Phase 4: Stage 2 - High Resolution Refinement (two-stage only)
         # =====================================================================
         print(">>> Stage 2: Loading transformer with distilled LoRA...", flush=True)
         stage2_start = time.time()
@@ -1012,9 +1066,11 @@ def main():
             LTXV_LORA_COMFY_RENAMING_MAP
         )]
 
+    pipeline_type = "one-stage" if args.one_stage else "two-stage"
     print("=" * 60)
     print("LTX-2 Video Generation")
     print("=" * 60)
+    print(f"Pipeline: {pipeline_type}")
     print(f"Checkpoint: {args.checkpoint_path}")
     print(f"Output: {args.output_path}")
     print(f"Resolution: {args.width}x{args.height}")
@@ -1040,6 +1096,7 @@ def main():
         enable_block_swap=args.enable_block_swap,
         blocks_in_memory=args.blocks_in_memory,
         text_encoder_blocks_in_memory=args.text_encoder_blocks_in_memory,
+        one_stage=args.one_stage,
     )
 
     # Set up tiling config for VAE
