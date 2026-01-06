@@ -93,13 +93,9 @@ def enable_block_swap(
         offloader = self._block_swap_offloader
         blocks = self._blocks_ref  # Use stored reference, not a copy
 
-        print(f"[BlockSwap] Starting forward pass with {len(self.transformer_blocks)} blocks", flush=True)
-
         for block_idx, block in enumerate(self.transformer_blocks):
             # Wait for this block to be ready BEFORE using it
-            print(f"[BlockSwap] Block {block_idx}: waiting...", flush=True)
             offloader.wait_for_block(block_idx)
-            print(f"[BlockSwap] Block {block_idx}: ready, processing...", flush=True)
 
             # Process the block
             video, audio = block(
@@ -107,12 +103,10 @@ def enable_block_swap(
                 audio=audio,
                 perturbations=perturbations,
             )
-            print(f"[BlockSwap] Block {block_idx}: done, submitting swap...", flush=True)
 
             # Submit swap for next iteration AFTER using block
             offloader.submit_move_blocks_forward(blocks, block_idx)
 
-        print(f"[BlockSwap] Forward pass complete", flush=True)
         return video, audio
 
     # Monkey-patch the method
@@ -181,14 +175,13 @@ def get_block_swap_offloader(model: X0Model | LTXModel) -> ModelOffloader | None
 
 def offload_all_blocks(model: X0Model | LTXModel) -> None:
     """
-    Offload all transformer blocks to CPU.
+    Offload all transformer blocks to CPU and cleanup the offloader.
 
     Used to free GPU memory after inference is complete.
 
     Args:
         model: Model with block swapping enabled.
     """
-    print("[BlockSwap] offload_all_blocks called", flush=True)
     if isinstance(model, X0Model):
         ltx_model = model.velocity_model
     else:
@@ -196,30 +189,30 @@ def offload_all_blocks(model: X0Model | LTXModel) -> None:
 
     offloader = getattr(ltx_model, "_block_swap_offloader", None)
     if offloader is None:
-        print("[BlockSwap] No offloader found, returning", flush=True)
         return
 
-    # Wait for any pending operations
-    print(f"[BlockSwap] Waiting for pending futures: {list(offloader.futures.keys())}", flush=True)
+    device = offloader.device
+
+    # Wait for any pending async operations
     for idx in range(len(ltx_model.transformer_blocks)):
         if idx in offloader.futures:
-            print(f"[BlockSwap] Waiting for block {idx}...", flush=True)
             offloader._wait_blocks_move(idx)
-            print(f"[BlockSwap] Block {idx} wait complete", flush=True)
 
-    # Shutdown the ThreadPoolExecutor to prevent hang on deletion
-    print("[BlockSwap] Shutting down thread pool...", flush=True)
+    # Shutdown the ThreadPoolExecutor
     offloader.thread_pool.shutdown(wait=True)
     offloader.futures.clear()
-    print("[BlockSwap] Thread pool shutdown complete", flush=True)
+
+    # Synchronize CUDA before moving blocks
+    if device.type == "cuda":
+        torch.cuda.synchronize()
 
     # Move all blocks to CPU
-    print("[BlockSwap] Moving all blocks to CPU...", flush=True)
-    for i, block in enumerate(ltx_model.transformer_blocks):
+    for block in ltx_model.transformer_blocks:
         weighs_to_device(block, "cpu")
-        if i % 10 == 0:
-            print(f"[BlockSwap] Moved block {i} to CPU", flush=True)
 
-    print("[BlockSwap] Cleaning memory...", flush=True)
-    clean_memory_on_device(offloader.device)
+    # Synchronize again after moves complete
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    clean_memory_on_device(device)
     print("[BlockSwap] All blocks offloaded to CPU")

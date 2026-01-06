@@ -594,24 +594,29 @@ class LTXVideoGeneratorWithOffloading:
         print(f">>> Stage 1 completed in {time.time() - stage1_start:.1f}s", flush=True)
 
         # Cleanup stage 1 transformer
-        print(">>> DEBUG: About to cleanup stage 1 transformer", flush=True)
         if block_swap_manager:
-            print(">>> DEBUG: Calling offload_all_blocks", flush=True)
             offload_all_blocks(transformer)
-            print(">>> DEBUG: offload_all_blocks returned", flush=True)
+            # Clear offloader references from transformer to break reference cycle
+            if hasattr(transformer, 'velocity_model'):
+                if hasattr(transformer.velocity_model, '_block_swap_offloader'):
+                    transformer.velocity_model._block_swap_offloader = None
+                if hasattr(transformer.velocity_model, '_blocks_ref'):
+                    transformer.velocity_model._blocks_ref = None
+            if hasattr(transformer, '_block_swap_offloader'):
+                transformer._block_swap_offloader = None
+            if hasattr(transformer, '_blocks_ref'):
+                transformer._blocks_ref = None
+            block_swap_manager = None
         if self.offload:
             print(">>> Offloading stage 1 transformer to CPU...")
-        print(">>> DEBUG: About to delete transformer", flush=True)
-        del transformer
-        del block_swap_manager
-        print(">>> DEBUG: About to cleanup_memory", flush=True)
+        # Set to None instead of del to avoid GC issues
+        transformer = None
         cleanup_memory()
-        print(">>> DEBUG: Stage 1 cleanup complete", flush=True)
 
         # =====================================================================
         # Phase 3: Spatial Upsampling
         # =====================================================================
-        print(">>> Upsampling latents (2x)...")
+        print(">>> Upsampling latents (2x)...", flush=True)
         upsample_start = time.time()
 
         upscaled_video_latent = upsample_video(
@@ -742,10 +747,20 @@ class LTXVideoGeneratorWithOffloading:
         # Cleanup stage 2 models
         if block_swap_manager:
             offload_all_blocks(transformer)
+            # Clear offloader references to break reference cycle
+            if hasattr(transformer, 'velocity_model'):
+                if hasattr(transformer.velocity_model, '_block_swap_offloader'):
+                    transformer.velocity_model._block_swap_offloader = None
+                if hasattr(transformer.velocity_model, '_blocks_ref'):
+                    transformer.velocity_model._blocks_ref = None
+            if hasattr(transformer, '_block_swap_offloader'):
+                transformer._block_swap_offloader = None
+            if hasattr(transformer, '_blocks_ref'):
+                transformer._blocks_ref = None
+            block_swap_manager = None
         torch.cuda.synchronize()
-        del transformer
-        del block_swap_manager
-        del video_encoder
+        transformer = None
+        video_encoder = None
         cleanup_memory()
 
         # =====================================================================
