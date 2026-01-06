@@ -820,6 +820,8 @@ class LTXVideoGeneratorWithOffloading:
                 chunk_frames=65,  # 8*8 + 1 frames per chunk
                 overlap_frames=8,  # 1 latent token overlap
             )
+            # Ensure video latent is in the correct dtype for the pipeline
+            upscaled_video_latent = upscaled_video_latent.to(dtype=dtype)
 
             # Extract and encode audio from input video (like stage 1 would)
             audio_latent = None
@@ -1324,6 +1326,35 @@ class LTXVideoGeneratorWithOffloading:
 # Main Entry Point
 # =============================================================================
 
+def add_metadata_to_video(video_path: str, parameters: dict) -> None:
+    """Add generation parameters to video metadata using ffmpeg."""
+    import json
+    import subprocess
+
+    params_json = json.dumps(parameters, indent=2)
+    temp_path = video_path.replace(".mp4", "_temp.mp4")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-metadata", f"comment={params_json}",
+        "-codec", "copy",
+        temp_path
+    ]
+
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        os.replace(temp_path, video_path)
+    except subprocess.CalledProcessError as e:
+        print(f"Warning: Failed to add metadata: {e.stderr.decode() if e.stderr else e}")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+    except Exception as e:
+        print(f"Warning: Failed to add metadata: {e}")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
 @torch.inference_mode()
 def main():
     """Main entry point for LTX-2 video generation."""
@@ -1413,6 +1444,39 @@ def main():
     )
 
     print(f">>> Video saved in {time.time() - encode_start:.1f}s")
+
+    # Build and save metadata
+    metadata = {
+        "model_type": "LTX-2",
+        "pipeline": "refine-only" if args.refine_only else ("one-stage" if args.one_stage else "two-stage"),
+        "checkpoint_path": args.checkpoint_path,
+        "prompt": args.prompt,
+        "negative_prompt": args.negative_prompt,
+        "width": args.width,
+        "height": args.height,
+        "num_frames": args.num_frames,
+        "frame_rate": args.frame_rate,
+        "cfg_guidance_scale": args.cfg_guidance_scale,
+        "num_inference_steps": args.num_inference_steps,
+        "seed": args.seed,
+        "offload": args.offload,
+        "enable_fp8": args.enable_fp8,
+        "enable_block_swap": args.enable_block_swap,
+        "blocks_in_memory": args.blocks_in_memory if args.enable_block_swap else None,
+        "text_encoder_blocks_in_memory": args.text_encoder_blocks_in_memory if args.enable_block_swap else None,
+        "images": [(img[0], img[1], img[2]) for img in args.images] if args.images else None,
+        "loras": [(lora.path, lora.strength) for lora in args.loras] if args.loras else None,
+        "distilled_lora": [(lora.path, lora.strength) for lora in args.distilled_lora] if args.distilled_lora else None,
+        "input_video": args.input_video,
+        "refine_strength": args.refine_strength if args.input_video else None,
+        "refine_steps": args.refine_steps if args.input_video else None,
+        "disable_audio": args.disable_audio,
+        "enhance_prompt": args.enhance_prompt,
+    }
+
+    print(">>> Adding metadata to video...")
+    add_metadata_to_video(args.output_path, metadata)
+
     print(f">>> Output: {args.output_path}")
     print(">>> Done!")
 

@@ -339,19 +339,35 @@ def update_video_dimensions(video_path):
     return "", gr.update(), gr.update(), gr.update(), gr.update()
 
 
+def extract_video_metadata(video_path: str) -> dict:
+    """Extract metadata from video file using PyAV."""
+    try:
+        import av
+        with av.open(video_path) as container:
+            comment = container.metadata.get('comment', '{}')
+            return json.loads(comment)
+    except Exception as e:
+        print(f"Metadata extraction failed: {e}")
+        return {}
+
+
 def load_video_metadata(video_path):
-    """Load metadata from video's JSON sidecar file."""
+    """Load metadata from video file or JSON sidecar file."""
     if not video_path:
         return None, "No video selected"
 
-    # Try to find the metadata JSON file
+    # First try to extract metadata embedded in video file
+    metadata = extract_video_metadata(video_path)
+    if metadata:
+        return metadata, None
+
+    # Fall back to JSON sidecar file for backwards compatibility
     meta_path = video_path.replace(".mp4", "_meta.json")
     if not os.path.exists(meta_path):
-        # Try without extension replacement
         meta_path = video_path + "_meta.json"
 
     if not os.path.exists(meta_path):
-        return None, f"No metadata file found for: {os.path.basename(video_path)}"
+        return None, f"No metadata found for: {os.path.basename(video_path)}"
 
     try:
         with open(meta_path, 'r') as f:
@@ -718,45 +734,8 @@ def generate_ltx_video(
             elapsed = time.perf_counter() - start_time
 
             if return_code == 0 and os.path.exists(output_filename):
-                # Save metadata
-                params_for_meta = {
-                    "model_type": "LTX-2",
-                    "pipeline": pipeline,
-                    "mode": mode,
-                    "prompt": prompt,
-                    "negative_prompt": negative_prompt,
-                    "width": int(width),
-                    "height": int(height),
-                    "num_frames": int(num_frames),
-                    "frame_rate": float(frame_rate),
-                    "cfg_guidance_scale": float(cfg_guidance_scale),
-                    "num_inference_steps": int(num_inference_steps),
-                    "seed": current_seed,
-                    "audio_enabled": not disable_audio,
-                    "prompt_enhanced": enhance_prompt,
-                    "offload": offload,
-                    "enable_fp8": enable_fp8,
-                    "enable_block_swap": enable_block_swap,
-                    "blocks_in_memory": int(blocks_in_memory) if enable_block_swap else None,
-                    "text_encoder_blocks_in_memory": int(text_encoder_blocks_in_memory) if enable_block_swap else None,
-                    "distilled_lora_strength": float(distilled_lora_strength),
-                    "user_lora": user_lora if user_lora != "None" else None,
-                    "user_lora_strength": float(user_lora_strength) if user_lora != "None" else None,
-                    "end_image": os.path.basename(end_image) if end_image else None,
-                    "end_image_strength": float(end_image_strength) if end_image else None,
-                    "input_video": os.path.basename(input_video) if input_video else None,
-                    "refine_strength": float(refine_strength) if input_video else None,
-                    "refine_steps": int(refine_steps) if input_video else None,
-                    "generation_time_seconds": round(elapsed, 2),
-                }
-
-                # Write metadata to JSON sidecar
-                meta_path = output_filename.replace(".mp4", "_meta.json")
-                try:
-                    with open(meta_path, "w") as f:
-                        json.dump(params_for_meta, f, indent=2)
-                except:
-                    pass
+                # Metadata is now saved by the backend (ltx_generate_video.py)
+                # embedded directly in the video file's comment metadata
 
                 label = f"Seed: {current_seed} | {elapsed:.1f}s"
                 all_generated_videos.append((output_filename, label))
