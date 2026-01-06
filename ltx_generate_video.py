@@ -841,8 +841,14 @@ class LTXVideoGeneratorWithOffloading:
                         n_fft=audio_encoder.n_fft,
                     ).to(self.device)
 
-                    # Add batch dimension if needed
-                    if waveform.dim() == 2:
+                    # Reshape waveform to [batch, channels, total_samples]
+                    # decode_audio_from_file returns [num_frames, channels, samples_per_frame]
+                    if waveform.dim() == 3:
+                        # Flatten frames into samples: [num_frames, channels, samples] -> [1, channels, total_samples]
+                        num_frames_audio, channels, samples_per_frame = waveform.shape
+                        waveform = waveform.permute(1, 0, 2).reshape(channels, -1).unsqueeze(0)
+                    elif waveform.dim() == 2:
+                        # [channels, samples] -> [1, channels, samples]
                         waveform = waveform.unsqueeze(0)
 
                     # Get sample rate from the video file
