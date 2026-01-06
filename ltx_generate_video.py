@@ -1209,10 +1209,14 @@ class LTXVideoGeneratorWithOffloading:
         # For refine-only mode, use the configurable refine_steps
         # For normal two-stage, use the fixed distilled sigma values
         if self.refine_only and input_video:
-            distilled_sigmas = LTX2Scheduler().execute(steps=refine_steps).to(
+            # Generate base sigma schedule (1.0 to 0.0)
+            base_sigmas = LTX2Scheduler().execute(steps=refine_steps).to(
                 dtype=torch.float32, device=self.device
             )
-            print(f">>> Using {refine_steps} refinement steps")
+            # Scale sigmas by refine_strength so they start from refine_strength instead of 1.0
+            # This preserves (1 - refine_strength) of the input content
+            distilled_sigmas = base_sigmas * refine_strength
+            print(f">>> Using {refine_steps} refinement steps with strength {refine_strength}")
         else:
             distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
 
