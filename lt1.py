@@ -556,7 +556,7 @@ def create_interface():
                                 frame_rate = gr.Slider(minimum=12, maximum=60, value=24, step=1, label="Frame Rate")
                             with gr.Row():
                                 cfg_guidance_scale = gr.Slider(minimum=1.0, maximum=15.0, value=4.0, step=0.5, label="CFG Scale")
-                                num_inference_steps = gr.Slider(minimum=10, maximum=60, value=40, step=1, label="Inference Steps")
+                                num_inference_steps = gr.Slider(minimum=1, maximum=60, value=40, step=1, label="Inference Steps")
 
                         # Image Conditioning (I2V)
                         with gr.Accordion("Image Conditioning (I2V)", open=False) as i2v_section:
