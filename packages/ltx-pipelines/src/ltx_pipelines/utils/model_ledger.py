@@ -244,7 +244,8 @@ class ModelLedger:
                 "Audio encoder not initialized. Please provide a checkpoint path to the ModelLedger constructor."
             )
 
-        return self.audio_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
+        # Audio VAE encoder needs float32 for quality (as noted in ltx-trainer)
+        return self.audio_encoder_builder.build(device=self._target_device(), dtype=torch.float32).to(self.device).eval()
 
     def vocoder(self) -> Vocoder:
         if not hasattr(self, "vocoder_builder"):
