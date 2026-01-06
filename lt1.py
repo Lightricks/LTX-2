@@ -60,6 +60,13 @@ def parse_ltx_progress_line(line: str) -> Optional[str]:
         match = re.search(r'(\d+\.?\d*)s', line)
         if match:
             return f"One-stage completed ({match.group(1)}s)"
+    # Refine-only pipeline
+    if ">>> Refine-only mode" in line:
+        return "Refine-only: Loading input video..."
+    if ">>> Input video encoded" in line:
+        match = re.search(r'(\d+\.?\d*)s', line)
+        if match:
+            return f"Video encoded ({match.group(1)}s)"
     # Two-stage pipeline
     if ">>> Stage 1: Loading" in line:
         return "Stage 1: Loading models..."
@@ -152,25 +159,184 @@ def validate_resolution(width: int, height: int) -> Optional[str]:
 
 def validate_model_paths(checkpoint_path: str, spatial_upsampler_path: str,
                          distilled_lora_path: str, gemma_root: str,
-                         is_one_stage: bool = False) -> Optional[str]:
+                         is_one_stage: bool = False,
+                         is_refine_only: bool = False) -> Optional[str]:
     """Validate all required model paths exist."""
     # Core paths required for all pipelines
     paths = [
         ("LTX Checkpoint", checkpoint_path),
         ("Gemma Root", gemma_root),
     ]
-    # Two-stage specific paths
-    if not is_one_stage:
+    # Two-stage specific paths (spatial upsampler always needed for two-stage)
+    if not is_one_stage and not is_refine_only:
         paths.extend([
             ("Spatial Upsampler", spatial_upsampler_path),
             ("Distilled LoRA", distilled_lora_path),
         ])
+    # Refine-only: distilled LoRA is optional, but validate if provided
+    if is_refine_only:
+        # Only validate distilled LoRA if path is provided
+        if distilled_lora_path and distilled_lora_path.strip():
+            paths.append(("Distilled LoRA", distilled_lora_path))
     for name, path in paths:
         if not path or not path.strip():
             return f"Error: {name} path is required"
         if not os.path.exists(path):
             return f"Error: {name} not found: {path}"
     return None
+
+
+# =============================================================================
+# Image Dimension Helpers
+# =============================================================================
+
+def update_image_dimensions(image_path):
+    """Update original dimensions when image is uploaded."""
+    if image_path is None:
+        return "", gr.update(), gr.update()
+    try:
+        img = Image.open(image_path)
+        w, h = img.size
+        original_dims_str = f"{w}x{h}"
+        # Calculate dimensions snapped to nearest multiple of 64 while maintaining aspect ratio
+        new_w = round(w / 64) * 64
+        new_h = round(h / 64) * 64
+        new_w = max(64, new_w)
+        new_h = max(64, new_h)
+        return original_dims_str, gr.update(value=new_w), gr.update(value=new_h)
+    except Exception as e:
+        print(f"Error reading image dimensions: {e}")
+        return "", gr.update(), gr.update()
+
+
+def update_resolution_from_scale(scale, original_dims):
+    """Update dimensions based on scale percentage (divisible by 64)."""
+    if not original_dims:
+        return gr.update(), gr.update()
+    try:
+        scale = float(scale) if scale is not None else 100.0
+        if scale <= 0:
+            scale = 100.0
+
+        orig_w, orig_h = map(int, original_dims.split('x'))
+        scale_factor = scale / 100.0
+
+        # Calculate and round to the nearest multiple of 64
+        new_w = round((orig_w * scale_factor) / 64) * 64
+        new_h = round((orig_h * scale_factor) / 64) * 64
+
+        # Ensure minimum size (must be multiple of 64)
+        new_w = max(64, new_w)
+        new_h = max(64, new_h)
+
+        return gr.update(value=new_w), gr.update(value=new_h)
+    except Exception as e:
+        print(f"Error updating from scale: {e}")
+        return gr.update(), gr.update()
+
+
+def calculate_width_from_height(height, original_dims):
+    """Calculate width based on height maintaining aspect ratio (divisible by 64)."""
+    if not original_dims or height is None:
+        return gr.update()
+    try:
+        height = int(height)
+        if height <= 0:
+            return gr.update()
+        height = (height // 64) * 64
+        height = max(64, height)
+
+        orig_w, orig_h = map(int, original_dims.split('x'))
+        if orig_h == 0:
+            return gr.update()
+        aspect_ratio = orig_w / orig_h
+        new_width = round((height * aspect_ratio) / 64) * 64
+        return gr.update(value=max(64, new_width))
+
+    except Exception as e:
+        print(f"Error calculating width: {e}")
+        return gr.update()
+
+
+def calculate_height_from_width(width, original_dims):
+    """Calculate height based on width maintaining aspect ratio (divisible by 64)."""
+    if not original_dims or width is None:
+        return gr.update()
+    try:
+        width = int(width)
+        if width <= 0:
+            return gr.update()
+        width = (width // 64) * 64
+        width = max(64, width)
+
+        orig_w, orig_h = map(int, original_dims.split('x'))
+        if orig_w == 0:
+            return gr.update()
+        aspect_ratio = orig_w / orig_h
+        new_height = round((width / aspect_ratio) / 64) * 64
+        return gr.update(value=max(64, new_height))
+
+    except Exception as e:
+        print(f"Error calculating height: {e}")
+        return gr.update()
+
+
+def get_video_info(video_path):
+    """Get video dimensions and frame count using ffprobe."""
+    if video_path is None:
+        return None
+    try:
+        import subprocess
+        import json
+        cmd = [
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_streams", "-select_streams", "v:0", video_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        data = json.loads(result.stdout)
+        if data.get("streams"):
+            stream = data["streams"][0]
+            return {
+                "width": int(stream.get("width", 0)),
+                "height": int(stream.get("height", 0)),
+                "nb_frames": int(stream.get("nb_frames", 0)) if stream.get("nb_frames") else None,
+                "duration": float(stream.get("duration", 0)) if stream.get("duration") else None,
+                "fps": eval(stream.get("r_frame_rate", "24/1")) if stream.get("r_frame_rate") else 24,
+            }
+    except Exception as e:
+        print(f"Error getting video info: {e}")
+    return None
+
+
+def update_video_dimensions(video_path):
+    """Update dimensions and frame count when video is uploaded."""
+    if video_path is None:
+        return "", gr.update(), gr.update(), gr.update(), gr.update()
+    try:
+        info = get_video_info(video_path)
+        if info:
+            w, h = info["width"], info["height"]
+            original_dims_str = f"{w}x{h}"
+            # Snap to nearest multiple of 64
+            new_w = round(w / 64) * 64
+            new_h = round(h / 64) * 64
+            new_w = max(64, new_w)
+            new_h = max(64, new_h)
+            # Calculate frame count (snap to 8*K+1 format)
+            if info.get("nb_frames"):
+                num_frames = info["nb_frames"]
+            elif info.get("duration") and info.get("fps"):
+                num_frames = int(info["duration"] * info["fps"])
+            else:
+                num_frames = 121
+            # Snap to nearest 8*K+1
+            k = max(1, round((num_frames - 1) / 8))
+            num_frames = 8 * k + 1
+            fps = info.get("fps", 24)
+            return original_dims_str, gr.update(value=new_w), gr.update(value=new_h), gr.update(value=num_frames), gr.update(value=int(fps))
+    except Exception as e:
+        print(f"Error reading video dimensions: {e}")
+    return "", gr.update(), gr.update(), gr.update(), gr.update()
 
 
 # =============================================================================
@@ -201,6 +367,12 @@ def generate_ltx_video(
     input_image: str,
     image_frame_idx: int,
     image_strength: float,
+    # End image conditioning
+    end_image: str,
+    end_image_strength: float,
+    # Video input (for V2V / refine)
+    input_video: str,
+    refine_strength: float,
     # Audio & prompt
     disable_audio: bool,
     enhance_prompt: bool,
@@ -239,10 +411,17 @@ def generate_ltx_video(
         yield [], None, error, ""
         return
 
+    # Round num_frames to valid 8*K+1 format
+    num_frames = int(num_frames)
+    k = max(1, round((num_frames - 1) / 8))
+    num_frames = 8 * k + 1
+
     is_one_stage = (pipeline == "one-stage")
+    is_refine_only = (pipeline == "refine-only")
     error = validate_model_paths(checkpoint_path, spatial_upsampler_path,
                                   distilled_lora_path, gemma_root,
-                                  is_one_stage=is_one_stage)
+                                  is_one_stage=is_one_stage,
+                                  is_refine_only=is_refine_only)
     if error:
         yield [], None, error, ""
         return
@@ -250,6 +429,11 @@ def generate_ltx_video(
     # Check image for I2V mode
     if mode == "i2v" and not input_image:
         yield [], None, "Error: Input image required for I2V mode", ""
+        return
+
+    # Check video for V2V/refine-only mode
+    if (mode == "v2v" or pipeline == "refine-only") and not input_video:
+        yield [], None, "Error: Input video required for V2V/refine-only mode", ""
         return
 
     os.makedirs(save_path, exist_ok=True)
@@ -296,14 +480,29 @@ def generate_ltx_video(
         # Pipeline selection
         if is_one_stage:
             command.append("--one-stage")
+        elif is_refine_only:
+            command.append("--refine-only")
+            # Refine-only: distilled LoRA is optional
+            if distilled_lora_path and distilled_lora_path.strip() and os.path.exists(distilled_lora_path):
+                command.extend(["--distilled-lora", distilled_lora_path, str(distilled_lora_strength)])
         else:
             # Two-stage specific: spatial upsampler and distilled LoRA
             command.extend(["--spatial-upsampler-path", spatial_upsampler_path])
             command.extend(["--distilled-lora", distilled_lora_path, str(distilled_lora_strength)])
 
+        # Video input (V2V / refine)
+        if input_video:
+            command.extend(["--input-video", str(input_video)])
+            command.extend(["--refine-strength", str(float(refine_strength))])
+
         # Image conditioning (I2V)
         if mode == "i2v" and input_image:
             command.extend(["--image", str(input_image), str(int(image_frame_idx)), str(float(image_strength))])
+
+        # End image conditioning (place at last frame)
+        if end_image:
+            last_frame_idx = int(num_frames) - 1
+            command.extend(["--image", str(end_image), str(last_frame_idx), str(float(end_image_strength))])
 
         # User LoRA
         if user_lora and user_lora != "None" and lora_folder:
@@ -429,6 +628,10 @@ def generate_ltx_video(
                     "distilled_lora_strength": float(distilled_lora_strength),
                     "user_lora": user_lora if user_lora != "None" else None,
                     "user_lora_strength": float(user_lora_strength) if user_lora != "None" else None,
+                    "end_image": os.path.basename(end_image) if end_image else None,
+                    "end_image_strength": float(end_image_strength) if end_image else None,
+                    "input_video": os.path.basename(input_video) if input_video else None,
+                    "refine_strength": float(refine_strength) if input_video else None,
                     "generation_time_seconds": round(elapsed, 2),
                 }
 
@@ -540,8 +743,107 @@ def create_interface():
                 with gr.Row():
                     # Left column - Parameters
                     with gr.Column():
-                        # Model Configuration
-                        with gr.Accordion("Model Configuration", open=False):
+                        # Generation Parameters
+                        with gr.Accordion("Generation Parameters", open=True):
+                            with gr.Row():
+                                mode = gr.Dropdown(
+                                    label="Mode",
+                                    choices=["t2v", "i2v", "v2v"],
+                                    value="t2v",
+                                    info="t2v = text-to-video, i2v = image-to-video, v2v = video-to-video (refine)"
+                                )
+                                pipeline = gr.Dropdown(
+                                    label="Pipeline",
+                                    choices=["two-stage", "one-stage", "refine-only"],
+                                    value="two-stage",
+                                    info="two-stage = higher quality, one-stage = faster, refine-only = stage 2 only on input video"
+                                )
+                            # Hidden state for original image/video dimensions
+                            original_dims = gr.State(value="")
+                        # Image Conditioning (I2V)
+                        with gr.Accordion("Image Conditioning (I2V)", open=True) as i2v_section:
+                            input_image = gr.Image(label="Start Image", type="filepath")
+                            with gr.Row():
+                                image_frame_idx = gr.Number(label="Frame Index", value=0, minimum=0, info="Which frame to condition (0 = first)")
+                                image_strength = gr.Slider(minimum=0.0, maximum=1.0, value=0.9, step=0.05, label="Strength")
+
+                            with gr.Accordion("End Image (optional)", open=False):
+                                end_image = gr.Image(label="End Image (for start-to-end video)", type="filepath")
+                                gr.Markdown("Set an ending frame to generate video that transitions from start to end image.")
+                                with gr.Row():
+                                    end_image_strength = gr.Slider(minimum=0.0, maximum=1.0, value=0.9, step=0.05, label="End Image Strength")
+                            gr.Markdown("### Resolution Settings")
+                            scale_slider = gr.Slider(
+                                minimum=1, maximum=200, value=100, step=1,
+                                label="Scale % (adjusts resolution while maintaining aspect ratio)",
+                                info="Scale the input image dimensions. Works for I2V mode."
+                            )
+                            with gr.Row():
+                                width = gr.Number(label="Width", value=1024, step=64, info="Must be divisible by 64")
+                                calc_height_btn = gr.Button("→", size="sm", min_width=40)
+                                calc_width_btn = gr.Button("←", size="sm", min_width=40)
+                                height = gr.Number(label="Height", value=1024, step=64, info="Must be divisible by 64")
+                            with gr.Row():
+                                num_frames = gr.Number(label="Num Frames (8*K+1)", value=121, step=8, info="e.g., 121 = 5s @ 24fps")
+                                frame_rate = gr.Slider(minimum=12, maximum=60, value=24, step=1, label="Frame Rate")
+                            with gr.Row():
+                                cfg_guidance_scale = gr.Slider(minimum=1.0, maximum=15.0, value=4.0, step=0.5, label="CFG Scale")
+                                num_inference_steps = gr.Slider(minimum=1, maximum=60, value=40, step=1, label="Inference Steps")
+
+                        # Video Input (V2V / Refine)
+                        with gr.Accordion("Video Input (V2V / Refine)", open=False) as v2v_section:
+                            input_video = gr.Video(label="Input Video (for refinement)", sources=["upload"])
+                            gr.Markdown("""
+                            **Video-to-Video Refinement:**
+                            - Upload a video to refine it using stage 2 (with distilled LoRA)
+                            - Use "refine-only" pipeline to skip stage 1 generation
+                            - Resolution and frame count will be auto-detected from video
+                            """)
+                            with gr.Row():
+                                refine_strength = gr.Slider(
+                                    minimum=0.0, maximum=1.0, value=0.3, step=0.05,
+                                    label="Refine Strength",
+                                    info="Amount of noise to add before refinement (0=none, 1=full denoise)"
+                                )
+
+
+                    # Right column - Output
+                    with gr.Column():
+                        output_gallery = gr.Gallery(
+                            label="Generated Videos",
+                            columns=2, rows=2,
+                            object_fit="contain",
+                            height="auto",
+                            allow_preview=True,
+                            preview=True
+                        )
+                        # User LoRA
+                        with gr.Accordion("User LoRA (Optional)", open=False):
+                            lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
+                            lora_refresh_btn = gr.Button("🔄 Refresh", size="sm")
+                            with gr.Row():
+                                user_lora = gr.Dropdown(
+                                    label="LoRA",
+                                    choices=get_ltx_lora_options("lora"),
+                                    value="None",
+                                    scale=3
+                                )
+                                user_lora_strength = gr.Slider(
+                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
+                                    label="Strength", scale=1
+                                )
+                        # Memory Optimization
+                        with gr.Accordion("Model settings", open=True):
+                            with gr.Row():
+                                offload = gr.Checkbox(label="CPU Offloading", value=False, info="Offload models to CPU when not in use")
+                                enable_fp8 = gr.Checkbox(label="FP8 Mode", value=False, info="Reduce memory with FP8 transformer")
+                            with gr.Row():
+                                enable_block_swap = gr.Checkbox(label="Block Swapping", value=True)
+                                blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=22, step=1, label="Transformer Blocks in GPU", visible=True)
+                            with gr.Row():
+                                text_encoder_blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=6, step=1, label="Text Encoder Blocks in GPU", visible=True, info="Gemma-3-12B has 48 layers")
+                                disable_audio = gr.Checkbox(label="Disable Audio", value=False, info="Generate video only (no audio)")
+                                enhance_prompt = gr.Checkbox(label="Enhance Prompt", value=False, info="Use Gemma to improve prompt")
                             checkpoint_path = gr.Textbox(
                                 label="LTX Checkpoint Path",
                                 value="./weights/ltx-2-19b-dev.safetensors",
@@ -568,86 +870,7 @@ def create_interface():
                                     minimum=0.0, maximum=2.0, value=1.0, step=0.1,
                                     label="Strength", scale=1
                                 )
-
-                        # Generation Parameters
-                        with gr.Accordion("Generation Parameters", open=True):
-                            with gr.Row():
-                                mode = gr.Dropdown(
-                                    label="Mode",
-                                    choices=["t2v", "i2v"],
-                                    value="t2v",
-                                    info="t2v = text-to-video, i2v = image-to-video"
-                                )
-                                pipeline = gr.Dropdown(
-                                    label="Pipeline",
-                                    choices=["two-stage", "one-stage"],
-                                    value="two-stage",
-                                    info="two-stage = higher quality, one-stage = faster"
-                                )
-                            with gr.Row():
-                                width = gr.Number(label="Width", value=1024, step=64, info="Must be divisible by 64")
-                                height = gr.Number(label="Height", value=1024, step=64, info="Must be divisible by 64")
-                            with gr.Row():
-                                num_frames = gr.Number(label="Num Frames (8*K+1)", value=121, step=8, info="e.g., 121 = 5s @ 24fps")
-                                frame_rate = gr.Slider(minimum=12, maximum=60, value=24, step=1, label="Frame Rate")
-                            with gr.Row():
-                                cfg_guidance_scale = gr.Slider(minimum=1.0, maximum=15.0, value=4.0, step=0.5, label="CFG Scale")
-                                num_inference_steps = gr.Slider(minimum=1, maximum=60, value=40, step=1, label="Inference Steps")
-
-                        # Image Conditioning (I2V)
-                        with gr.Accordion("Image Conditioning (I2V)", open=False) as i2v_section:
-                            input_image = gr.Image(label="Input Image", type="filepath")
-                            with gr.Row():
-                                image_frame_idx = gr.Number(label="Frame Index", value=0, minimum=0, info="Which frame to condition")
-                                image_strength = gr.Slider(minimum=0.0, maximum=1.0, value=0.9, step=0.05, label="Strength")
-
-                        # Audio & Prompt Enhancement
-                        with gr.Accordion("Audio & Prompt", open=False):
-                            with gr.Row():
-                                disable_audio = gr.Checkbox(label="Disable Audio", value=False, info="Generate video only (no audio)")
-                                enhance_prompt = gr.Checkbox(label="Enhance Prompt", value=False, info="Use Gemma to improve prompt")
-
-                        # Memory Optimization
-                        with gr.Accordion("Memory Optimization", open=False):
-                            with gr.Row():
-                                offload = gr.Checkbox(label="CPU Offloading", value=False, info="Offload models to CPU when not in use")
-                                enable_fp8 = gr.Checkbox(label="FP8 Mode", value=False, info="Reduce memory with FP8 transformer")
-                            with gr.Row():
-                                enable_block_swap = gr.Checkbox(label="Block Swapping", value=True)
-                                blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=22, step=1, label="Transformer Blocks in GPU", visible=True)
-                            with gr.Row():
-                                text_encoder_blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=6, step=1, label="Text Encoder Blocks in GPU", visible=True, info="Gemma-3-12B has 48 layers")
-
-                        # User LoRA
-                        with gr.Accordion("User LoRA (Optional)", open=False):
-                            lora_folder = gr.Textbox(label="LoRA Folder", value="lora")
-                            lora_refresh_btn = gr.Button("🔄 Refresh", size="sm")
-                            with gr.Row():
-                                user_lora = gr.Dropdown(
-                                    label="LoRA",
-                                    choices=get_ltx_lora_options("lora"),
-                                    value="None",
-                                    scale=3
-                                )
-                                user_lora_strength = gr.Slider(
-                                    minimum=0.0, maximum=2.0, value=1.0, step=0.1,
-                                    label="Strength", scale=1
-                                )
-
-                        # Output Settings
-                        with gr.Accordion("Output Settings", open=False):
-                            save_path = gr.Textbox(label="Output Folder", value="outputs")
-
-                    # Right column - Output
-                    with gr.Column():
-                        output_gallery = gr.Gallery(
-                            label="Generated Videos",
-                            columns=2, rows=2,
-                            object_fit="contain",
-                            height="auto",
-                            allow_preview=True,
-                            preview=True
-                        )
+                            save_path = gr.Textbox(label="Output Folder", value="outputs")                                       
 
             # =================================================================
             # Settings Tab
@@ -670,14 +893,29 @@ def create_interface():
                 ### Pipeline Options
                 - **Two-stage** (default): Generates at half resolution, upsamples 2x, then refines with distilled LoRA. Higher quality output.
                 - **One-stage**: Generates directly at full resolution in a single pass. Faster but may have less detail.
+                - **Refine-only**: Runs stage 2 refinement on an input video. Use this to improve a previously generated video.
 
                 ### Generation Modes
                 - **T2V (Text-to-Video)**: Generate video from text prompt only
                 - **I2V (Image-to-Video)**: Start from an input image
+                - **V2V (Video-to-Video)**: Refine an existing video
+
+                ### Video Input (V2V / Refine)
+                - Upload a video to refine it using stage 2
+                - Use "refine-only" pipeline to skip stage 1 generation
+                - **Refine Strength**: Amount of noise added before refinement (0=none, 1=full denoise)
+                - Distilled LoRA is optional for refine-only mode
+
+                ### Image Conditioning (I2V)
+                - **Start Image**: Set the first frame of the video
+                - **End Image** (optional): Set the last frame to create start-to-end transitions
+                - **Scale Slider**: Automatically adjusts width/height based on input image aspect ratio
+                - **→ / ← Buttons**: Calculate width from height or height from width while preserving aspect ratio
 
                 ### Resolution Requirements
                 - Width and height must be divisible by 64
                 - Recommended: 1024x1024, 768x1024, 1024x768
+                - When using I2V, the scale slider helps maintain the input image's aspect ratio
 
                 ### Frame Count
                 - Must be in format: 8*K + 1
@@ -718,11 +956,46 @@ def create_interface():
             outputs=[blocks_in_memory, text_encoder_blocks_in_memory]
         )
 
-        # Mode change - show/hide I2V section
+        # Image dimension handlers
+        input_image.change(
+            fn=update_image_dimensions,
+            inputs=[input_image],
+            outputs=[original_dims, width, height]
+        )
+
+        scale_slider.change(
+            fn=update_resolution_from_scale,
+            inputs=[scale_slider, original_dims],
+            outputs=[width, height]
+        )
+
+        calc_width_btn.click(
+            fn=calculate_width_from_height,
+            inputs=[height, original_dims],
+            outputs=[width]
+        )
+
+        calc_height_btn.click(
+            fn=calculate_height_from_width,
+            inputs=[width, original_dims],
+            outputs=[height]
+        )
+
+        # Mode change - show/hide I2V and V2V sections
+        def update_sections_visibility(m):
+            return gr.update(open=(m == "i2v")), gr.update(open=(m == "v2v"))
+
         mode.change(
-            fn=lambda m: gr.update(open=(m == "i2v")),
+            fn=update_sections_visibility,
             inputs=[mode],
-            outputs=[i2v_section]
+            outputs=[i2v_section, v2v_section]
+        )
+
+        # Video input change - update dimensions and frame count
+        input_video.change(
+            fn=update_video_dimensions,
+            inputs=[input_video],
+            outputs=[original_dims, width, height, num_frames, frame_rate]
         )
 
         # Stop button
@@ -741,6 +1014,8 @@ def create_interface():
                 mode, pipeline, width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, seed,
                 input_image, image_frame_idx, image_strength,
+                end_image, end_image_strength,
+                input_video, refine_strength,
                 disable_audio, enhance_prompt,
                 offload, enable_fp8, enable_block_swap, blocks_in_memory,
                 text_encoder_blocks_in_memory,

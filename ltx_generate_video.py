@@ -71,7 +71,7 @@ from ltx_pipelines.utils.helpers import (
     image_conditionings_by_replacing_latent,
     simple_denoising_func,
 )
-from ltx_pipelines.utils.media_io import encode_video
+from ltx_pipelines.utils.media_io import encode_video, load_video_conditioning
 from ltx_pipelines.utils.types import PipelineComponents
 
 
@@ -340,6 +340,29 @@ Examples:
         help="Use one-stage pipeline (faster, generates at full resolution directly). "
              "Default is two-stage (half res + upsample + refine).",
     )
+    pipeline_group.add_argument(
+        "--refine-only",
+        action="store_true",
+        help="Use refine-only pipeline (stage 2 only on input video). "
+             "Requires --input-video.",
+    )
+
+    # ==========================================================================
+    # Video Input (V2V / Refine)
+    # ==========================================================================
+    v2v_group = parser.add_argument_group("Video Input (V2V / Refine)")
+    v2v_group.add_argument(
+        "--input-video",
+        type=resolve_path,
+        default=None,
+        help="Input video path for video-to-video refinement.",
+    )
+    v2v_group.add_argument(
+        "--refine-strength",
+        type=float,
+        default=0.3,
+        help="Amount of noise to add before refinement (0=none, 1=full denoise). Default: 0.3",
+    )
 
     # ==========================================================================
     # Advanced Options
@@ -503,6 +526,7 @@ class LTXVideoGeneratorWithOffloading:
         blocks_in_memory: int = 6,
         text_encoder_blocks_in_memory: int = 6,
         one_stage: bool = False,
+        refine_only: bool = False,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
@@ -511,6 +535,7 @@ class LTXVideoGeneratorWithOffloading:
         self.blocks_in_memory = blocks_in_memory
         self.text_encoder_blocks_in_memory = text_encoder_blocks_in_memory
         self.one_stage = one_stage
+        self.refine_only = refine_only
 
         # Create model ledger for stage 1
         self.stage_1_model_ledger = ModelLedger(
@@ -559,6 +584,8 @@ class LTXVideoGeneratorWithOffloading:
         tiling_config: TilingConfig | None = None,
         enhance_prompt: bool = False,
         disable_audio: bool = False,
+        input_video: str | None = None,
+        refine_strength: float = 0.3,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None]:
         """
         Generate video with optional audio.
@@ -625,205 +652,249 @@ class LTXVideoGeneratorWithOffloading:
         print(f">>> Text encoding completed in {time.time() - start_time:.1f}s")
 
         # =====================================================================
-        # Phase 2: Stage 1 - Low Resolution Generation
+        # Refine-only mode: Skip stage 1 and use input video directly
         # =====================================================================
-        print(">>> Stage 1: Loading video encoder and transformer...")
-        stage1_start = time.time()
+        if self.refine_only and input_video:
+            print(">>> Refine-only mode: Loading and encoding input video...")
+            refine_start = time.time()
 
-        video_encoder = self.stage_1_model_ledger.video_encoder()
+            video_encoder = self.stage_1_model_ledger.video_encoder()
 
-        # For block swapping, load transformer to CPU first, then selectively move blocks
-        block_swap_manager = None
-        if self.enable_block_swap:
-            print(f">>> Loading transformer to CPU for block swapping...")
-            # Temporarily override device to load to CPU
-            original_device = self.stage_1_model_ledger.device
-            self.stage_1_model_ledger.device = torch.device("cpu")
-            transformer = self.stage_1_model_ledger.transformer()
-            self.stage_1_model_ledger.device = original_device
-
-            # Move non-block components to GPU, keep blocks on CPU
-            print(f">>> Enabling block swapping ({self.blocks_in_memory} blocks in GPU)...")
-            # Move the wrapper and non-block parts to GPU
-            transformer.velocity_model.patchify_proj.to(self.device)
-            transformer.velocity_model.adaln_single.to(self.device)
-            transformer.velocity_model.caption_projection.to(self.device)
-            transformer.velocity_model.norm_out.to(self.device)
-            transformer.velocity_model.proj_out.to(self.device)
-            transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
-                transformer.velocity_model.scale_shift_table.to(self.device)
-            )
-            # Audio components
-            if hasattr(transformer.velocity_model, "audio_patchify_proj"):
-                transformer.velocity_model.audio_patchify_proj.to(self.device)
-            if hasattr(transformer.velocity_model, "audio_adaln_single"):
-                transformer.velocity_model.audio_adaln_single.to(self.device)
-            if hasattr(transformer.velocity_model, "audio_caption_projection"):
-                transformer.velocity_model.audio_caption_projection.to(self.device)
-            if hasattr(transformer.velocity_model, "audio_norm_out"):
-                transformer.velocity_model.audio_norm_out.to(self.device)
-            if hasattr(transformer.velocity_model, "audio_proj_out"):
-                transformer.velocity_model.audio_proj_out.to(self.device)
-            if hasattr(transformer.velocity_model, "audio_scale_shift_table"):
-                transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
-                    transformer.velocity_model.audio_scale_shift_table.to(self.device)
-                )
-            # Cross-attention adaln components
-            if hasattr(transformer.velocity_model, "av_ca_video_scale_shift_adaln_single"):
-                transformer.velocity_model.av_ca_video_scale_shift_adaln_single.to(self.device)
-            if hasattr(transformer.velocity_model, "av_ca_audio_scale_shift_adaln_single"):
-                transformer.velocity_model.av_ca_audio_scale_shift_adaln_single.to(self.device)
-            if hasattr(transformer.velocity_model, "av_ca_a2v_gate_adaln_single"):
-                transformer.velocity_model.av_ca_a2v_gate_adaln_single.to(self.device)
-            if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
-                transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(self.device)
-
-            block_swap_manager = enable_block_swap(
-                transformer,
-                blocks_in_memory=self.blocks_in_memory,
+            # Load and encode input video
+            video_tensor = load_video_conditioning(
+                video_path=input_video,
+                height=height,
+                width=width,
+                frame_cap=num_frames,
+                dtype=dtype,
                 device=self.device,
             )
-        else:
-            transformer = self.stage_1_model_ledger.transformer()
+            upscaled_video_latent = video_encoder(video_tensor)
 
-        # Create diffusion schedule
-        sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
-            dtype=torch.float32, device=self.device
-        )
-
-        # Define denoising function for stage 1 (with CFG)
-        def first_stage_denoising_loop(
-            sigmas: torch.Tensor,
-            video_state: LatentState,
-            audio_state: LatentState,
-            stepper: DiffusionStepProtocol,
-        ) -> tuple[LatentState, LatentState]:
-            return euler_denoising_loop(
-                sigmas=sigmas,
-                video_state=video_state,
-                audio_state=audio_state,
-                stepper=stepper,
-                denoise_fn=guider_denoising_func(
-                    cfg_guider,
-                    v_context_p,
-                    v_context_n,
-                    a_context_p,
-                    a_context_n,
-                    transformer=transformer,
-                ),
+            # For audio, generate fresh audio latent that will be denoised in stage 2
+            audio_shape = self.pipeline_components.get_audio_shape(
+                VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
             )
-
-        # Stage 1 output shape (half resolution for two-stage, full for one-stage)
-        if self.one_stage:
-            stage_1_output_shape = VideoPixelShape(
-                batch=1,
-                frames=num_frames,
-                width=width,
-                height=height,
-                fps=frame_rate,
+            initial_audio_latent = noiser.noise(
+                torch.zeros(audio_shape.batch, audio_shape.channels, audio_shape.num_tokens,
+                           device=self.device, dtype=dtype),
+                STAGE_2_DISTILLED_SIGMA_VALUES[0]
             )
-        else:
-            stage_1_output_shape = VideoPixelShape(
-                batch=1,
-                frames=num_frames,
-                width=width // 2,
-                height=height // 2,
-                fps=frame_rate,
-            )
+            audio_state = LatentState(latent=initial_audio_latent)
 
-        # Image conditioning for stage 1
-        stage_1_conditionings = image_conditionings_by_replacing_latent(
-            images=images,
-            height=stage_1_output_shape.height,
-            width=stage_1_output_shape.width,
-            video_encoder=video_encoder,
-            dtype=dtype,
-            device=self.device,
-        )
+            print(f">>> Input video encoded in {time.time() - refine_start:.1f}s")
 
-        stage_label = "One-stage" if self.one_stage else "Stage 1"
-        print(f">>> {stage_label}: Generating at {stage_1_output_shape.width}x{stage_1_output_shape.height}...")
-        video_state, audio_state = denoise_audio_video(
-            output_shape=stage_1_output_shape,
-            conditionings=stage_1_conditionings,
-            noiser=noiser,
-            sigmas=sigmas,
-            stepper=stepper,
-            denoising_loop_fn=first_stage_denoising_loop,
-            components=self.pipeline_components,
-            dtype=dtype,
-            device=self.device,
-        )
-
-        print(f">>> {stage_label} completed in {time.time() - stage1_start:.1f}s", flush=True)
-
-        # Cleanup stage 1 transformer
-        if block_swap_manager:
-            offload_all_blocks(transformer)
-            # Clear offloader references from transformer to break reference cycle
-            if hasattr(transformer, 'velocity_model'):
-                if hasattr(transformer.velocity_model, '_block_swap_offloader'):
-                    transformer.velocity_model._block_swap_offloader = None
-                if hasattr(transformer.velocity_model, '_blocks_ref'):
-                    transformer.velocity_model._blocks_ref = None
-            if hasattr(transformer, '_block_swap_offloader'):
-                transformer._block_swap_offloader = None
-            if hasattr(transformer, '_blocks_ref'):
-                transformer._blocks_ref = None
-            block_swap_manager = None
-        if self.offload:
-            print(">>> Offloading stage 1 transformer to CPU...")
-        # Set to None instead of del to avoid GC issues
-        transformer = None
-        cleanup_memory()
-
-        # For one-stage, skip upsampling and stage 2 refinement
-        if self.one_stage:
-            # Cleanup video encoder
-            video_encoder = None
+            # Clean up video encoder before loading stage 2
+            del video_encoder
             cleanup_memory()
 
-            # Skip directly to VAE decoding
-            print(">>> Decoding video...")
-            decode_start = time.time()
+            # Skip Phase 2, 3 - go directly to Phase 4 (Stage 2)
+            block_swap_manager = None
+            video_encoder = None  # Not needed for refine-only
 
-            decoded_video = vae_decode_video(
-                video_state.latent,
-                self.stage_1_model_ledger.video_decoder(),
-                tiling_config,
-            )
+        # =====================================================================
+        # Phase 2: Stage 1 - Low Resolution Generation (skip for refine-only)
+        # =====================================================================
+        skip_stage_1 = self.refine_only and input_video
+        if not skip_stage_1:
+            print(">>> Stage 1: Loading video encoder and transformer...")
+            stage1_start = time.time()
 
-            if not disable_audio:
-                print(">>> Decoding audio...")
-                decoded_audio = vae_decode_audio(
-                    audio_state.latent,
-                    self.stage_1_model_ledger.audio_decoder(),
-                    self.stage_1_model_ledger.vocoder(),
+            video_encoder = self.stage_1_model_ledger.video_encoder()
+
+            # For block swapping, load transformer to CPU first, then selectively move blocks
+            block_swap_manager = None
+            if self.enable_block_swap:
+                print(f">>> Loading transformer to CPU for block swapping...")
+                # Temporarily override device to load to CPU
+                original_device = self.stage_1_model_ledger.device
+                self.stage_1_model_ledger.device = torch.device("cpu")
+                transformer = self.stage_1_model_ledger.transformer()
+                self.stage_1_model_ledger.device = original_device
+
+                # Move non-block components to GPU, keep blocks on CPU
+                print(f">>> Enabling block swapping ({self.blocks_in_memory} blocks in GPU)...")
+                # Move the wrapper and non-block parts to GPU
+                transformer.velocity_model.patchify_proj.to(self.device)
+                transformer.velocity_model.adaln_single.to(self.device)
+                transformer.velocity_model.caption_projection.to(self.device)
+                transformer.velocity_model.norm_out.to(self.device)
+                transformer.velocity_model.proj_out.to(self.device)
+                transformer.velocity_model.scale_shift_table = torch.nn.Parameter(
+                    transformer.velocity_model.scale_shift_table.to(self.device)
+                )
+                # Audio components
+                if hasattr(transformer.velocity_model, "audio_patchify_proj"):
+                    transformer.velocity_model.audio_patchify_proj.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_adaln_single"):
+                    transformer.velocity_model.audio_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_caption_projection"):
+                    transformer.velocity_model.audio_caption_projection.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_norm_out"):
+                    transformer.velocity_model.audio_norm_out.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_proj_out"):
+                    transformer.velocity_model.audio_proj_out.to(self.device)
+                if hasattr(transformer.velocity_model, "audio_scale_shift_table"):
+                    transformer.velocity_model.audio_scale_shift_table = torch.nn.Parameter(
+                        transformer.velocity_model.audio_scale_shift_table.to(self.device)
+                    )
+                # Cross-attention adaln components
+                if hasattr(transformer.velocity_model, "av_ca_video_scale_shift_adaln_single"):
+                    transformer.velocity_model.av_ca_video_scale_shift_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_audio_scale_shift_adaln_single"):
+                    transformer.velocity_model.av_ca_audio_scale_shift_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_a2v_gate_adaln_single"):
+                    transformer.velocity_model.av_ca_a2v_gate_adaln_single.to(self.device)
+                if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
+                    transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(self.device)
+
+                block_swap_manager = enable_block_swap(
+                    transformer,
+                    blocks_in_memory=self.blocks_in_memory,
+                    device=self.device,
                 )
             else:
-                decoded_audio = None
+                transformer = self.stage_1_model_ledger.transformer()
 
-            print(f">>> Decoding completed in {time.time() - decode_start:.1f}s")
-            print(f">>> Total generation time: {time.time() - start_time:.1f}s")
+            # Create diffusion schedule
+            sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
+                dtype=torch.float32, device=self.device
+            )
 
-            return decoded_video, decoded_audio
+            # Define denoising function for stage 1 (with CFG)
+            def first_stage_denoising_loop(
+                sigmas: torch.Tensor,
+                video_state: LatentState,
+                audio_state: LatentState,
+                stepper: DiffusionStepProtocol,
+            ) -> tuple[LatentState, LatentState]:
+                return euler_denoising_loop(
+                    sigmas=sigmas,
+                    video_state=video_state,
+                    audio_state=audio_state,
+                    stepper=stepper,
+                    denoise_fn=guider_denoising_func(
+                        cfg_guider,
+                        v_context_p,
+                        v_context_n,
+                        a_context_p,
+                        a_context_n,
+                        transformer=transformer,
+                    ),
+                )
 
-        # =====================================================================
-        # Phase 3: Spatial Upsampling (two-stage only)
-        # =====================================================================
-        print(">>> Upsampling latents (2x)...", flush=True)
-        upsample_start = time.time()
+            # Stage 1 output shape (half resolution for two-stage, full for one-stage)
+            if self.one_stage:
+                stage_1_output_shape = VideoPixelShape(
+                    batch=1,
+                    frames=num_frames,
+                    width=width,
+                    height=height,
+                    fps=frame_rate,
+                )
+            else:
+                stage_1_output_shape = VideoPixelShape(
+                    batch=1,
+                    frames=num_frames,
+                    width=width // 2,
+                    height=height // 2,
+                    fps=frame_rate,
+                )
 
-        spatial_upsampler = self.stage_2_model_ledger.spatial_upsampler()
-        upscaled_video_latent = upsample_video(
-            latent=video_state.latent[:1],
-            video_encoder=video_encoder,
-            upsampler=spatial_upsampler,
-        )
+            # Image conditioning for stage 1
+            stage_1_conditionings = image_conditionings_by_replacing_latent(
+                images=images,
+                height=stage_1_output_shape.height,
+                width=stage_1_output_shape.width,
+                video_encoder=video_encoder,
+                dtype=dtype,
+                device=self.device,
+            )
 
-        torch.cuda.synchronize()
-        cleanup_memory()
-        print(f">>> Upsampling completed in {time.time() - upsample_start:.1f}s", flush=True)
+            stage_label = "One-stage" if self.one_stage else "Stage 1"
+            print(f">>> {stage_label}: Generating at {stage_1_output_shape.width}x{stage_1_output_shape.height}...")
+            video_state, audio_state = denoise_audio_video(
+                output_shape=stage_1_output_shape,
+                conditionings=stage_1_conditionings,
+                noiser=noiser,
+                sigmas=sigmas,
+                stepper=stepper,
+                denoising_loop_fn=first_stage_denoising_loop,
+                components=self.pipeline_components,
+                dtype=dtype,
+                device=self.device,
+            )
+
+            print(f">>> {stage_label} completed in {time.time() - stage1_start:.1f}s", flush=True)
+
+            # Cleanup stage 1 transformer
+            if block_swap_manager:
+                offload_all_blocks(transformer)
+                # Clear offloader references from transformer to break reference cycle
+                if hasattr(transformer, 'velocity_model'):
+                    if hasattr(transformer.velocity_model, '_block_swap_offloader'):
+                        transformer.velocity_model._block_swap_offloader = None
+                    if hasattr(transformer.velocity_model, '_blocks_ref'):
+                        transformer.velocity_model._blocks_ref = None
+                if hasattr(transformer, '_block_swap_offloader'):
+                    transformer._block_swap_offloader = None
+                if hasattr(transformer, '_blocks_ref'):
+                    transformer._blocks_ref = None
+                block_swap_manager = None
+            if self.offload:
+                print(">>> Offloading stage 1 transformer to CPU...")
+            # Set to None instead of del to avoid GC issues
+            transformer = None
+            cleanup_memory()
+
+            # For one-stage, skip upsampling and stage 2 refinement
+            if self.one_stage:
+                # Cleanup video encoder
+                video_encoder = None
+                cleanup_memory()
+
+                # Skip directly to VAE decoding
+                print(">>> Decoding video...")
+                decode_start = time.time()
+
+                decoded_video = vae_decode_video(
+                    video_state.latent,
+                    self.stage_1_model_ledger.video_decoder(),
+                    tiling_config,
+                )
+
+                if not disable_audio:
+                    print(">>> Decoding audio...")
+                    decoded_audio = vae_decode_audio(
+                        audio_state.latent,
+                        self.stage_1_model_ledger.audio_decoder(),
+                        self.stage_1_model_ledger.vocoder(),
+                    )
+                else:
+                    decoded_audio = None
+
+                print(f">>> Decoding completed in {time.time() - decode_start:.1f}s")
+                print(f">>> Total generation time: {time.time() - start_time:.1f}s")
+
+                return decoded_video, decoded_audio
+
+            # =====================================================================
+            # Phase 3: Spatial Upsampling (two-stage only)
+            # =====================================================================
+            print(">>> Upsampling latents (2x)...", flush=True)
+            upsample_start = time.time()
+
+            spatial_upsampler = self.stage_2_model_ledger.spatial_upsampler()
+            upscaled_video_latent = upsample_video(
+                latent=video_state.latent[:1],
+                video_encoder=video_encoder,
+                upsampler=spatial_upsampler,
+            )
+
+            torch.cuda.synchronize()
+            cleanup_memory()
+            print(f">>> Upsampling completed in {time.time() - upsample_start:.1f}s", flush=True)
+        # End of skip_stage_1 block
 
         # =====================================================================
         # Phase 4: Stage 2 - High Resolution Refinement (two-stage only)
@@ -1066,7 +1137,7 @@ def main():
             LTXV_LORA_COMFY_RENAMING_MAP
         )]
 
-    pipeline_type = "one-stage" if args.one_stage else "two-stage"
+    pipeline_type = "refine-only" if args.refine_only else ("one-stage" if args.one_stage else "two-stage")
     print("=" * 60)
     print("LTX-2 Video Generation")
     print("=" * 60)
@@ -1097,6 +1168,7 @@ def main():
         blocks_in_memory=args.blocks_in_memory,
         text_encoder_blocks_in_memory=args.text_encoder_blocks_in_memory,
         one_stage=args.one_stage,
+        refine_only=args.refine_only,
     )
 
     # Set up tiling config for VAE
@@ -1118,6 +1190,8 @@ def main():
         tiling_config=tiling_config,
         enhance_prompt=args.enhance_prompt,
         disable_audio=args.disable_audio,
+        input_video=args.input_video,
+        refine_strength=args.refine_strength,
     )
 
     # Encode and save video
