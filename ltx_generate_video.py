@@ -637,7 +637,9 @@ class LTXVideoGeneratorWithOffloading:
         print(">>> DEBUG: About to cleanup_memory...", flush=True)
         cleanup_memory()
         print(">>> DEBUG: cleanup_memory done", flush=True)
-        print(f">>> Upsampling completed in {time.time() - upsample_start:.1f}s")
+        import sys; sys.stdout.flush(); sys.stderr.flush()
+        print(">>> DEBUG: About to print upsampling time", flush=True)
+        print(f">>> Upsampling completed in {time.time() - upsample_start:.1f}s", flush=True)
 
         # =====================================================================
         # Phase 4: Stage 2 - High Resolution Refinement
