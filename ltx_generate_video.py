@@ -301,23 +301,42 @@ Examples:
         action="store_true",
         help="Enable FP8 mode for transformer (reduces memory, calculations in bfloat16).",
     )
+    # DiT (main transformer) block swapping
     mem_group.add_argument(
-        "--enable-block-swap",
+        "--enable-dit-block-swap",
         action="store_true",
-        help="Enable block swapping for transformer (reduces VRAM by ~40%%).",
+        help="Enable block swapping for main DiT transformer (stage 1).",
     )
     mem_group.add_argument(
-        "--blocks-in-memory",
+        "--dit-blocks-in-memory",
         type=int,
-        default=6,
-        help="Number of transformer blocks to keep in GPU when block swapping (default: 6).",
+        default=22,
+        help="Number of DiT transformer blocks to keep in GPU (default: 22).",
+    )
+    # Text encoder block swapping
+    mem_group.add_argument(
+        "--enable-text-encoder-block-swap",
+        action="store_true",
+        help="Enable block swapping for text encoder (Gemma).",
     )
     mem_group.add_argument(
         "--text-encoder-blocks-in-memory",
         type=int,
         default=6,
-        help="Number of text encoder layers to keep in GPU when block swapping (default: 6). "
+        help="Number of text encoder layers to keep in GPU (default: 6). "
              "The Gemma-3-12B text encoder has 48 layers.",
+    )
+    # Refiner block swapping
+    mem_group.add_argument(
+        "--enable-refiner-block-swap",
+        action="store_true",
+        help="Enable block swapping for refiner transformer (stage 2).",
+    )
+    mem_group.add_argument(
+        "--refiner-blocks-in-memory",
+        type=int,
+        default=22,
+        help="Number of refiner transformer blocks to keep in GPU (default: 22).",
     )
 
     # ==========================================================================
@@ -662,18 +681,26 @@ class LTXVideoGeneratorWithOffloading:
         device: str = None,
         fp8transformer: bool = False,
         offload: bool = False,
-        enable_block_swap: bool = False,
-        blocks_in_memory: int = 6,
+        # Separate block swap controls
+        enable_dit_block_swap: bool = False,
+        dit_blocks_in_memory: int = 22,
+        enable_text_encoder_block_swap: bool = False,
         text_encoder_blocks_in_memory: int = 6,
+        enable_refiner_block_swap: bool = False,
+        refiner_blocks_in_memory: int = 22,
         one_stage: bool = False,
         refine_only: bool = False,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
         self.offload = offload
-        self.enable_block_swap = enable_block_swap
-        self.blocks_in_memory = blocks_in_memory
+        # Separate block swap settings
+        self.enable_dit_block_swap = enable_dit_block_swap
+        self.dit_blocks_in_memory = dit_blocks_in_memory
+        self.enable_text_encoder_block_swap = enable_text_encoder_block_swap
         self.text_encoder_blocks_in_memory = text_encoder_blocks_in_memory
+        self.enable_refiner_block_swap = enable_refiner_block_swap
+        self.refiner_blocks_in_memory = refiner_blocks_in_memory
         self.one_stage = one_stage
         self.refine_only = refine_only
 
@@ -751,7 +778,7 @@ class LTXVideoGeneratorWithOffloading:
         # =====================================================================
         print(">>> Loading text encoder...")
         text_encoder_block_swap = None
-        if self.enable_block_swap:
+        if self.enable_text_encoder_block_swap:
             # Load text encoder to CPU first for block swapping
             original_device = self.stage_1_model_ledger.device
             self.stage_1_model_ledger.device = torch.device("cpu")
@@ -899,8 +926,8 @@ class LTXVideoGeneratorWithOffloading:
 
             # For block swapping, load transformer to CPU first, then selectively move blocks
             block_swap_manager = None
-            if self.enable_block_swap:
-                print(f">>> Loading transformer to CPU for block swapping...")
+            if self.enable_dit_block_swap:
+                print(f">>> Loading DiT transformer to CPU for block swapping...")
                 # Temporarily override device to load to CPU
                 original_device = self.stage_1_model_ledger.device
                 self.stage_1_model_ledger.device = torch.device("cpu")
@@ -908,7 +935,7 @@ class LTXVideoGeneratorWithOffloading:
                 self.stage_1_model_ledger.device = original_device
 
                 # Move non-block components to GPU, keep blocks on CPU
-                print(f">>> Enabling block swapping ({self.blocks_in_memory} blocks in GPU)...")
+                print(f">>> Enabling DiT block swapping ({self.dit_blocks_in_memory} blocks in GPU)...")
                 # Move the wrapper and non-block parts to GPU
                 transformer.velocity_model.patchify_proj.to(self.device)
                 transformer.velocity_model.adaln_single.to(self.device)
@@ -945,7 +972,7 @@ class LTXVideoGeneratorWithOffloading:
 
                 block_swap_manager = enable_block_swap(
                     transformer,
-                    blocks_in_memory=self.blocks_in_memory,
+                    blocks_in_memory=self.dit_blocks_in_memory,
                     device=self.device,
                 )
             else:
@@ -1109,7 +1136,7 @@ class LTXVideoGeneratorWithOffloading:
         # 3. Apply LoRAs using chunked GPU computation (fast, low memory)
         # This avoids the slow CPU-only LoRA application that appears to hang.
         block_swap_manager = None
-        if self.enable_block_swap:
+        if self.enable_refiner_block_swap:
             # Create ledger WITHOUT LoRAs - loading will be fast
             stage_2_ledger_no_lora = ModelLedger(
                 dtype=self.dtype,
@@ -1155,7 +1182,7 @@ class LTXVideoGeneratorWithOffloading:
             stage_2_ledger = stage_2_ledger_no_lora
 
             # Move non-block components to GPU
-            print(f">>> Enabling block swapping for stage 2 ({self.blocks_in_memory} blocks in GPU)...")
+            print(f">>> Enabling refiner block swapping ({self.refiner_blocks_in_memory} blocks in GPU)...")
             transformer.velocity_model.patchify_proj.to(self.device)
             transformer.velocity_model.adaln_single.to(self.device)
             transformer.velocity_model.caption_projection.to(self.device)
@@ -1190,7 +1217,7 @@ class LTXVideoGeneratorWithOffloading:
 
             block_swap_manager = enable_block_swap(
                 transformer,
-                blocks_in_memory=self.blocks_in_memory,
+                blocks_in_memory=self.refiner_blocks_in_memory,
                 device=self.device,
             )
         else:
@@ -1403,9 +1430,12 @@ def main():
         loras=args.loras,
         fp8transformer=args.enable_fp8,
         offload=args.offload,
-        enable_block_swap=args.enable_block_swap,
-        blocks_in_memory=args.blocks_in_memory,
+        enable_dit_block_swap=args.enable_dit_block_swap,
+        dit_blocks_in_memory=args.dit_blocks_in_memory,
+        enable_text_encoder_block_swap=args.enable_text_encoder_block_swap,
         text_encoder_blocks_in_memory=args.text_encoder_blocks_in_memory,
+        enable_refiner_block_swap=args.enable_refiner_block_swap,
+        refiner_blocks_in_memory=args.refiner_blocks_in_memory,
         one_stage=args.one_stage,
         refine_only=args.refine_only,
     )
@@ -1465,9 +1495,13 @@ def main():
         "seed": args.seed,
         "offload": args.offload,
         "enable_fp8": args.enable_fp8,
-        "enable_block_swap": args.enable_block_swap,
-        "blocks_in_memory": args.blocks_in_memory if args.enable_block_swap else None,
-        "text_encoder_blocks_in_memory": args.text_encoder_blocks_in_memory if args.enable_block_swap else None,
+        # Separate block swap settings
+        "enable_dit_block_swap": args.enable_dit_block_swap,
+        "dit_blocks_in_memory": args.dit_blocks_in_memory if args.enable_dit_block_swap else None,
+        "enable_text_encoder_block_swap": args.enable_text_encoder_block_swap,
+        "text_encoder_blocks_in_memory": args.text_encoder_blocks_in_memory if args.enable_text_encoder_block_swap else None,
+        "enable_refiner_block_swap": args.enable_refiner_block_swap,
+        "refiner_blocks_in_memory": args.refiner_blocks_in_memory if args.enable_refiner_block_swap else None,
         "images": [(img[0], img[1], img[2]) for img in args.images] if args.images else None,
         "loras": [(lora.path, lora.strength) for lora in args.loras] if args.loras else None,
         "distilled_lora": [(lora.path, lora.strength) for lora in args.distilled_lora] if args.distilled_lora else None,

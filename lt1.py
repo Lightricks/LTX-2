@@ -454,7 +454,21 @@ def format_metadata_display(metadata):
         lines.append(f"- **CPU Offloading:** {metadata['offload']}")
     if metadata.get("enable_fp8") is not None:
         lines.append(f"- **FP8 Mode:** {metadata['enable_fp8']}")
-    if metadata.get("enable_block_swap") is not None:
+    # New separate block swap settings
+    if metadata.get("enable_dit_block_swap") is not None:
+        lines.append(f"- **DiT Block Swap:** {metadata['enable_dit_block_swap']}")
+        if metadata.get("dit_blocks_in_memory"):
+            lines.append(f"  - Blocks in GPU: {metadata['dit_blocks_in_memory']}")
+    if metadata.get("enable_text_encoder_block_swap") is not None:
+        lines.append(f"- **Text Encoder Block Swap:** {metadata['enable_text_encoder_block_swap']}")
+        if metadata.get("text_encoder_blocks_in_memory"):
+            lines.append(f"  - Blocks in GPU: {metadata['text_encoder_blocks_in_memory']}")
+    if metadata.get("enable_refiner_block_swap") is not None:
+        lines.append(f"- **Refiner Block Swap:** {metadata['enable_refiner_block_swap']}")
+        if metadata.get("refiner_blocks_in_memory"):
+            lines.append(f"  - Blocks in GPU: {metadata['refiner_blocks_in_memory']}")
+    # Legacy single block swap setting (backwards compatibility)
+    elif metadata.get("enable_block_swap") is not None:
         lines.append(f"- **Block Swapping:** {metadata['enable_block_swap']}")
         if metadata.get("blocks_in_memory"):
             lines.append(f"- **Blocks in Memory:** {metadata['blocks_in_memory']}")
@@ -508,9 +522,12 @@ def generate_ltx_video(
     # Memory optimization
     offload: bool,
     enable_fp8: bool,
-    enable_block_swap: bool,
-    blocks_in_memory: int,
+    enable_dit_block_swap: bool,
+    dit_blocks_in_memory: int,
+    enable_text_encoder_block_swap: bool,
     text_encoder_blocks_in_memory: int,
+    enable_refiner_block_swap: bool,
+    refiner_blocks_in_memory: int,
     # LoRA
     lora_folder: str,
     user_lora: str,
@@ -649,10 +666,16 @@ def generate_ltx_video(
             command.append("--offload")
         if enable_fp8:
             command.append("--enable-fp8")
-        if enable_block_swap:
-            command.append("--enable-block-swap")
-            command.extend(["--blocks-in-memory", str(int(blocks_in_memory))])
+        # Block swap controls (separate for DiT, text encoder, and refiner)
+        if enable_dit_block_swap:
+            command.append("--enable-dit-block-swap")
+            command.extend(["--dit-blocks-in-memory", str(int(dit_blocks_in_memory))])
+        if enable_text_encoder_block_swap:
+            command.append("--enable-text-encoder-block-swap")
             command.extend(["--text-encoder-blocks-in-memory", str(int(text_encoder_blocks_in_memory))])
+        if enable_refiner_block_swap:
+            command.append("--enable-refiner-block-swap")
+            command.extend(["--refiner-blocks-in-memory", str(int(refiner_blocks_in_memory))])
 
         # Print command for debugging
         print("\n" + "=" * 80)
@@ -936,11 +959,17 @@ def create_interface():
                             with gr.Row():
                                 offload = gr.Checkbox(label="CPU Offloading", value=False, info="Offload models to CPU when not in use")
                                 enable_fp8 = gr.Checkbox(label="FP8 Mode", value=False, info="Reduce memory with FP8 transformer")
+                            gr.Markdown("### Block Swapping")
                             with gr.Row():
-                                enable_block_swap = gr.Checkbox(label="Block Swapping", value=True)
-                                blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=22, step=1, label="Transformer Blocks in GPU", visible=True)
+                                enable_dit_block_swap = gr.Checkbox(label="DiT Block Swap", value=True, info="Main transformer (stage 1)")
+                                dit_blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=22, step=1, label="DiT Blocks in GPU", visible=True)
                             with gr.Row():
+                                enable_text_encoder_block_swap = gr.Checkbox(label="Text Encoder Block Swap", value=True, info="Gemma text encoder")
                                 text_encoder_blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=6, step=1, label="Text Encoder Blocks in GPU", visible=True, info="Gemma-3-12B has 48 layers")
+                            with gr.Row():
+                                enable_refiner_block_swap = gr.Checkbox(label="Refiner Block Swap", value=True, info="Stage 2 refiner transformer")
+                                refiner_blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=22, step=1, label="Refiner Blocks in GPU", visible=True)
+                            with gr.Row():
                                 disable_audio = gr.Checkbox(label="Disable Audio", value=False, info="Generate video only (no audio)")
                                 enhance_prompt = gr.Checkbox(label="Enhance Prompt", value=False, info="Use Gemma to improve prompt")
                             checkpoint_path = gr.Textbox(
@@ -1067,11 +1096,21 @@ def create_interface():
             outputs=[user_lora]
         )
 
-        # Block swap visibility toggle
-        enable_block_swap.change(
-            fn=lambda x: (gr.update(visible=x), gr.update(visible=x)),
-            inputs=[enable_block_swap],
-            outputs=[blocks_in_memory, text_encoder_blocks_in_memory]
+        # Block swap visibility toggles
+        enable_dit_block_swap.change(
+            fn=lambda x: gr.update(visible=x),
+            inputs=[enable_dit_block_swap],
+            outputs=[dit_blocks_in_memory]
+        )
+        enable_text_encoder_block_swap.change(
+            fn=lambda x: gr.update(visible=x),
+            inputs=[enable_text_encoder_block_swap],
+            outputs=[text_encoder_blocks_in_memory]
+        )
+        enable_refiner_block_swap.change(
+            fn=lambda x: gr.update(visible=x),
+            inputs=[enable_refiner_block_swap],
+            outputs=[refiner_blocks_in_memory]
         )
 
         # Image dimension handlers
@@ -1135,8 +1174,10 @@ def create_interface():
                 end_image, end_image_strength,
                 input_video, refine_strength, refine_steps,
                 disable_audio, enhance_prompt,
-                offload, enable_fp8, enable_block_swap, blocks_in_memory,
-                text_encoder_blocks_in_memory,
+                offload, enable_fp8,
+                enable_dit_block_swap, dit_blocks_in_memory,
+                enable_text_encoder_block_swap, text_encoder_blocks_in_memory,
+                enable_refiner_block_swap, refiner_blocks_in_memory,
                 lora_folder, user_lora, user_lora_strength,
                 save_path, batch_size
             ],
@@ -1163,7 +1204,10 @@ def create_interface():
         def send_to_generation_handler(metadata):
             """Send loaded metadata to generation tab parameters."""
             if not metadata:
-                return [gr.update()] * 18 + ["No metadata loaded - load a video first"]
+                return [gr.update()] * 21 + ["No metadata loaded - load a video first"]
+
+            # Handle legacy metadata that used single enable_block_swap
+            legacy_block_swap = metadata.get("enable_block_swap", True)
 
             # Return updates for all generation parameters
             return [
@@ -1184,7 +1228,9 @@ def create_interface():
                 gr.update(value=metadata.get("refine_steps", 10)),  # refine_steps
                 gr.update(value=metadata.get("offload", False)),  # offload
                 gr.update(value=metadata.get("enable_fp8", False)),  # enable_fp8
-                gr.update(value=metadata.get("enable_block_swap", True)),  # enable_block_swap
+                gr.update(value=metadata.get("enable_dit_block_swap", legacy_block_swap)),  # enable_dit_block_swap
+                gr.update(value=metadata.get("enable_text_encoder_block_swap", legacy_block_swap)),  # enable_text_encoder_block_swap
+                gr.update(value=metadata.get("enable_refiner_block_swap", legacy_block_swap)),  # enable_refiner_block_swap
                 "Parameters sent to Generation tab"  # status
             ]
 
@@ -1196,7 +1242,8 @@ def create_interface():
                 width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, seed,
                 image_strength, end_image_strength, refine_strength, refine_steps,
-                offload, enable_fp8, enable_block_swap,
+                offload, enable_fp8,
+                enable_dit_block_swap, enable_text_encoder_block_swap, enable_refiner_block_swap,
                 info_status
             ]
         )
