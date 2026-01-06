@@ -35,7 +35,7 @@ from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
-from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
+from ltx_core.model.audio_vae import AudioProcessor, decode_audio as vae_decode_audio
 from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.model.video_vae import decode_video as vae_decode_video
@@ -71,7 +71,7 @@ from ltx_pipelines.utils.helpers import (
     image_conditionings_by_replacing_latent,
     simple_denoising_func,
 )
-from ltx_pipelines.utils.media_io import encode_video, load_video_conditioning
+from ltx_pipelines.utils.media_io import decode_audio_from_file, encode_video, load_video_conditioning
 from ltx_pipelines.utils.types import PipelineComponents
 
 
@@ -792,6 +792,10 @@ class LTXVideoGeneratorWithOffloading:
 
         print(f">>> Text encoding completed in {time.time() - start_time:.1f}s")
 
+        # Initialize audio_latent for use in stage 2
+        # Will be set by refine-only mode if encoding audio from input video
+        audio_latent = None
+
         # =====================================================================
         # Refine-only mode: Skip stage 1 and use input video directly
         # =====================================================================
@@ -817,16 +821,53 @@ class LTXVideoGeneratorWithOffloading:
                 overlap_frames=8,  # 1 latent token overlap
             )
 
-            # For audio, generate fresh audio latent that will be denoised in stage 2
-            audio_shape = self.pipeline_components.get_audio_shape(
-                VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
-            )
-            initial_audio_latent = noiser.noise(
-                torch.zeros(audio_shape.batch, audio_shape.channels, audio_shape.num_tokens,
-                           device=self.device, dtype=dtype),
-                STAGE_2_DISTILLED_SIGMA_VALUES[0]
-            )
-            audio_state = LatentState(latent=initial_audio_latent)
+            # Extract and encode audio from input video (like stage 1 would)
+            audio_latent = None
+            if not disable_audio:
+                print(">>> Encoding audio from input video...")
+
+                # Extract audio waveform from input video
+                waveform = decode_audio_from_file(input_video, self.device)
+
+                if waveform is not None:
+                    import av
+                    audio_encoder = self.stage_1_model_ledger.audio_encoder()
+
+                    # Create audio processor with encoder's parameters
+                    audio_processor = AudioProcessor(
+                        sample_rate=audio_encoder.sample_rate,
+                        mel_bins=audio_encoder.mel_bins,
+                        mel_hop_length=audio_encoder.mel_hop_length,
+                        n_fft=audio_encoder.n_fft,
+                    ).to(self.device)
+
+                    # Add batch dimension if needed
+                    if waveform.dim() == 2:
+                        waveform = waveform.unsqueeze(0)
+
+                    # Get sample rate from the video file
+                    container = av.open(input_video)
+                    audio_stream = next(s for s in container.streams if s.type == "audio")
+                    sample_rate = audio_stream.sample_rate
+                    container.close()
+
+                    # Convert waveform to mel spectrogram (use float32 for audio quality)
+                    mel_spectrogram = audio_processor.waveform_to_mel(
+                        waveform.to(dtype=torch.float32),
+                        waveform_sample_rate=sample_rate
+                    )
+
+                    # Encode mel spectrogram to latents
+                    audio_latent = audio_encoder(mel_spectrogram.to(dtype=torch.float32))
+                    # Convert to bfloat16 for consistency with pipeline
+                    audio_latent = audio_latent.to(dtype=dtype)
+
+                    # Clean up audio encoder
+                    del audio_encoder, audio_processor
+                    cleanup_memory()
+                    print(">>> Audio encoded successfully")
+                else:
+                    print(">>> Input video has no audio track, will generate fresh audio")
 
             print(f">>> Input video encoded in {time.time() - refine_start:.1f}s")
 
@@ -1206,6 +1247,9 @@ class LTXVideoGeneratorWithOffloading:
         )
 
         print(f">>> Stage 2: Refining at {stage_2_output_shape.width}x{stage_2_output_shape.height}...")
+        # For refine-only mode, use audio_latent from input video encoding
+        # For normal two-stage, use audio_state.latent from stage 1
+        stage_2_initial_audio = audio_latent if (self.refine_only and input_video) else audio_state.latent
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_2_output_shape,
             conditionings=stage_2_conditionings,
@@ -1218,7 +1262,7 @@ class LTXVideoGeneratorWithOffloading:
             device=self.device,
             noise_scale=distilled_sigmas[0],
             initial_video_latent=upscaled_video_latent,
-            initial_audio_latent=audio_state.latent,
+            initial_audio_latent=stage_2_initial_audio,
         )
 
         print(f">>> Stage 2 completed in {time.time() - stage2_start:.1f}s")
