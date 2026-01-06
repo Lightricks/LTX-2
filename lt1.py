@@ -581,9 +581,9 @@ def create_interface():
                                 enable_fp8 = gr.Checkbox(label="FP8 Mode", value=False, info="Reduce memory with FP8 transformer")
                             with gr.Row():
                                 enable_block_swap = gr.Checkbox(label="Block Swapping", value=True)
-                                blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=22, step=1, label="Transformer Blocks in GPU", visible=False)
+                                blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=22, step=1, label="Transformer Blocks in GPU", visible=True)
                             with gr.Row():
-                                text_encoder_blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=6, step=1, label="Text Encoder Blocks in GPU", visible=False, info="Gemma-3-12B has 48 layers")
+                                text_encoder_blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=6, step=1, label="Text Encoder Blocks in GPU", visible=True, info="Gemma-3-12B has 48 layers")
 
                         # User LoRA
                         with gr.Accordion("User LoRA (Optional)", open=False):
