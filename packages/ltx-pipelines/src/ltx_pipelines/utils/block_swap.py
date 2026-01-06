@@ -59,10 +59,13 @@ def enable_block_swap(
         print(f"[BlockSwap] blocks_in_memory ({blocks_in_memory}) >= num_blocks ({num_blocks}), no swapping needed")
         return None
 
+    # Get reference to the actual blocks (not a copy!)
+    blocks = ltx_model.transformer_blocks
+
     # Create offloader with ThreadPoolExecutor for async transfers
     offloader = ModelOffloader(
         block_type="ltx_transformer_block",
-        blocks=list(ltx_model.transformer_blocks),
+        blocks=blocks,
         num_blocks=num_blocks,
         blocks_to_swap=blocks_to_swap,
         supports_backward=False,
@@ -72,12 +75,14 @@ def enable_block_swap(
     # Store on model for access in forward pass
     ltx_model._block_swap_offloader = offloader
     ltx_model._blocks_to_swap = blocks_to_swap
+    ltx_model._blocks_ref = blocks  # Store reference for forward pass
     if isinstance(model, X0Model):
         model._block_swap_offloader = offloader
         model._blocks_to_swap = blocks_to_swap
+        model._blocks_ref = blocks
 
     # Prepare block positions: first (num_blocks - blocks_to_swap) on GPU, rest on CPU
-    offloader.prepare_block_devices_before_forward(list(ltx_model.transformer_blocks))
+    offloader.prepare_block_devices_before_forward(blocks)
 
     # Store original method for potential restoration
     ltx_model._original_process_transformer_blocks = ltx_model._process_transformer_blocks
@@ -86,10 +91,15 @@ def enable_block_swap(
     def block_swap_process_transformer_blocks(self, video, audio, perturbations):
         """Process transformer blocks with block swapping using wait/submit pattern."""
         offloader = self._block_swap_offloader
+        blocks = self._blocks_ref  # Use stored reference, not a copy
+
+        print(f"[BlockSwap] Starting forward pass with {len(self.transformer_blocks)} blocks", flush=True)
 
         for block_idx, block in enumerate(self.transformer_blocks):
             # Wait for this block to be ready BEFORE using it
+            print(f"[BlockSwap] Block {block_idx}: waiting...", flush=True)
             offloader.wait_for_block(block_idx)
+            print(f"[BlockSwap] Block {block_idx}: ready, processing...", flush=True)
 
             # Process the block
             video, audio = block(
@@ -97,10 +107,12 @@ def enable_block_swap(
                 audio=audio,
                 perturbations=perturbations,
             )
+            print(f"[BlockSwap] Block {block_idx}: done, submitting swap...", flush=True)
 
             # Submit swap for next iteration AFTER using block
-            offloader.submit_move_blocks_forward(list(self.transformer_blocks), block_idx)
+            offloader.submit_move_blocks_forward(blocks, block_idx)
 
+        print(f"[BlockSwap] Forward pass complete", flush=True)
         return video, audio
 
     # Monkey-patch the method
