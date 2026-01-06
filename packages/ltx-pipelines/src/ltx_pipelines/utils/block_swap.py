@@ -177,6 +177,10 @@ def _create_block_swap_forward(
                 perturbations=perturbations,
             )
 
+        # Synchronize to ensure all async transfers complete before returning
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
         return video, audio
 
     return block_swap_process_transformer_blocks
