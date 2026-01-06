@@ -281,31 +281,45 @@ def calculate_height_from_width(width, original_dims):
         return gr.update()
 
 
-def get_video_info(video_path):
-    """Get video dimensions and frame count using ffprobe."""
-    if video_path is None:
-        return None
+def get_video_info(video_path: str) -> dict:
+    """Get video information using PyAV."""
     try:
-        import subprocess
-        import json
-        cmd = [
-            "ffprobe", "-v", "quiet", "-print_format", "json",
-            "-show_streams", "-select_streams", "v:0", video_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        data = json.loads(result.stdout)
-        if data.get("streams"):
-            stream = data["streams"][0]
+        import av
+        with av.open(video_path) as container:
+            # Get first video stream
+            video_stream = container.streams.video[0]
+
+            width = video_stream.width
+            height = video_stream.height
+
+            # Calculate FPS from average_rate or guessed_rate
+            if video_stream.average_rate:
+                fps = float(video_stream.average_rate)
+            elif video_stream.guessed_rate:
+                fps = float(video_stream.guessed_rate)
+            else:
+                fps = 30.0  # fallback
+
+            # Calculate duration
+            if video_stream.duration and video_stream.time_base:
+                duration = float(video_stream.duration * video_stream.time_base)
+            elif container.duration:
+                duration = container.duration / av.time_base
+            else:
+                duration = 0
+
+            total_frames = int(video_stream.frames) if video_stream.frames else int(duration * fps)
+
             return {
-                "width": int(stream.get("width", 0)),
-                "height": int(stream.get("height", 0)),
-                "nb_frames": int(stream.get("nb_frames", 0)) if stream.get("nb_frames") else None,
-                "duration": float(stream.get("duration", 0)) if stream.get("duration") else None,
-                "fps": eval(stream.get("r_frame_rate", "24/1")) if stream.get("r_frame_rate") else 24,
+                'width': width,
+                'height': height,
+                'fps': fps,
+                'total_frames': total_frames,
+                'duration': duration
             }
     except Exception as e:
-        print(f"Error getting video info: {e}")
-    return None
+        print(f"Error extracting video info: {e}")
+        return {}
 
 
 def update_video_dimensions(video_path):
@@ -315,25 +329,26 @@ def update_video_dimensions(video_path):
     try:
         info = get_video_info(video_path)
         if info:
-            w, h = info["width"], info["height"]
-            original_dims_str = f"{w}x{h}"
-            # Snap to nearest multiple of 64
-            new_w = round(w / 64) * 64
-            new_h = round(h / 64) * 64
-            new_w = max(64, new_w)
-            new_h = max(64, new_h)
-            # Calculate frame count (snap to 8*K+1 format)
-            if info.get("nb_frames"):
-                num_frames = info["nb_frames"]
-            elif info.get("duration") and info.get("fps"):
-                num_frames = int(info["duration"] * info["fps"])
-            else:
-                num_frames = 121
-            # Snap to nearest 8*K+1
-            k = max(1, round((num_frames - 1) / 8))
-            num_frames = 8 * k + 1
-            fps = info.get("fps", 24)
-            return original_dims_str, gr.update(value=new_w), gr.update(value=new_h), gr.update(value=num_frames), gr.update(value=int(fps))
+            w, h = info.get("width", 0), info.get("height", 0)
+            if w and h:
+                original_dims_str = f"{w}x{h}"
+                # Snap to nearest multiple of 64
+                new_w = round(w / 64) * 64
+                new_h = round(h / 64) * 64
+                new_w = max(64, new_w)
+                new_h = max(64, new_h)
+                # Calculate frame count (snap to 8*K+1 format)
+                if info.get("total_frames"):
+                    num_frames = info["total_frames"]
+                elif info.get("duration") and info.get("fps"):
+                    num_frames = int(info["duration"] * info["fps"])
+                else:
+                    num_frames = 121
+                # Snap to nearest 8*K+1
+                k = max(1, round((num_frames - 1) / 8))
+                num_frames = 8 * k + 1
+                fps = info.get("fps", 24)
+                return original_dims_str, gr.update(value=new_w), gr.update(value=new_h), gr.update(value=num_frames), gr.update(value=int(fps))
     except Exception as e:
         print(f"Error reading video dimensions: {e}")
     return "", gr.update(), gr.update(), gr.update(), gr.update()
@@ -344,141 +359,56 @@ def extract_video_metadata(video_path: str) -> dict:
     try:
         import av
         with av.open(video_path) as container:
+            # Get comment metadata from container
             comment = container.metadata.get('comment', '{}')
             return json.loads(comment)
     except Exception as e:
-        print(f"Metadata extraction failed: {e}")
+        print(f"Metadata extraction failed: {str(e)}")
         return {}
 
 
-def load_video_metadata(video_path):
-    """Load metadata from video file or JSON sidecar file."""
-    if not video_path:
-        return None, "No video selected"
+def add_metadata_to_video(video_path: str, parameters: dict) -> None:
+    """Add generation parameters to video metadata using ffmpeg."""
+    # Convert parameters to JSON string
+    params_json = json.dumps(parameters, indent=2)
 
-    # First try to extract metadata embedded in video file
-    metadata = extract_video_metadata(video_path)
-    if metadata:
-        return metadata, None
+    # Temporary output path
+    temp_path = video_path.replace(".mp4", "_temp.mp4")
 
-    # Fall back to JSON sidecar file for backwards compatibility
-    meta_path = video_path.replace(".mp4", "_meta.json")
-    if not os.path.exists(meta_path):
-        meta_path = video_path + "_meta.json"
-
-    if not os.path.exists(meta_path):
-        return None, f"No metadata found for: {os.path.basename(video_path)}"
+    # FFmpeg command to add metadata without re-encoding
+    cmd = [
+        'ffmpeg',
+        '-i', video_path,
+        '-metadata', f'comment={params_json}',
+        '-codec', 'copy',
+        temp_path
+    ]
 
     try:
-        with open(meta_path, 'r') as f:
-            metadata = json.load(f)
-        return metadata, None
+        # Execute FFmpeg command
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # Replace original file with the metadata-enhanced version
+        os.replace(temp_path, video_path)
+    except subprocess.CalledProcessError as e:
+        print(f"Failed to add metadata: {e.stderr.decode()}")
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
     except Exception as e:
-        return None, f"Error reading metadata: {e}"
+        print(f"Error: {str(e)}")
 
 
-def format_metadata_display(metadata):
-    """Format metadata for display in the UI."""
-    if not metadata:
-        return "No metadata available"
+def extract_video_details(video_path: str) -> Tuple[dict, str]:
+    """Extract both metadata and video information."""
+    metadata = extract_video_metadata(video_path)
+    video_details = get_video_info(video_path)
 
-    lines = []
-    lines.append("## Generation Parameters\n")
+    # Combine metadata with video details
+    for key, value in video_details.items():
+        if key not in metadata:
+            metadata[key] = value
 
-    # Basic info
-    if metadata.get("model_type"):
-        lines.append(f"**Model:** {metadata['model_type']}")
-    if metadata.get("pipeline"):
-        lines.append(f"**Pipeline:** {metadata['pipeline']}")
-    if metadata.get("mode"):
-        lines.append(f"**Mode:** {metadata['mode']}")
-
-    lines.append("")
-
-    # Prompt
-    if metadata.get("prompt"):
-        lines.append(f"**Prompt:**\n> {metadata['prompt']}")
-    if metadata.get("negative_prompt"):
-        lines.append(f"\n**Negative Prompt:**\n> {metadata['negative_prompt']}")
-
-    lines.append("")
-    lines.append("### Settings")
-
-    # Resolution and frames
-    if metadata.get("width") and metadata.get("height"):
-        lines.append(f"- **Resolution:** {metadata['width']}x{metadata['height']}")
-    if metadata.get("num_frames"):
-        lines.append(f"- **Frames:** {metadata['num_frames']}")
-    if metadata.get("frame_rate"):
-        lines.append(f"- **Frame Rate:** {metadata['frame_rate']} fps")
-    if metadata.get("seed") is not None:
-        lines.append(f"- **Seed:** {metadata['seed']}")
-
-    # Generation settings
-    if metadata.get("cfg_guidance_scale"):
-        lines.append(f"- **CFG Scale:** {metadata['cfg_guidance_scale']}")
-    if metadata.get("num_inference_steps"):
-        lines.append(f"- **Steps:** {metadata['num_inference_steps']}")
-
-    # Image conditioning
-    if metadata.get("input_image"):
-        lines.append(f"- **Input Image:** {metadata['input_image']}")
-        if metadata.get("image_frame_idx") is not None:
-            lines.append(f"- **Image Frame Index:** {metadata['image_frame_idx']}")
-        if metadata.get("image_strength") is not None:
-            lines.append(f"- **Image Strength:** {metadata['image_strength']}")
-
-    if metadata.get("end_image"):
-        lines.append(f"- **End Image:** {metadata['end_image']}")
-        if metadata.get("end_image_strength") is not None:
-            lines.append(f"- **End Image Strength:** {metadata['end_image_strength']}")
-
-    # Video input
-    if metadata.get("input_video"):
-        lines.append(f"- **Input Video:** {metadata['input_video']}")
-        if metadata.get("refine_strength") is not None:
-            lines.append(f"- **Refine Strength:** {metadata['refine_strength']}")
-        if metadata.get("refine_steps") is not None:
-            lines.append(f"- **Refine Steps:** {metadata['refine_steps']}")
-
-    # LoRA
-    if metadata.get("user_lora"):
-        lines.append(f"- **User LoRA:** {metadata['user_lora']}")
-        if metadata.get("user_lora_strength") is not None:
-            lines.append(f"- **LoRA Strength:** {metadata['user_lora_strength']}")
-
-    # Memory settings
-    lines.append("")
-    lines.append("### Memory Settings")
-    if metadata.get("offload") is not None:
-        lines.append(f"- **CPU Offloading:** {metadata['offload']}")
-    if metadata.get("enable_fp8") is not None:
-        lines.append(f"- **FP8 Mode:** {metadata['enable_fp8']}")
-    # New separate block swap settings
-    if metadata.get("enable_dit_block_swap") is not None:
-        lines.append(f"- **DiT Block Swap:** {metadata['enable_dit_block_swap']}")
-        if metadata.get("dit_blocks_in_memory"):
-            lines.append(f"  - Blocks in GPU: {metadata['dit_blocks_in_memory']}")
-    if metadata.get("enable_text_encoder_block_swap") is not None:
-        lines.append(f"- **Text Encoder Block Swap:** {metadata['enable_text_encoder_block_swap']}")
-        if metadata.get("text_encoder_blocks_in_memory"):
-            lines.append(f"  - Blocks in GPU: {metadata['text_encoder_blocks_in_memory']}")
-    if metadata.get("enable_refiner_block_swap") is not None:
-        lines.append(f"- **Refiner Block Swap:** {metadata['enable_refiner_block_swap']}")
-        if metadata.get("refiner_blocks_in_memory"):
-            lines.append(f"  - Blocks in GPU: {metadata['refiner_blocks_in_memory']}")
-    # Legacy single block swap setting (backwards compatibility)
-    elif metadata.get("enable_block_swap") is not None:
-        lines.append(f"- **Block Swapping:** {metadata['enable_block_swap']}")
-        if metadata.get("blocks_in_memory"):
-            lines.append(f"- **Blocks in Memory:** {metadata['blocks_in_memory']}")
-
-    # Generation time
-    if metadata.get("generation_time_seconds"):
-        lines.append("")
-        lines.append(f"**Generation Time:** {metadata['generation_time_seconds']:.1f}s")
-
-    return "\n".join(lines)
+    # Return both the updated metadata and a status message
+    return metadata, "Video details extracted successfully"
 
 
 # =============================================================================
@@ -1004,20 +934,15 @@ def create_interface():
             # Video Info Tab
             # =================================================================
             with gr.Tab("Video Info"):
-                gr.Markdown("## Video Metadata Viewer\nLoad a generated video to view its parameters and optionally send them to the generation tab.")
+                with gr.Row():
+                    info_video_input = gr.Video(label="Upload Video", interactive=True)
+                    info_metadata_output = gr.JSON(label="Generation Parameters")
 
                 with gr.Row():
-                    with gr.Column(scale=1):
-                        info_video_input = gr.Video(label="Select Video", sources=["upload"])
-                        info_load_btn = gr.Button("Load Metadata", variant="primary")
-                        info_send_btn = gr.Button("Send to Generation", variant="secondary")
-                        info_status = gr.Textbox(label="Status", interactive=False)
+                    info_status = gr.Textbox(label="Status", interactive=False)
 
-                    with gr.Column(scale=2):
-                        info_metadata_display = gr.Markdown("Select a video and click 'Load Metadata' to view its generation parameters.")
-
-                # Hidden state to store loaded metadata
-                info_metadata_state = gr.State(value=None)
+                with gr.Row():
+                    info_send_btn = gr.Button("Send to Generation", variant="primary")
 
             # =================================================================
             # Help Tab
@@ -1187,24 +1112,16 @@ def create_interface():
         # =================================================================
         # Video Info Tab Event Handlers
         # =================================================================
-        def load_metadata_handler(video_path):
-            """Load and display metadata for selected video."""
-            metadata, error = load_video_metadata(video_path)
-            if error:
-                return None, error, "No metadata loaded"
-            display_text = format_metadata_display(metadata)
-            return metadata, "Metadata loaded successfully", display_text
-
-        info_load_btn.click(
-            fn=load_metadata_handler,
-            inputs=[info_video_input],
-            outputs=[info_metadata_state, info_status, info_metadata_display]
+        info_video_input.upload(
+            fn=extract_video_details,
+            inputs=info_video_input,
+            outputs=[info_metadata_output, info_status]
         )
 
         def send_to_generation_handler(metadata):
             """Send loaded metadata to generation tab parameters."""
             if not metadata:
-                return [gr.update()] * 21 + ["No metadata loaded - load a video first"]
+                return [gr.update()] * 21 + ["No metadata loaded - upload a video first"]
 
             # Handle legacy metadata that used single enable_block_swap
             legacy_block_swap = metadata.get("enable_block_swap", True)
@@ -1236,7 +1153,7 @@ def create_interface():
 
         info_send_btn.click(
             fn=send_to_generation_handler,
-            inputs=[info_metadata_state],
+            inputs=[info_metadata_output],
             outputs=[
                 prompt, negative_prompt, mode, pipeline,
                 width, height, num_frames, frame_rate,
