@@ -578,7 +578,7 @@ def create_interface():
                                 enable_fp8 = gr.Checkbox(label="FP8 Mode", value=False, info="Reduce memory with FP8 transformer")
                             with gr.Row():
                                 enable_block_swap = gr.Checkbox(label="Block Swapping", value=False, info="~40% VRAM reduction")
-                                blocks_in_memory = gr.Slider(minimum=2, maximum=24, value=6, step=1, label="Blocks in GPU", visible=False)
+                                blocks_in_memory = gr.Slider(minimum=1, maximum=47, value=22, step=1, label="Blocks in GPU", visible=False)
 
                         # User LoRA
                         with gr.Accordion("User LoRA (Optional)", open=False):

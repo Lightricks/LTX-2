@@ -595,11 +595,14 @@ class LTXVideoGeneratorWithOffloading:
         torch.cuda.synchronize()  # Must sync before any other operations
         print(">>> DEBUG: cuda synced"); sys.stdout.flush()
 
-        print(f">>> Stage 1 completed in {time.time() - stage1_start:.1f}s")
+        print(f">>> Stage 1 completed in {time.time() - stage1_start:.1f}s"); sys.stdout.flush()
+        print(">>> DEBUG: about to cleanup stage 1"); sys.stdout.flush()
 
         # Cleanup stage 1 transformer
         if block_swap_manager:
+            print(">>> DEBUG: calling offload_all"); sys.stdout.flush()
             block_swap_manager.offload_all()
+            print(">>> DEBUG: offload_all done"); sys.stdout.flush()
         if self.offload:
             print(">>> Offloading stage 1 transformer to CPU...")
         torch.cuda.synchronize()
