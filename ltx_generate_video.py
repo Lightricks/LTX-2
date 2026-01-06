@@ -1,0 +1,747 @@
+#!/usr/bin/env python3
+"""
+LTX-2 Video Generation Script
+
+A comprehensive CLI tool for generating videos using the LTX-2 model with:
+- Two-stage pipeline (low-res generation + hi-res refinement)
+- Joint audio-video generation
+- Intelligent CPU/GPU offloading
+- Block swapping for memory efficiency
+- Image conditioning (I2V mode)
+- LoRA support
+- FP8 quantization
+
+Based on the LTX-2 ti2vid_two_stages pipeline with advanced memory management
+features inspired by Kandinsky5.
+"""
+
+import argparse
+import gc
+import logging
+import os
+import sys
+import time
+from collections.abc import Iterator
+from dataclasses import replace
+from pathlib import Path
+
+import torch
+from tqdm import tqdm
+
+# Import LTX-2 components
+from ltx_core.components.diffusion_steps import EulerDiffusionStep
+from ltx_core.components.guiders import CFGGuider
+from ltx_core.components.noisers import GaussianNoiser
+from ltx_core.components.protocols import DiffusionStepProtocol
+from ltx_core.components.schedulers import LTX2Scheduler
+from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
+from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
+from ltx_core.model.upsampler import upsample_video
+from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
+from ltx_core.model.video_vae import decode_video as vae_decode_video
+from ltx_core.text_encoders.gemma import encode_text
+from ltx_core.types import LatentState, VideoPixelShape
+
+from ltx_pipelines.utils import ModelLedger
+from ltx_pipelines.utils.constants import (
+    AUDIO_SAMPLE_RATE,
+    DEFAULT_CFG_GUIDANCE_SCALE,
+    DEFAULT_FRAME_RATE,
+    DEFAULT_LORA_STRENGTH,
+    DEFAULT_NEGATIVE_PROMPT,
+    DEFAULT_NUM_FRAMES,
+    DEFAULT_NUM_INFERENCE_STEPS,
+    DEFAULT_SEED,
+    STAGE_2_DISTILLED_SIGMA_VALUES,
+)
+from ltx_pipelines.utils.helpers import (
+    assert_resolution,
+    cleanup_memory,
+    denoise_audio_video,
+    euler_denoising_loop,
+    generate_enhanced_prompt,
+    get_device,
+    guider_denoising_func,
+    image_conditionings_by_replacing_latent,
+    simple_denoising_func,
+)
+from ltx_pipelines.utils.media_io import encode_video
+from ltx_pipelines.utils.types import PipelineComponents
+
+
+# =============================================================================
+# Defaults
+# =============================================================================
+
+DEFAULT_WIDTH = 1024
+DEFAULT_HEIGHT = 1024
+DEFAULT_GEMMA_ROOT = "./gemma-3-12b-it-qat-q4_0-unquantized"
+
+
+# =============================================================================
+# Argument Parser
+# =============================================================================
+
+def resolve_path(path: str) -> str:
+    """Resolve a path to an absolute path."""
+    return str(Path(path).expanduser().resolve().as_posix())
+
+
+class ImageAction(argparse.Action):
+    """Parse image conditioning arguments: PATH FRAME_IDX STRENGTH"""
+    def __call__(self, parser, namespace, values, option_string=None):
+        path, frame_idx, strength_str = values
+        resolved_path = resolve_path(path)
+        frame_idx = int(frame_idx)
+        strength = float(strength_str)
+        current = getattr(namespace, self.dest) or []
+        current.append((resolved_path, frame_idx, strength))
+        setattr(namespace, self.dest, current)
+
+
+class LoraAction(argparse.Action):
+    """Parse LoRA arguments: PATH [STRENGTH]"""
+    def __call__(self, parser, namespace, values, option_string=None):
+        if len(values) > 2:
+            msg = f"{option_string} accepts at most 2 arguments (PATH and optional STRENGTH), got {len(values)} values"
+            raise argparse.ArgumentError(self, msg)
+
+        path = values[0]
+        strength_str = values[1] if len(values) > 1 else str(DEFAULT_LORA_STRENGTH)
+
+        resolved_path = resolve_path(path)
+        strength = float(strength_str)
+
+        current = getattr(namespace, self.dest) or []
+        current.append(LoraPathStrengthAndSDOps(resolved_path, strength, LTXV_LORA_COMFY_RENAMING_MAP))
+        setattr(namespace, self.dest, current)
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="LTX-2 Video Generation with advanced memory management",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic text-to-video generation
+  python ltx_generate_video.py \\
+    --checkpoint-path model.safetensors \\
+    --spatial-upsampler-path upsampler.safetensors \\
+    --distilled-lora distilled.safetensors \\
+    --prompt "A cat playing piano" \\
+    --output-path output.mp4
+
+  # Image-to-video with conditioning
+  python ltx_generate_video.py \\
+    --checkpoint-path model.safetensors \\
+    --spatial-upsampler-path upsampler.safetensors \\
+    --distilled-lora distilled.safetensors \\
+    --prompt "The cat starts playing" \\
+    --image input.jpg 0 0.9 \\
+    --output-path output.mp4
+
+  # Memory-optimized generation with offloading
+  python ltx_generate_video.py \\
+    --checkpoint-path model.safetensors \\
+    --spatial-upsampler-path upsampler.safetensors \\
+    --distilled-lora distilled.safetensors \\
+    --prompt "A beautiful sunset" \\
+    --offload \\
+    --enable-fp8 \\
+    --output-path output.mp4
+        """
+    )
+
+    # ==========================================================================
+    # Required Model Paths
+    # ==========================================================================
+    model_group = parser.add_argument_group("Model Paths")
+    model_group.add_argument(
+        "--checkpoint-path",
+        type=resolve_path,
+        required=True,
+        help="Path to LTX-2 model checkpoint (.safetensors file).",
+    )
+    model_group.add_argument(
+        "--gemma-root",
+        type=resolve_path,
+        default=DEFAULT_GEMMA_ROOT,
+        help=f"Path to Gemma text encoder directory (default: {DEFAULT_GEMMA_ROOT}).",
+    )
+    model_group.add_argument(
+        "--spatial-upsampler-path",
+        type=resolve_path,
+        required=True,
+        help="Path to spatial upsampler model for 2x resolution increase.",
+    )
+    model_group.add_argument(
+        "--distilled-lora",
+        dest="distilled_lora",
+        action=LoraAction,
+        nargs="+",
+        metavar=("PATH", "STRENGTH"),
+        required=True,
+        help="Distilled LoRA for stage 2 refinement. Example: --distilled-lora path.safetensors 1.0",
+    )
+
+    # ==========================================================================
+    # Generation Parameters
+    # ==========================================================================
+    gen_group = parser.add_argument_group("Generation Parameters")
+    gen_group.add_argument(
+        "--prompt",
+        type=str,
+        required=True,
+        help="Text prompt describing the desired video content.",
+    )
+    gen_group.add_argument(
+        "--negative-prompt",
+        type=str,
+        default=DEFAULT_NEGATIVE_PROMPT,
+        help="Negative prompt for unwanted content (default: comprehensive quality prompt).",
+    )
+    gen_group.add_argument(
+        "--output-path",
+        type=resolve_path,
+        required=True,
+        help="Output video file path (.mp4).",
+    )
+    gen_group.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_SEED,
+        help=f"Random seed for reproducibility (default: {DEFAULT_SEED}).",
+    )
+    gen_group.add_argument(
+        "--width",
+        type=int,
+        default=DEFAULT_WIDTH,
+        help=f"Video width in pixels, must be divisible by 64 (default: {DEFAULT_WIDTH}).",
+    )
+    gen_group.add_argument(
+        "--height",
+        type=int,
+        default=DEFAULT_HEIGHT,
+        help=f"Video height in pixels, must be divisible by 64 (default: {DEFAULT_HEIGHT}).",
+    )
+    gen_group.add_argument(
+        "--num-frames",
+        type=int,
+        default=DEFAULT_NUM_FRAMES,
+        help=f"Number of frames (8*K + 1, e.g., 121 = 5s at 24fps) (default: {DEFAULT_NUM_FRAMES}).",
+    )
+    gen_group.add_argument(
+        "--frame-rate",
+        type=float,
+        default=DEFAULT_FRAME_RATE,
+        help=f"Video frame rate in fps (default: {DEFAULT_FRAME_RATE}).",
+    )
+    gen_group.add_argument(
+        "--num-inference-steps",
+        type=int,
+        default=DEFAULT_NUM_INFERENCE_STEPS,
+        help=f"Number of denoising steps for stage 1 (default: {DEFAULT_NUM_INFERENCE_STEPS}).",
+    )
+    gen_group.add_argument(
+        "--cfg-guidance-scale",
+        type=float,
+        default=DEFAULT_CFG_GUIDANCE_SCALE,
+        help=f"CFG guidance scale (default: {DEFAULT_CFG_GUIDANCE_SCALE}).",
+    )
+
+    # ==========================================================================
+    # Image Conditioning (I2V)
+    # ==========================================================================
+    i2v_group = parser.add_argument_group("Image Conditioning (I2V)")
+    i2v_group.add_argument(
+        "--image",
+        dest="images",
+        action=ImageAction,
+        nargs=3,
+        metavar=("PATH", "FRAME_IDX", "STRENGTH"),
+        default=[],
+        help="Image conditioning: path, frame index, strength. Can be repeated.",
+    )
+
+    # ==========================================================================
+    # LoRA Support
+    # ==========================================================================
+    lora_group = parser.add_argument_group("LoRA Support")
+    lora_group.add_argument(
+        "--lora",
+        dest="loras",
+        action=LoraAction,
+        nargs="+",
+        metavar=("PATH", "STRENGTH"),
+        default=[],
+        help="User LoRA: path and optional strength (default: 1.0). Can be repeated.",
+    )
+
+    # ==========================================================================
+    # Memory Optimization
+    # ==========================================================================
+    mem_group = parser.add_argument_group("Memory Optimization")
+    mem_group.add_argument(
+        "--offload",
+        action="store_true",
+        help="Enable CPU/GPU offloading to reduce VRAM usage.",
+    )
+    mem_group.add_argument(
+        "--enable-fp8",
+        action="store_true",
+        help="Enable FP8 mode for transformer (reduces memory, calculations in bfloat16).",
+    )
+    mem_group.add_argument(
+        "--enable-block-swap",
+        action="store_true",
+        help="Enable block swapping for transformer (reduces VRAM by ~40%%).",
+    )
+    mem_group.add_argument(
+        "--blocks-in-memory",
+        type=int,
+        default=6,
+        help="Number of transformer blocks to keep in GPU when block swapping (default: 6).",
+    )
+
+    # ==========================================================================
+    # Audio Control
+    # ==========================================================================
+    audio_group = parser.add_argument_group("Audio Control")
+    audio_group.add_argument(
+        "--disable-audio",
+        action="store_true",
+        help="Disable audio generation (video only output).",
+    )
+
+    # ==========================================================================
+    # Advanced Options
+    # ==========================================================================
+    adv_group = parser.add_argument_group("Advanced Options")
+    adv_group.add_argument(
+        "--enhance-prompt",
+        action="store_true",
+        help="Use Gemma to enhance the prompt before generation.",
+    )
+    adv_group.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging.",
+    )
+
+    return parser.parse_args()
+
+
+# =============================================================================
+# Memory Management Utilities
+# =============================================================================
+
+def offload_model(model: torch.nn.Module, target: str = "cpu") -> torch.nn.Module:
+    """Offload a model to CPU or back to GPU."""
+    if model is not None:
+        model = model.to(target, non_blocking=True)
+    return model
+
+
+def synchronize_and_cleanup():
+    """Synchronize CUDA and cleanup memory."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+# =============================================================================
+# Pipeline with Offloading
+# =============================================================================
+
+class LTXVideoGeneratorWithOffloading:
+    """
+    LTX-2 video generator with intelligent model offloading.
+
+    This class wraps the two-stage pipeline and manages model lifecycle
+    to minimize GPU memory usage through strategic CPU offloading.
+    """
+
+    def __init__(
+        self,
+        checkpoint_path: str,
+        distilled_lora: list[LoraPathStrengthAndSDOps],
+        spatial_upsampler_path: str,
+        gemma_root: str,
+        loras: list[LoraPathStrengthAndSDOps],
+        device: str = None,
+        fp8transformer: bool = False,
+        offload: bool = False,
+        enable_block_swap: bool = False,
+        blocks_in_memory: int = 6,
+    ):
+        self.device = device or get_device()
+        self.dtype = torch.bfloat16
+        self.offload = offload
+        self.enable_block_swap = enable_block_swap
+        self.blocks_in_memory = blocks_in_memory
+
+        # Create model ledger for stage 1
+        self.stage_1_model_ledger = ModelLedger(
+            dtype=self.dtype,
+            device=self.device,
+            checkpoint_path=checkpoint_path,
+            gemma_root_path=gemma_root,
+            spatial_upsampler_path=spatial_upsampler_path,
+            loras=loras,
+            fp8transformer=fp8transformer,
+        )
+
+        # Create model ledger for stage 2 (with distilled LoRA)
+        self.stage_2_model_ledger = self.stage_1_model_ledger.with_loras(
+            loras=distilled_lora,
+        )
+
+        # Pipeline components (patchifiers, scale factors)
+        self.pipeline_components = PipelineComponents(
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+    @torch.inference_mode()
+    def generate(
+        self,
+        prompt: str,
+        negative_prompt: str,
+        seed: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        frame_rate: float,
+        num_inference_steps: int,
+        cfg_guidance_scale: float,
+        images: list[tuple[str, int, float]],
+        tiling_config: TilingConfig | None = None,
+        enhance_prompt: bool = False,
+        disable_audio: bool = False,
+    ) -> tuple[Iterator[torch.Tensor], torch.Tensor | None]:
+        """
+        Generate video with optional audio.
+
+        Returns:
+            Tuple of (video_iterator, audio_tensor or None)
+        """
+        # Validate resolution
+        assert_resolution(height=height, width=width, is_two_stage=True)
+
+        # Initialize diffusion components
+        generator = torch.Generator(device=self.device).manual_seed(seed)
+        noiser = GaussianNoiser(generator=generator)
+        stepper = EulerDiffusionStep()
+        cfg_guider = CFGGuider(cfg_guidance_scale)
+        dtype = self.dtype
+
+        start_time = time.time()
+
+        # =====================================================================
+        # Phase 1: Text Encoding
+        # =====================================================================
+        print(">>> Loading text encoder...")
+        text_encoder = self.stage_1_model_ledger.text_encoder()
+
+        if enhance_prompt:
+            print(">>> Enhancing prompt with Gemma...")
+            prompt = generate_enhanced_prompt(
+                text_encoder, prompt, images[0][0] if len(images) > 0 else None, seed=seed
+            )
+            print(f">>> Enhanced prompt: {prompt}")
+
+        print(">>> Encoding prompts...")
+        context_p, context_n = encode_text(text_encoder, prompts=[prompt, negative_prompt])
+        v_context_p, a_context_p = context_p
+        v_context_n, a_context_n = context_n
+
+        # Offload text encoder
+        if self.offload:
+            print(">>> Offloading text encoder to CPU...")
+            del text_encoder
+            synchronize_and_cleanup()
+        else:
+            torch.cuda.synchronize()
+            del text_encoder
+            cleanup_memory()
+
+        print(f">>> Text encoding completed in {time.time() - start_time:.1f}s")
+
+        # =====================================================================
+        # Phase 2: Stage 1 - Low Resolution Generation
+        # =====================================================================
+        print(">>> Stage 1: Loading video encoder and transformer...")
+        stage1_start = time.time()
+
+        video_encoder = self.stage_1_model_ledger.video_encoder()
+        transformer = self.stage_1_model_ledger.transformer()
+
+        # Create diffusion schedule
+        sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
+            dtype=torch.float32, device=self.device
+        )
+
+        # Define denoising function for stage 1 (with CFG)
+        def first_stage_denoising_loop(
+            sigmas: torch.Tensor,
+            video_state: LatentState,
+            audio_state: LatentState,
+            stepper: DiffusionStepProtocol,
+        ) -> tuple[LatentState, LatentState]:
+            return euler_denoising_loop(
+                sigmas=sigmas,
+                video_state=video_state,
+                audio_state=audio_state,
+                stepper=stepper,
+                denoise_fn=guider_denoising_func(
+                    cfg_guider,
+                    v_context_p,
+                    v_context_n,
+                    a_context_p,
+                    a_context_n,
+                    transformer=transformer,
+                ),
+            )
+
+        # Stage 1 output shape (half resolution)
+        stage_1_output_shape = VideoPixelShape(
+            batch=1,
+            frames=num_frames,
+            width=width // 2,
+            height=height // 2,
+            fps=frame_rate,
+        )
+
+        # Image conditioning for stage 1
+        stage_1_conditionings = image_conditionings_by_replacing_latent(
+            images=images,
+            height=stage_1_output_shape.height,
+            width=stage_1_output_shape.width,
+            video_encoder=video_encoder,
+            dtype=dtype,
+            device=self.device,
+        )
+
+        print(f">>> Stage 1: Generating at {stage_1_output_shape.width}x{stage_1_output_shape.height}...")
+        video_state, audio_state = denoise_audio_video(
+            output_shape=stage_1_output_shape,
+            conditionings=stage_1_conditionings,
+            noiser=noiser,
+            sigmas=sigmas,
+            stepper=stepper,
+            denoising_loop_fn=first_stage_denoising_loop,
+            components=self.pipeline_components,
+            dtype=dtype,
+            device=self.device,
+        )
+
+        print(f">>> Stage 1 completed in {time.time() - stage1_start:.1f}s")
+
+        # Cleanup stage 1 transformer
+        if self.offload:
+            print(">>> Offloading stage 1 transformer to CPU...")
+        torch.cuda.synchronize()
+        del transformer
+        cleanup_memory()
+
+        # =====================================================================
+        # Phase 3: Spatial Upsampling
+        # =====================================================================
+        print(">>> Upsampling latents (2x)...")
+        upsample_start = time.time()
+
+        upscaled_video_latent = upsample_video(
+            latent=video_state.latent[:1],
+            video_encoder=video_encoder,
+            upsampler=self.stage_2_model_ledger.spatial_upsampler(),
+        )
+
+        torch.cuda.synchronize()
+        cleanup_memory()
+        print(f">>> Upsampling completed in {time.time() - upsample_start:.1f}s")
+
+        # =====================================================================
+        # Phase 4: Stage 2 - High Resolution Refinement
+        # =====================================================================
+        print(">>> Stage 2: Loading transformer with distilled LoRA...")
+        stage2_start = time.time()
+
+        transformer = self.stage_2_model_ledger.transformer()
+        distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
+
+        # Define denoising function for stage 2 (no CFG, just positive)
+        def second_stage_denoising_loop(
+            sigmas: torch.Tensor,
+            video_state: LatentState,
+            audio_state: LatentState,
+            stepper: DiffusionStepProtocol,
+        ) -> tuple[LatentState, LatentState]:
+            return euler_denoising_loop(
+                sigmas=sigmas,
+                video_state=video_state,
+                audio_state=audio_state,
+                stepper=stepper,
+                denoise_fn=simple_denoising_func(
+                    video_context=v_context_p,
+                    audio_context=a_context_p,
+                    transformer=transformer,
+                ),
+            )
+
+        # Stage 2 output shape (full resolution)
+        stage_2_output_shape = VideoPixelShape(
+            batch=1,
+            frames=num_frames,
+            width=width,
+            height=height,
+            fps=frame_rate,
+        )
+
+        # Image conditioning for stage 2 (full resolution)
+        stage_2_conditionings = image_conditionings_by_replacing_latent(
+            images=images,
+            height=stage_2_output_shape.height,
+            width=stage_2_output_shape.width,
+            video_encoder=video_encoder,
+            dtype=dtype,
+            device=self.device,
+        )
+
+        print(f">>> Stage 2: Refining at {stage_2_output_shape.width}x{stage_2_output_shape.height}...")
+        video_state, audio_state = denoise_audio_video(
+            output_shape=stage_2_output_shape,
+            conditionings=stage_2_conditionings,
+            noiser=noiser,
+            sigmas=distilled_sigmas,
+            stepper=stepper,
+            denoising_loop_fn=second_stage_denoising_loop,
+            components=self.pipeline_components,
+            dtype=dtype,
+            device=self.device,
+            noise_scale=distilled_sigmas[0],
+            initial_video_latent=upscaled_video_latent,
+            initial_audio_latent=audio_state.latent,
+        )
+
+        print(f">>> Stage 2 completed in {time.time() - stage2_start:.1f}s")
+
+        # Cleanup stage 2 models
+        torch.cuda.synchronize()
+        del transformer
+        del video_encoder
+        cleanup_memory()
+
+        # =====================================================================
+        # Phase 5: VAE Decoding
+        # =====================================================================
+        print(">>> Decoding video...")
+        decode_start = time.time()
+
+        decoded_video = vae_decode_video(
+            video_state.latent,
+            self.stage_2_model_ledger.video_decoder(),
+            tiling_config,
+        )
+
+        if not disable_audio:
+            print(">>> Decoding audio...")
+            decoded_audio = vae_decode_audio(
+                audio_state.latent,
+                self.stage_2_model_ledger.audio_decoder(),
+                self.stage_2_model_ledger.vocoder(),
+            )
+        else:
+            decoded_audio = None
+
+        print(f">>> Decoding completed in {time.time() - decode_start:.1f}s")
+        print(f">>> Total generation time: {time.time() - start_time:.1f}s")
+
+        return decoded_video, decoded_audio
+
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
+
+@torch.inference_mode()
+def main():
+    """Main entry point for LTX-2 video generation."""
+    args = parse_args()
+
+    # Configure logging
+    log_level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(level=log_level, format="%(message)s")
+
+    print("=" * 60)
+    print("LTX-2 Video Generation")
+    print("=" * 60)
+    print(f"Checkpoint: {args.checkpoint_path}")
+    print(f"Output: {args.output_path}")
+    print(f"Resolution: {args.width}x{args.height}")
+    print(f"Frames: {args.num_frames} ({args.num_frames / args.frame_rate:.1f}s at {args.frame_rate}fps)")
+    print(f"Seed: {args.seed}")
+    print(f"Offload: {args.offload}")
+    print(f"FP8: {args.enable_fp8}")
+    if args.images:
+        print(f"Image conditioning: {len(args.images)} image(s)")
+    print("=" * 60)
+    print(f"Prompt: {args.prompt}")
+    print("=" * 60)
+
+    # Create generator
+    generator = LTXVideoGeneratorWithOffloading(
+        checkpoint_path=args.checkpoint_path,
+        distilled_lora=args.distilled_lora,
+        spatial_upsampler_path=args.spatial_upsampler_path,
+        gemma_root=args.gemma_root,
+        loras=args.loras,
+        fp8transformer=args.enable_fp8,
+        offload=args.offload,
+        enable_block_swap=args.enable_block_swap,
+        blocks_in_memory=args.blocks_in_memory,
+    )
+
+    # Set up tiling config for VAE
+    tiling_config = TilingConfig.default()
+    video_chunks_number = get_video_chunks_number(args.num_frames, tiling_config)
+
+    # Generate video
+    video, audio = generator.generate(
+        prompt=args.prompt,
+        negative_prompt=args.negative_prompt,
+        seed=args.seed,
+        height=args.height,
+        width=args.width,
+        num_frames=args.num_frames,
+        frame_rate=args.frame_rate,
+        num_inference_steps=args.num_inference_steps,
+        cfg_guidance_scale=args.cfg_guidance_scale,
+        images=args.images,
+        tiling_config=tiling_config,
+        enhance_prompt=args.enhance_prompt,
+        disable_audio=args.disable_audio,
+    )
+
+    # Encode and save video
+    print(f">>> Encoding video to {args.output_path}...")
+    encode_start = time.time()
+
+    encode_video(
+        video=video,
+        fps=args.frame_rate,
+        audio=audio,
+        audio_sample_rate=AUDIO_SAMPLE_RATE if audio is not None else None,
+        output_path=args.output_path,
+        video_chunks_number=video_chunks_number,
+    )
+
+    print(f">>> Video saved in {time.time() - encode_start:.1f}s")
+    print(f">>> Output: {args.output_path}")
+    print(">>> Done!")
+
+
+if __name__ == "__main__":
+    main()

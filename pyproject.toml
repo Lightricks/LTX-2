@@ -1,3 +1,14 @@
+[project]
+name = "ltx"
+version = "1.0.0"
+description = "LTX-2 Video Generation"
+requires-python = ">=3.10"
+dependencies = [
+    "ltx-core",
+    "ltx-pipelines",
+    "gradio>=4.0.0",
+]
+
 [tool.uv.sources]
 ltx-core = { workspace = true }
 ltx-pipelines = { workspace = true }
