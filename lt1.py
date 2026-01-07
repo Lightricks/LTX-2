@@ -559,13 +559,15 @@ def generate_ltx_video(
             command.append("--one-stage")
         elif is_refine_only:
             command.append("--refine-only")
-            # Refine-only: distilled LoRA is optional
-            if distilled_lora_path and distilled_lora_path.strip() and os.path.exists(distilled_lora_path):
+            # Refine-only: distilled LoRA is optional, skip for distilled checkpoints
+            if not distilled_checkpoint and distilled_lora_path and distilled_lora_path.strip() and os.path.exists(distilled_lora_path):
                 command.extend(["--distilled-lora", distilled_lora_path, str(distilled_lora_strength)])
         else:
             # Two-stage specific: spatial upsampler and distilled LoRA
             command.extend(["--spatial-upsampler-path", spatial_upsampler_path])
-            command.extend(["--distilled-lora", distilled_lora_path, str(distilled_lora_strength)])
+            # Skip distilled LoRA for distilled checkpoints (already distilled)
+            if not distilled_checkpoint:
+                command.extend(["--distilled-lora", distilled_lora_path, str(distilled_lora_strength)])
 
         # Video input (V2V / refine)
         if input_video:
