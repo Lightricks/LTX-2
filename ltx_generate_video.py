@@ -1505,11 +1505,34 @@ class LTXVideoGeneratorWithOffloading:
             distilled_sigmas = base_sigmas * refine_strength
             print(f">>> Using {refine_steps} refinement steps with strength {refine_strength}")
         else:
-            # Use configurable stage2_steps for normal two-stage pipeline
-            distilled_sigmas = LTX2Scheduler().execute(steps=stage2_steps).to(
-                dtype=torch.float32, device=self.device
-            )
-            print(f">>> Stage 2 using {stage2_steps} denoising steps")
+            # Use pre-tuned sigma values for stage 2 refinement with distilled LoRA
+            # These values are specifically calibrated for the distilled model
+            if stage2_steps == 3:
+                # Use exact tuned values for default 3 steps
+                distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
+            else:
+                # Interpolate tuned values to support different step counts
+                # Original tuned values: [0.909375, 0.725, 0.421875, 0.0]
+                tuned = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES)
+                # Create interpolation positions for original values (0 to 1)
+                orig_positions = torch.linspace(0, 1, len(tuned))
+                # Create new positions for desired step count
+                new_positions = torch.linspace(0, 1, stage2_steps + 1)
+                # Interpolate to get new sigma values
+                distilled_sigmas = torch.zeros(stage2_steps + 1)
+                for i, pos in enumerate(new_positions):
+                    # Find surrounding original values and interpolate
+                    idx = torch.searchsorted(orig_positions, pos, right=True)
+                    if idx == 0:
+                        distilled_sigmas[i] = tuned[0]
+                    elif idx >= len(tuned):
+                        distilled_sigmas[i] = tuned[-1]
+                    else:
+                        # Linear interpolation between tuned[idx-1] and tuned[idx]
+                        t = (pos - orig_positions[idx-1]) / (orig_positions[idx] - orig_positions[idx-1])
+                        distilled_sigmas[i] = tuned[idx-1] * (1 - t) + tuned[idx] * t
+                distilled_sigmas = distilled_sigmas.to(self.device)
+                print(f">>> Stage 2 using {stage2_steps} steps (interpolated from tuned schedule)")
 
         # Define denoising function for stage 2 (no CFG, just positive)
         # Convert anchor_decay "none" to None for the denoising loop (if not already done in stage 1)

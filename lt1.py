@@ -35,6 +35,10 @@ stop_event = threading.Event()
 current_process = None
 current_output_filename = None
 
+# Defaults configuration
+UI_CONFIGS_DIR = "ui_configs"
+LT1_DEFAULTS_FILE = os.path.join(UI_CONFIGS_DIR, "lt1_defaults.json")
+
 
 # =============================================================================
 # Progress Parsing
@@ -1016,7 +1020,11 @@ def create_interface():
                                     minimum=0.0, maximum=2.0, value=1.0, step=0.1,
                                     label="Strength", scale=1
                                 )
-                            save_path = gr.Textbox(label="Output Folder", value="outputs")                                       
+                            save_path = gr.Textbox(label="Output Folder", value="outputs")
+                            with gr.Row():
+                                lt1_save_defaults_btn = gr.Button("Save Defaults")
+                                lt1_load_defaults_btn = gr.Button("Load Defaults")
+                            lt1_defaults_status = gr.Textbox(label="Defaults Status", interactive=False, visible=False)
 
             # =================================================================
             # Video Info Tab
@@ -1311,6 +1319,143 @@ def create_interface():
                 distilled_checkpoint,
                 info_status
             ]
+        )
+
+        # =================================================================
+        # Save/Load Defaults
+        # =================================================================
+        lt1_ui_default_components_ORDERED_LIST = [
+            # Prompts
+            prompt, negative_prompt,
+            # Model paths
+            checkpoint_path, distilled_checkpoint, stage2_checkpoint, gemma_root,
+            spatial_upsampler_path, distilled_lora_path, distilled_lora_strength,
+            # Generation parameters
+            mode, pipeline, width, height, num_frames, frame_rate,
+            cfg_guidance_scale, num_inference_steps, stage2_steps, seed,
+            # Image conditioning (not input_image itself - that's a file upload)
+            image_frame_idx, image_strength,
+            end_image_strength,
+            # Anchor conditioning
+            anchor_interval, anchor_strength, anchor_decay,
+            # Refine settings
+            refine_strength, refine_steps,
+            # Audio and prompt
+            disable_audio, enhance_prompt,
+            # Memory optimization
+            offload, enable_fp8,
+            enable_dit_block_swap, dit_blocks_in_memory,
+            enable_text_encoder_block_swap, text_encoder_blocks_in_memory,
+            enable_refiner_block_swap, refiner_blocks_in_memory,
+            # LoRA
+            lora_folder, user_lora, user_lora_strength,
+            # Output
+            save_path, batch_size,
+            # Scale slider
+            scale_slider,
+        ]
+
+        lt1_ui_default_keys = [
+            # Prompts
+            "prompt", "negative_prompt",
+            # Model paths
+            "checkpoint_path", "distilled_checkpoint", "stage2_checkpoint", "gemma_root",
+            "spatial_upsampler_path", "distilled_lora_path", "distilled_lora_strength",
+            # Generation parameters
+            "mode", "pipeline", "width", "height", "num_frames", "frame_rate",
+            "cfg_guidance_scale", "num_inference_steps", "stage2_steps", "seed",
+            # Image conditioning
+            "image_frame_idx", "image_strength",
+            "end_image_strength",
+            # Anchor conditioning
+            "anchor_interval", "anchor_strength", "anchor_decay",
+            # Refine settings
+            "refine_strength", "refine_steps",
+            # Audio and prompt
+            "disable_audio", "enhance_prompt",
+            # Memory optimization
+            "offload", "enable_fp8",
+            "enable_dit_block_swap", "dit_blocks_in_memory",
+            "enable_text_encoder_block_swap", "text_encoder_blocks_in_memory",
+            "enable_refiner_block_swap", "refiner_blocks_in_memory",
+            # LoRA
+            "lora_folder", "user_lora", "user_lora_strength",
+            # Output
+            "save_path", "batch_size",
+            # Scale slider
+            "scale_slider",
+        ]
+
+        def save_lt1_defaults(*values):
+            os.makedirs(UI_CONFIGS_DIR, exist_ok=True)
+            settings_to_save = {}
+            for i, key in enumerate(lt1_ui_default_keys):
+                settings_to_save[key] = values[i]
+            try:
+                with open(LT1_DEFAULTS_FILE, 'w') as f:
+                    json.dump(settings_to_save, f, indent=2)
+                return "LTX defaults saved successfully."
+            except Exception as e:
+                return f"Error saving LTX defaults: {e}"
+
+        def load_lt1_defaults(request: gr.Request = None):
+            lora_folder_val = "lora"
+            lora_choices = get_ltx_lora_options(lora_folder_val)
+
+            if not os.path.exists(LT1_DEFAULTS_FILE):
+                if request:
+                    return [gr.update()] * len(lt1_ui_default_keys) + ["No defaults file found."]
+                else:
+                    return [gr.update()] * len(lt1_ui_default_keys) + [""]
+
+            try:
+                with open(LT1_DEFAULTS_FILE, 'r') as f:
+                    loaded_settings = json.load(f)
+            except Exception as e:
+                return [gr.update()] * len(lt1_ui_default_keys) + [f"Error loading defaults: {e}"]
+
+            # Update lora folder from settings
+            lora_folder_val = loaded_settings.get("lora_folder", "lora")
+            lora_choices = get_ltx_lora_options(lora_folder_val)
+
+            updates = []
+            for i, key in enumerate(lt1_ui_default_keys):
+                component = lt1_ui_default_components_ORDERED_LIST[i]
+                default_value_from_component = None
+                if hasattr(component, 'value'):
+                    default_value_from_component = component.value
+
+                value_to_set = loaded_settings.get(key, default_value_from_component)
+
+                # Special handling for LoRA dropdown
+                if key == "user_lora":
+                    if value_to_set not in lora_choices:
+                        value_to_set = "None"
+                    updates.append(gr.update(choices=lora_choices, value=value_to_set))
+                else:
+                    updates.append(gr.update(value=value_to_set))
+
+            return updates + ["LTX defaults loaded successfully."]
+
+        lt1_save_defaults_btn.click(
+            fn=save_lt1_defaults,
+            inputs=lt1_ui_default_components_ORDERED_LIST,
+            outputs=[lt1_defaults_status]
+        )
+        lt1_load_defaults_btn.click(
+            fn=load_lt1_defaults,
+            inputs=None,
+            outputs=lt1_ui_default_components_ORDERED_LIST + [lt1_defaults_status]
+        )
+
+        def initial_load_lt1_defaults():
+            results_and_status = load_lt1_defaults(None)
+            return results_and_status[:-1]
+
+        demo.load(
+            fn=initial_load_lt1_defaults,
+            inputs=None,
+            outputs=lt1_ui_default_components_ORDERED_LIST
         )
 
         return demo
