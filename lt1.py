@@ -422,6 +422,7 @@ def generate_ltx_video(
     # Model paths
     checkpoint_path: str,
     distilled_checkpoint: bool,
+    stage2_checkpoint: str,
     gemma_root: str,
     spatial_upsampler_path: str,
     distilled_lora_path: str,
@@ -563,15 +564,19 @@ def generate_ltx_video(
             command.append("--one-stage")
         elif is_refine_only:
             command.append("--refine-only")
-            # Refine-only: distilled LoRA is optional, skip for distilled checkpoints
-            if not distilled_checkpoint and distilled_lora_path and distilled_lora_path.strip() and os.path.exists(distilled_lora_path):
+            # Refine-only: distilled LoRA is optional, skip if stage2 checkpoint or distilled checkpoint
+            if not distilled_checkpoint and not stage2_checkpoint and distilled_lora_path and distilled_lora_path.strip() and os.path.exists(distilled_lora_path):
                 command.extend(["--distilled-lora", distilled_lora_path, str(distilled_lora_strength)])
         else:
             # Two-stage specific: spatial upsampler and distilled LoRA
             command.extend(["--spatial-upsampler-path", spatial_upsampler_path])
-            # Skip distilled LoRA for distilled checkpoints (already distilled)
-            if not distilled_checkpoint:
+            # Skip distilled LoRA if using stage2 checkpoint (full model) or distilled checkpoint
+            if not distilled_checkpoint and not stage2_checkpoint:
                 command.extend(["--distilled-lora", distilled_lora_path, str(distilled_lora_strength)])
+
+        # Stage 2 checkpoint (full model for stage 2 refinement)
+        if stage2_checkpoint and stage2_checkpoint.strip() and os.path.exists(stage2_checkpoint):
+            command.extend(["--stage2-checkpoint", stage2_checkpoint])
 
         # Video input (V2V / refine)
         if input_video:
@@ -945,9 +950,15 @@ def create_interface():
                                 distilled_checkpoint = gr.Checkbox(
                                     label="Distilled",
                                     value=False,
-                                    info="No CFG, 8-step schedule",
+                                    info="Checkpoint is distilled (skips distilled LoRA)",
                                     scale=1
                                 )
+                            stage2_checkpoint = gr.Textbox(
+                                label="Stage 2 Checkpoint (optional)",
+                                value="",
+                                info="Full model checkpoint for stage 2 refinement (leave empty to use distilled LoRA)",
+                                placeholder="e.g., ./weights/ltx-2-19b-distilled.safetensors"
+                            )
                             gemma_root = gr.Textbox(
                                 label="Gemma Root Path",
                                 value="./gemma-3-12b-it-qat-q4_0-unquantized",
@@ -1007,6 +1018,11 @@ def create_interface():
                 - **Two-stage** (default): Generates at half resolution, upsamples 2x, then refines with distilled LoRA. Higher quality output.
                 - **One-stage**: Generates directly at full resolution in a single pass. Faster but may have less detail.
                 - **Refine-only**: Runs stage 2 refinement on an input video. Use this to improve a previously generated video.
+
+                ### Stage 2 Checkpoint
+                - By default, stage 2 uses the main checkpoint + distilled LoRA for refinement
+                - **Stage 2 Checkpoint** (optional): Use a separate full model checkpoint for stage 2 (e.g., a distilled model)
+                - When a stage 2 checkpoint is provided, the distilled LoRA is not applied
 
                 ### Generation Modes
                 - **T2V (Text-to-Video)**: Generate video from text prompt only
@@ -1132,7 +1148,7 @@ def create_interface():
             fn=generate_ltx_video,
             inputs=[
                 prompt, negative_prompt,
-                checkpoint_path, distilled_checkpoint, gemma_root, spatial_upsampler_path,
+                checkpoint_path, distilled_checkpoint, stage2_checkpoint, gemma_root, spatial_upsampler_path,
                 distilled_lora_path, distilled_lora_strength,
                 mode, pipeline, width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, seed,
@@ -1163,7 +1179,7 @@ def create_interface():
         def send_to_generation_handler(metadata):
             """Send loaded metadata to generation tab parameters and switch to Generation tab."""
             if not metadata:
-                return [gr.update()] * 22 + ["No metadata loaded - upload a video first"]
+                return [gr.update()] * 24 + ["No metadata loaded - upload a video first"]
 
             # Handle legacy metadata that used single enable_block_swap
             legacy_block_swap = metadata.get("enable_block_swap", True)
@@ -1191,6 +1207,8 @@ def create_interface():
                 gr.update(value=metadata.get("enable_dit_block_swap", legacy_block_swap)),  # enable_dit_block_swap
                 gr.update(value=metadata.get("enable_text_encoder_block_swap", legacy_block_swap)),  # enable_text_encoder_block_swap
                 gr.update(value=metadata.get("enable_refiner_block_swap", legacy_block_swap)),  # enable_refiner_block_swap
+                gr.update(value=metadata.get("distilled_checkpoint", False)),  # distilled_checkpoint
+                gr.update(value=metadata.get("stage2_checkpoint", "")),  # stage2_checkpoint
                 "Parameters sent to Generation tab"  # status
             ]
 
@@ -1205,6 +1223,7 @@ def create_interface():
                 image_strength, end_image_strength, refine_strength, refine_steps,
                 offload, enable_fp8,
                 enable_dit_block_swap, enable_text_encoder_block_swap, enable_refiner_block_swap,
+                distilled_checkpoint, stage2_checkpoint,
                 info_status
             ]
         )
