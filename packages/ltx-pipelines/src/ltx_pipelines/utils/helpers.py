@@ -122,6 +122,50 @@ def anchor_strength_decay(
     return progress  # Default to linear
 
 
+def apply_frame_freezing(
+    denoised_video: torch.Tensor,
+    frozen_latent: torch.Tensor,
+    freeze_mask: torch.Tensor,
+    sigma: float,
+    step_idx: int,
+    total_steps: int,
+    transition_steps: int = 4,
+) -> torch.Tensor:
+    """
+    Apply frame freezing with noise-scaled blending at transition boundary.
+
+    For frozen frames, inject source latent scaled by (1 - sigma) to maintain
+    the original content while respecting the diffusion process.
+
+    Args:
+        denoised_video: Current denoised output [B, C, T, H, W]
+        frozen_latent: Clean source latent for frozen frames [B, C, T, H, W]
+        freeze_mask: Binary mask [B, 1, T, H, W], 1=frozen, 0=generated
+        sigma: Current noise level
+        step_idx: Current step index
+        total_steps: Total denoising steps
+        transition_steps: Steps for blending transition (unused, kept for API)
+
+    Returns:
+        Modified denoised video with frozen frames injected
+    """
+    # Expand freeze_mask to match latent channels
+    expanded_mask = freeze_mask.expand_as(denoised_video)
+
+    # For frozen frames: use clean latent scaled by how "done" we are
+    # At high sigma (early): allow more denoising freedom
+    # At low sigma (late): lock to clean latent
+    sigma_max = 1.0
+    noise_weight = min(sigma / sigma_max, 1.0)
+    clean_weight = 1.0 - noise_weight
+
+    # Blend: where mask=1, inject frozen content; where mask=0, keep denoised
+    frozen_contribution = frozen_latent * clean_weight + denoised_video * noise_weight
+    result = denoised_video * (1 - expanded_mask) + frozen_contribution * expanded_mask
+
+    return result
+
+
 def euler_denoising_loop(
     sigmas: torch.Tensor,
     video_state: LatentState,
@@ -129,6 +173,11 @@ def euler_denoising_loop(
     stepper: DiffusionStepProtocol,
     denoise_fn: DenoisingFunc,
     anchor_decay: str | None = None,
+    callback: callable = None,
+    callback_interval: int = 1,
+    frozen_video_latent: torch.Tensor | None = None,
+    freeze_mask: torch.Tensor | None = None,
+    freeze_transition_steps: int = 4,
 ) -> tuple[LatentState, LatentState]:
     """
     Perform the joint audio-video denoising loop over a diffusion schedule.
@@ -161,6 +210,19 @@ def euler_denoising_loop(
         (those with denoise_mask < 1.0) will have their constraints gradually
         released over the denoising process. Options: "linear", "cosine", "sigmoid".
         This allows anchors to guide structure early but permit motion later.
+    callback:
+        Optional callback invoked at each step for preview generation.
+        Signature: callback(step_idx, video_state, sigmas)
+    callback_interval:
+        Invoke callback every N steps (default: 1 = every step).
+    frozen_video_latent:
+        If provided, these latents are injected where freeze_mask=1.
+        Enables frame freezing for video continuation.
+    freeze_mask:
+        Tensor of shape [B, 1, T, H, W] where 1=frozen frame, 0=generated frame.
+        Used with frozen_video_latent for selective frame injection.
+    freeze_transition_steps:
+        Number of steps for blending transition at freeze boundary.
     ### Returns
     tuple[LatentState, LatentState]
         A pair ``(video_state, audio_state)`` containing the final video and
@@ -183,11 +245,27 @@ def euler_denoising_loop(
 
         denoised_video, denoised_audio = denoise_fn(video_state, audio_state, sigmas, step_idx)
 
+        # Apply frame freezing if enabled
+        if frozen_video_latent is not None and freeze_mask is not None:
+            denoised_video = apply_frame_freezing(
+                denoised_video=denoised_video,
+                frozen_latent=frozen_video_latent,
+                freeze_mask=freeze_mask,
+                sigma=sigmas[step_idx].item(),
+                step_idx=step_idx,
+                total_steps=total_steps,
+                transition_steps=freeze_transition_steps,
+            )
+
         denoised_video = post_process_latent(denoised_video, video_state.denoise_mask, video_state.clean_latent)
         denoised_audio = post_process_latent(denoised_audio, audio_state.denoise_mask, audio_state.clean_latent)
 
         video_state = replace(video_state, latent=stepper.step(video_state.latent, denoised_video, sigmas, step_idx))
         audio_state = replace(audio_state, latent=stepper.step(audio_state.latent, denoised_audio, sigmas, step_idx))
+
+        # Invoke callback for preview generation
+        if callback is not None and step_idx % callback_interval == 0:
+            callback(step_idx, video_state, sigmas)
 
     return (video_state, audio_state)
 
