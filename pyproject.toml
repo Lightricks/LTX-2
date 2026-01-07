@@ -22,6 +22,7 @@ dependencies = [
     "packaging",
     "pandas>=1.0",
     "pillow>=9.0",
+    "opencv-python>=4.5",
     "pydantic>=2.0",
     "pydub",
     "python-multipart>=0.0.9",

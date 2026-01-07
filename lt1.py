@@ -1035,12 +1035,18 @@ def generate_svi_ltx_video(
             log_file_path = os.path.join(output_path, "logs", f"svi_{run_id}.log")
             log_file = open(log_file_path, "w", encoding="utf-8")
 
+            # Get script directory to ensure ltx_generate_video.py is found
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+            print(f">>> Running from: {script_dir}")
+            print(f">>> Log file: {log_file_path}")
+
             process = subprocess.Popen(
                 command,
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
                 text=True,
-                bufsize=1
+                bufsize=1,
+                cwd=script_dir  # Run from the script directory
             )
 
             current_process = process
@@ -1085,7 +1091,19 @@ def generate_svi_ltx_video(
                         all_generated_videos.append((output_filename, label))
                         yield all_generated_videos.copy(), None, f"Completed batch {batch_idx+1}/{batch_size}", "Done!"
                     else:
-                        yield all_generated_videos, None, f"Error in batch {batch_idx+1} (exit code {exit_code})", ""
+                        # Read last lines of log for error message
+                        error_msg = f"Error in batch {batch_idx+1} (exit code {exit_code})"
+                        try:
+                            with open(log_file_path, "r", encoding="utf-8") as f:
+                                log_content = f.read()
+                                # Get last 500 chars of log for error context
+                                if log_content:
+                                    error_detail = log_content[-500:].strip()
+                                    error_msg = f"Exit code {exit_code}. Log tail:\n{error_detail}"
+                                    print(f">>> SVI ERROR LOG:\n{log_content}")
+                        except Exception:
+                            pass
+                        yield all_generated_videos, None, error_msg, ""
                     break
 
                 yield all_generated_videos.copy(), None, status_text, last_progress
@@ -1535,24 +1553,24 @@ def create_interface():
                     with gr.Row():
                         svi_checkpoint_path = gr.Textbox(
                             label="LTX Checkpoint",
-                            value="models/ltx-video-2b-v0.9.5.safetensors",
+                            value="./weights/ltx-2-19b-dev.safetensors",
                             info="Main LTX model checkpoint"
                         )
                         svi_gemma_root = gr.Textbox(
                             label="Gemma Root",
-                            value="models/google/gemma-2-2b-it",
+                            value="./gemma-3-12b-it-qat-q4_0-unquantized",
                             info="Text encoder directory"
                         )
                     with gr.Row():
                         svi_spatial_upsampler = gr.Textbox(
-                            label="Spatial Upsampler Path (optional)",
-                            value="",
-                            info="For 2x upscaling"
+                            label="Spatial Upsampler Path",
+                            value="./weights/ltx-2-spatial-upscaler-x2-1.0.safetensors",
+                            info="For 2x upscaling (two-stage)"
                         )
                         svi_distilled_lora = gr.Textbox(
-                            label="Distilled LoRA Path (optional)",
-                            value="",
-                            info="Distilled LoRA for faster inference"
+                            label="Distilled LoRA Path",
+                            value="./weights/ltx-2-19b-distilled-lora-384.safetensors",
+                            info="For stage 2 refinement (two-stage)"
                         )
                     with gr.Row():
                         svi_distilled_lora_strength = gr.Slider(
@@ -1560,7 +1578,7 @@ def create_interface():
                             label="Distilled LoRA Strength", value=1.0
                         )
                     with gr.Row():
-                        svi_one_stage = gr.Checkbox(label="One-Stage Pipeline", value=True, info="Use single-stage generation (faster)")
+                        svi_one_stage = gr.Checkbox(label="One-Stage Pipeline", value=False, info="Skip two-stage refinement (faster but lower quality)")
                         svi_enable_fp8 = gr.Checkbox(label="Enable FP8", value=False, info="Use FP8 precision (lower VRAM)")
                         svi_offload = gr.Checkbox(label="Offload", value=False, info="Offload models to CPU")
 
