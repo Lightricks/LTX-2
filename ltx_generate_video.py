@@ -49,6 +49,7 @@ from ltx_pipelines.utils.block_swap import (
     enable_text_encoder_block_swap,
     offload_all_text_encoder_blocks,
 )
+from ltx_pipelines.utils.custom_offloading_utils import clean_memory_on_device
 from ltx_pipelines.utils.constants import (
     AUDIO_SAMPLE_RATE,
     DEFAULT_CFG_GUIDANCE_SCALE,
@@ -249,6 +250,13 @@ Examples:
         default=None,
         help="Path to a separate checkpoint for stage 2 refinement (full model, not LoRA). "
              "If not specified, uses the main checkpoint with --distilled-lora applied.",
+    )
+    model_group.add_argument(
+        "--stage2-steps",
+        type=int,
+        default=3,
+        help="Number of denoising steps for stage 2 refinement (default: 3). "
+             "Uses LTX2Scheduler to generate sigma schedule.",
     )
 
     # ==========================================================================
@@ -505,6 +513,99 @@ def synchronize_and_cleanup():
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
+
+
+def reconfigure_block_swap(
+    transformer,
+    new_blocks_in_memory: int,
+    device: torch.device,
+) -> tuple:
+    """
+    Reconfigure block swapping with fewer blocks in GPU after an OOM.
+
+    Args:
+        transformer: The transformer model with block swap enabled
+        new_blocks_in_memory: New (reduced) number of blocks to keep in GPU
+        device: Target GPU device
+
+    Returns:
+        Tuple of (new_offloader, new_blocks_in_memory) or (None, 0) if at minimum
+    """
+    from ltx_core.model.transformer.model import X0Model
+
+    # Get the underlying LTXModel
+    if isinstance(transformer, X0Model):
+        ltx_model = transformer.velocity_model
+    else:
+        ltx_model = transformer
+
+    # Get current offloader
+    offloader = getattr(ltx_model, "_block_swap_offloader", None)
+    if offloader is None:
+        print("[BlockSwap] No offloader found, cannot reconfigure")
+        return None, 0
+
+    num_blocks = len(ltx_model.transformer_blocks)
+
+    # Ensure we have at least 1 block
+    if new_blocks_in_memory < 1:
+        print(f"[BlockSwap] Cannot reduce below 1 block in GPU")
+        return None, 0
+
+    print(f"[BlockSwap] Reconfiguring: {new_blocks_in_memory}/{num_blocks} blocks in GPU...")
+
+    # Wait for any pending async operations
+    for idx in range(num_blocks):
+        if idx in offloader.futures:
+            offloader._wait_blocks_move(idx)
+
+    # Shutdown the ThreadPoolExecutor
+    offloader.thread_pool.shutdown(wait=True)
+    offloader.futures.clear()
+
+    # Synchronize CUDA
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    # Move all blocks to CPU
+    from ltx_pipelines.utils.custom_offloading_utils import weighs_to_device
+    for block in ltx_model.transformer_blocks:
+        weighs_to_device(block, "cpu")
+
+    # Clear GPU memory
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    gc.collect()
+
+    # Restore original method temporarily
+    if hasattr(ltx_model, "_original_process_transformer_blocks"):
+        ltx_model._process_transformer_blocks = ltx_model._original_process_transformer_blocks
+
+    # Clean up old offloader attributes
+    if hasattr(ltx_model, "_block_swap_offloader"):
+        del ltx_model._block_swap_offloader
+    if hasattr(ltx_model, "_blocks_to_swap"):
+        del ltx_model._blocks_to_swap
+    if hasattr(ltx_model, "_blocks_ref"):
+        del ltx_model._blocks_ref
+
+    if isinstance(transformer, X0Model):
+        if hasattr(transformer, "_block_swap_offloader"):
+            del transformer._block_swap_offloader
+        if hasattr(transformer, "_blocks_to_swap"):
+            del transformer._blocks_to_swap
+        if hasattr(transformer, "_blocks_ref"):
+            del transformer._blocks_ref
+
+    # Re-enable block swap with new configuration
+    new_offloader = enable_block_swap(
+        transformer,
+        blocks_in_memory=new_blocks_in_memory,
+        device=device,
+    )
+
+    return new_offloader, new_blocks_in_memory
 
 
 def apply_loras_chunked_gpu(
@@ -839,6 +940,7 @@ class LTXVideoGeneratorWithOffloading:
         input_video: str | None = None,
         refine_strength: float = 0.3,
         refine_steps: int = 10,
+        stage2_steps: int = 3,
         anchor_image: str | None = None,
         anchor_interval: int | None = None,
         anchor_strength: float = 0.8,
@@ -1376,8 +1478,8 @@ class LTXVideoGeneratorWithOffloading:
             )
             transformer = stage_2_ledger.transformer()
 
-        # For refine-only mode, use the configurable refine_steps
-        # For normal two-stage, use the fixed distilled sigma values
+        # For refine-only mode, use the configurable refine_steps with strength scaling
+        # For normal two-stage, use stage2_steps (default 3)
         if self.refine_only and input_video:
             # Generate base sigma schedule (1.0 to 0.0)
             base_sigmas = LTX2Scheduler().execute(steps=refine_steps).to(
@@ -1388,7 +1490,11 @@ class LTXVideoGeneratorWithOffloading:
             distilled_sigmas = base_sigmas * refine_strength
             print(f">>> Using {refine_steps} refinement steps with strength {refine_strength}")
         else:
-            distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
+            # Use configurable stage2_steps for normal two-stage pipeline
+            distilled_sigmas = LTX2Scheduler().execute(steps=stage2_steps).to(
+                dtype=torch.float32, device=self.device
+            )
+            print(f">>> Stage 2 using {stage2_steps} denoising steps")
 
         # Define denoising function for stage 2 (no CFG, just positive)
         def second_stage_denoising_loop(
@@ -1452,20 +1558,73 @@ class LTXVideoGeneratorWithOffloading:
         # For refine-only mode, use audio_latent from input video encoding
         # For normal two-stage, use audio_state.latent from stage 1
         stage_2_initial_audio = audio_latent if (self.refine_only and input_video) else audio_state.latent
-        video_state, audio_state = denoise_audio_video(
-            output_shape=stage_2_output_shape,
-            conditionings=stage_2_conditionings,
-            noiser=noiser,
-            sigmas=distilled_sigmas,
-            stepper=stepper,
-            denoising_loop_fn=second_stage_denoising_loop,
-            components=self.pipeline_components,
-            dtype=dtype,
-            device=self.device,
-            noise_scale=distilled_sigmas[0],
-            initial_video_latent=upscaled_video_latent,
-            initial_audio_latent=stage_2_initial_audio,
-        )
+
+        # OOM retry loop - reduces blocks in GPU until denoising succeeds
+        current_blocks = self.refiner_blocks_in_memory
+        min_blocks = 1  # Minimum blocks to try before giving up
+        max_retries = current_blocks - min_blocks + 1  # Maximum retry attempts
+
+        for retry_attempt in range(max_retries):
+            try:
+                # Reset generator for reproducibility on retries
+                if retry_attempt > 0:
+                    generator = torch.Generator(device=self.device).manual_seed(seed)
+                    noiser = GaussianNoiser(generator=generator)
+
+                video_state, audio_state = denoise_audio_video(
+                    output_shape=stage_2_output_shape,
+                    conditionings=stage_2_conditionings,
+                    noiser=noiser,
+                    sigmas=distilled_sigmas,
+                    stepper=stepper,
+                    denoising_loop_fn=second_stage_denoising_loop,
+                    components=self.pipeline_components,
+                    dtype=dtype,
+                    device=self.device,
+                    noise_scale=distilled_sigmas[0],
+                    initial_video_latent=upscaled_video_latent,
+                    initial_audio_latent=stage_2_initial_audio,
+                )
+                # Success - break out of retry loop
+                break
+
+            except torch.OutOfMemoryError as e:
+                # Check if we can retry with fewer blocks
+                if not block_swap_manager:
+                    print(f">>> OOM Error: Block swapping not enabled, cannot reduce memory usage")
+                    raise
+
+                current_blocks -= 1
+                if current_blocks < min_blocks:
+                    print(f">>> OOM Error: Already at minimum blocks ({min_blocks}), cannot reduce further")
+                    raise
+
+                print(f">>> OOM Error caught! Retrying with {current_blocks} blocks in GPU...")
+
+                # Clear CUDA error state and memory
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                gc.collect()
+
+                # Reconfigure block swap with fewer blocks
+                block_swap_manager, current_blocks = reconfigure_block_swap(
+                    transformer,
+                    new_blocks_in_memory=current_blocks,
+                    device=torch.device(self.device),
+                )
+
+                if block_swap_manager is None:
+                    print(f">>> Failed to reconfigure block swap, cannot retry")
+                    raise
+
+                # Clear memory again after reconfiguration
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
+                gc.collect()
+
+                print(f">>> Retry attempt {retry_attempt + 1}/{max_retries}...")
 
         print(f">>> Stage 2 completed in {time.time() - stage2_start:.1f}s")
 
@@ -1582,6 +1741,8 @@ def main():
     print(f"Checkpoint: {args.checkpoint_path}")
     if args.stage2_checkpoint:
         print(f"Stage 2 Checkpoint: {args.stage2_checkpoint}")
+    if not args.one_stage:
+        print(f"Stage 2 Steps: {args.stage2_steps}")
     print(f"Output: {args.output_path}")
     print(f"Resolution: {args.width}x{args.height}")
     print(f"Frames: {args.num_frames} ({args.num_frames / args.frame_rate:.1f}s at {args.frame_rate}fps)")
@@ -1642,6 +1803,7 @@ def main():
         input_video=args.input_video,
         refine_strength=args.refine_strength,
         refine_steps=args.refine_steps,
+        stage2_steps=args.stage2_steps,
         anchor_image=args.anchor_image,
         anchor_interval=args.anchor_interval,
         anchor_strength=args.anchor_strength,
@@ -1669,6 +1831,7 @@ def main():
         "distilled_checkpoint": args.distilled_checkpoint,
         "checkpoint_path": args.checkpoint_path,
         "stage2_checkpoint": args.stage2_checkpoint,
+        "stage2_steps": args.stage2_steps if not args.one_stage else None,
         "prompt": args.prompt,
         "negative_prompt": args.negative_prompt if args.cfg_guidance_scale > 1.0 else None,
         "width": args.width,

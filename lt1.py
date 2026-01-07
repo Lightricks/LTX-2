@@ -397,8 +397,29 @@ def add_metadata_to_video(video_path: str, parameters: dict) -> None:
         print(f"Error: {str(e)}")
 
 
-def extract_video_details(video_path: str) -> Tuple[dict, str]:
-    """Extract both metadata and video information."""
+def extract_first_frame(video_path: str, output_dir: str = "outputs") -> Optional[str]:
+    """Extract the first frame from a video file."""
+    try:
+        import av
+        os.makedirs(output_dir, exist_ok=True)
+
+        with av.open(video_path) as container:
+            stream = container.streams.video[0]
+            for frame in container.decode(stream):
+                # Convert to PIL Image and save
+                img = frame.to_image()
+                # Save with unique name based on source video
+                base_name = os.path.splitext(os.path.basename(video_path))[0]
+                output_path = os.path.join(output_dir, f"{base_name}_frame0.png")
+                img.save(output_path)
+                return output_path
+    except Exception as e:
+        print(f"Error extracting first frame: {e}")
+    return None
+
+
+def extract_video_details(video_path: str) -> Tuple[dict, str, Optional[str]]:
+    """Extract metadata, video information, and first frame."""
     metadata = extract_video_metadata(video_path)
     video_details = get_video_info(video_path)
 
@@ -407,8 +428,11 @@ def extract_video_details(video_path: str) -> Tuple[dict, str]:
         if key not in metadata:
             metadata[key] = value
 
-    # Return both the updated metadata and a status message
-    return metadata, "Video details extracted successfully"
+    # Extract first frame
+    first_frame_path = extract_first_frame(video_path)
+
+    # Return metadata, status message, and first frame path
+    return metadata, "Video details extracted successfully", first_frame_path
 
 
 # =============================================================================
@@ -988,6 +1012,7 @@ def create_interface():
             with gr.Tab("Video Info"):
                 with gr.Row():
                     info_video_input = gr.Video(label="Upload Video", interactive=True)
+                    info_first_frame = gr.Image(label="First Frame", interactive=False)
                     info_metadata_output = gr.JSON(label="Generation Parameters")
 
                 with gr.Row():
@@ -1173,23 +1198,41 @@ def create_interface():
         info_video_input.upload(
             fn=extract_video_details,
             inputs=info_video_input,
-            outputs=[info_metadata_output, info_status]
+            outputs=[info_metadata_output, info_status, info_first_frame]
         )
 
-        def send_to_generation_handler(metadata):
+        def send_to_generation_handler(metadata, first_frame):
             """Send loaded metadata to generation tab parameters and switch to Generation tab."""
             if not metadata:
-                return [gr.update()] * 24 + ["No metadata loaded - upload a video first"]
+                return [gr.update()] * 35 + ["No metadata loaded - upload a video first"]
 
             # Handle legacy metadata that used single enable_block_swap
             legacy_block_swap = metadata.get("enable_block_swap", True)
 
-            # Return updates for all generation parameters (first output switches tab)
+            # Extract image conditioning info from metadata
+            images = metadata.get("images", [])
+            image_strength = 0.9
+            image_frame_idx = 0
+            if images and len(images) > 0:
+                # First image entry: (path, frame_idx, strength)
+                image_frame_idx = images[0][1] if len(images[0]) > 1 else 0
+                image_strength = images[0][2] if len(images[0]) > 2 else 0.9
+
+            # Determine mode based on whether images were used
+            mode = "t2v"
+            if images:
+                mode = "i2v"
+            elif metadata.get("input_video"):
+                mode = "v2v"
+
+            # Return updates for all generation parameters
+            # NOTE: Model paths (checkpoint_path, gemma_root, spatial_upsampler_path,
+            #       distilled_lora_path) are NOT restored - user keeps their current settings
             return [
                 gr.Tabs(selected="gen_tab"),  # Switch to Generation tab
                 gr.update(value=metadata.get("prompt", "")),  # prompt
                 gr.update(value=metadata.get("negative_prompt", "")),  # negative_prompt
-                gr.update(value=metadata.get("mode", "t2v")),  # mode
+                gr.update(value=mode),  # mode
                 gr.update(value=metadata.get("pipeline", "two-stage")),  # pipeline
                 gr.update(value=metadata.get("width", 1024)),  # width
                 gr.update(value=metadata.get("height", 1024)),  # height
@@ -1198,32 +1241,60 @@ def create_interface():
                 gr.update(value=metadata.get("cfg_guidance_scale", 4.0)),  # cfg_guidance_scale
                 gr.update(value=metadata.get("num_inference_steps", 40)),  # num_inference_steps
                 gr.update(value=metadata.get("seed", -1)),  # seed
-                gr.update(value=metadata.get("image_strength", 0.9)),  # image_strength
+                # Image conditioning
+                gr.update(value=first_frame),  # input_image - use extracted first frame
+                gr.update(value=image_frame_idx),  # image_frame_idx
+                gr.update(value=image_strength),  # image_strength
                 gr.update(value=metadata.get("end_image_strength", 0.9)),  # end_image_strength
+                # Anchor conditioning
+                gr.update(value=metadata.get("anchor_interval", 0) or 0),  # anchor_interval
+                gr.update(value=metadata.get("anchor_strength", 0.8)),  # anchor_strength
+                # Refine settings
                 gr.update(value=metadata.get("refine_strength", 0.3)),  # refine_strength
                 gr.update(value=metadata.get("refine_steps", 10)),  # refine_steps
+                # Audio and prompt
+                gr.update(value=metadata.get("disable_audio", False)),  # disable_audio
+                gr.update(value=metadata.get("enhance_prompt", False)),  # enhance_prompt
+                # Memory optimization
                 gr.update(value=metadata.get("offload", False)),  # offload
                 gr.update(value=metadata.get("enable_fp8", False)),  # enable_fp8
+                # Block swap settings
                 gr.update(value=metadata.get("enable_dit_block_swap", legacy_block_swap)),  # enable_dit_block_swap
+                gr.update(value=metadata.get("dit_blocks_in_memory", 22) or 22),  # dit_blocks_in_memory
                 gr.update(value=metadata.get("enable_text_encoder_block_swap", legacy_block_swap)),  # enable_text_encoder_block_swap
+                gr.update(value=metadata.get("text_encoder_blocks_in_memory", 6) or 6),  # text_encoder_blocks_in_memory
                 gr.update(value=metadata.get("enable_refiner_block_swap", legacy_block_swap)),  # enable_refiner_block_swap
+                gr.update(value=metadata.get("refiner_blocks_in_memory", 22) or 22),  # refiner_blocks_in_memory
+                # Distilled settings (NOT model paths)
                 gr.update(value=metadata.get("distilled_checkpoint", False)),  # distilled_checkpoint
-                gr.update(value=metadata.get("stage2_checkpoint", "")),  # stage2_checkpoint
-                "Parameters sent to Generation tab"  # status
+                # NOTE: stage2_checkpoint path is NOT restored - keep user's current setting
+                "Parameters sent to Generation tab (model paths unchanged)"  # status
             ]
 
         info_send_btn.click(
             fn=send_to_generation_handler,
-            inputs=[info_metadata_output],
+            inputs=[info_metadata_output, info_first_frame],
             outputs=[
                 tabs,  # Switch tab
                 prompt, negative_prompt, mode, pipeline,
                 width, height, num_frames, frame_rate,
                 cfg_guidance_scale, num_inference_steps, seed,
-                image_strength, end_image_strength, refine_strength, refine_steps,
+                # Image conditioning
+                input_image, image_frame_idx, image_strength, end_image_strength,
+                # Anchor conditioning
+                anchor_interval, anchor_strength,
+                # Refine settings
+                refine_strength, refine_steps,
+                # Audio and prompt
+                disable_audio, enhance_prompt,
+                # Memory optimization
                 offload, enable_fp8,
-                enable_dit_block_swap, enable_text_encoder_block_swap, enable_refiner_block_swap,
-                distilled_checkpoint, stage2_checkpoint,
+                # Block swap settings
+                enable_dit_block_swap, dit_blocks_in_memory,
+                enable_text_encoder_block_swap, text_encoder_blocks_in_memory,
+                enable_refiner_block_swap, refiner_blocks_in_memory,
+                # Distilled settings
+                distilled_checkpoint,
                 info_status
             ]
         )
