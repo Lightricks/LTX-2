@@ -43,7 +43,7 @@ All pipelines can be run directly from the command line. Each pipeline module is
 # Run a pipeline (example: two-stage text-to-video)
 python -m ltx_pipelines.ti2vid_two_stages \
     --checkpoint-path path/to/checkpoint.safetensors \
-    --distilled-lora-path path/to/distilled_lora.safetensors \
+    --distilled-lora path/to/distilled_lora.safetensors \
     --spatial-upsampler-path path/to/upsampler.safetensors \
     --gemma-root path/to/gemma \
     --prompt "A beautiful sunset over the ocean" \
