@@ -867,6 +867,11 @@ Examples:
     # ==========================================================================
     sliding_group = parser.add_argument_group("Sliding Window (Long Video)")
     sliding_group.add_argument(
+        "--enable-sliding-window",
+        action="store_true",
+        help="Enable sliding window mode for long videos. Required to use sliding windows.",
+    )
+    sliding_group.add_argument(
         "--sliding-window-size",
         type=int,
         default=129,
@@ -3138,7 +3143,7 @@ def sliding_window_generate(
                 stage_1_w = args.width // 2
                 frames_resized = []
                 for i in range(frames_for_latent.shape[0]):
-                    frame = frames_for_latent[i].numpy().astype("uint8")
+                    frame = frames_for_latent[i].cpu().numpy().astype("uint8")
                     frame_resized = cv2.resize(frame, (stage_1_w, stage_1_h), interpolation=cv2.INTER_LANCZOS4)
                     frames_resized.append(torch.from_numpy(frame_resized).float())
                 frames_for_latent = torch.stack(frames_resized, dim=0)
@@ -3320,9 +3325,10 @@ def main():
     # Set up tiling config for VAE
     tiling_config = TilingConfig.default()
 
-    # Determine if sliding window mode should be used
+    # Determine if sliding window mode should be used (requires explicit flag)
     use_sliding_window = (
-        args.num_frames > args.sliding_window_size
+        args.enable_sliding_window
+        and args.num_frames > args.sliding_window_size
         and not args.svi_mode
         and not args.extend_video
     )
