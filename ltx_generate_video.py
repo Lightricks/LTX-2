@@ -1889,11 +1889,29 @@ class LTXVideoGeneratorWithOffloading:
             if hasattr(transformer.velocity_model, "av_ca_v2a_gate_adaln_single"):
                 transformer.velocity_model.av_ca_v2a_gate_adaln_single.to(self.device)
 
-            block_swap_manager = enable_block_swap(
-                transformer,
-                blocks_in_memory=self.refiner_blocks_in_memory,
-                device=self.device,
-            )
+            # Try to enable block swap with OOM retry (reduce blocks if needed)
+            current_blocks = self.refiner_blocks_in_memory
+            min_blocks = 1
+            while current_blocks >= min_blocks:
+                try:
+                    block_swap_manager = enable_block_swap(
+                        transformer,
+                        blocks_in_memory=current_blocks,
+                        device=self.device,
+                    )
+                    # Update instance variable for later retry logic
+                    self.refiner_blocks_in_memory = current_blocks
+                    break
+                except torch.OutOfMemoryError:
+                    current_blocks -= 1
+                    if current_blocks < min_blocks:
+                        print(f">>> OOM Error during block swap setup: Already at minimum blocks ({min_blocks})")
+                        raise
+                    print(f">>> OOM during enable_block_swap! Retrying with {current_blocks} blocks...")
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+                    gc.collect()
         else:
             # Non-block-swap case: load with LoRAs directly to GPU (fast)
             stage_2_ledger = ModelLedger(
@@ -2238,12 +2256,26 @@ def generate_svi_multi_clip(
             # Create preview callback if enabled
             preview_callback = None
             if args.preview_dir:
+                # Compute latent dimensions for preview unpatchification
+                # Two-stage operates at half resolution in stage 1
+                if generator.one_stage:
+                    lf = (args.num_frames - 1) // 8 + 1
+                    lh = args.height // 32
+                    lw = args.width // 32
+                else:
+                    lf = (args.num_frames - 1) // 8 + 1
+                    lh = (args.height // 2) // 32
+                    lw = (args.width // 2) // 32
+
                 preview_callback = create_preview_callback(
                     preview_dir=args.preview_dir,
                     preview_interval=args.preview_interval,
                     max_height=args.preview_max_height,
                     stage_name=f"svi_clip{clip_idx + 1}",
                     preview_suffix=args.preview_suffix,
+                    latent_frames=lf,
+                    latent_height=lh,
+                    latent_width=lw,
                 )
 
             # Generate this clip
@@ -2578,6 +2610,10 @@ def generate_preview(
     latents: torch.Tensor,
     max_height: int = 200,
     num_keyframes: int = 4,
+    # Latent spatial dimensions for unpatchifying sequence format
+    latent_frames: int = 0,
+    latent_height: int = 0,
+    latent_width: int = 0,
 ) -> "Image.Image | None":
     """
     Generate RGB preview from latent tensor without VAE decoding.
@@ -2586,9 +2622,14 @@ def generate_preview(
     memory-efficient preview during denoising.
 
     Args:
-        latents: Latent tensor [B, C, T, H, W] or [C, T, H, W]
+        latents: Latent tensor - can be:
+            - Spatial format: [B, C, T, H, W] or [C, T, H, W]
+            - Sequence format: [B, seq_len, C] (patchified, needs dimensions to reshape)
         max_height: Maximum height of output preview
         num_keyframes: Number of temporal keyframes to show
+        latent_frames: Number of latent frames (for unpatchifying sequence format)
+        latent_height: Latent height (for unpatchifying sequence format)
+        latent_width: Latent width (for unpatchifying sequence format)
 
     Returns:
         PIL Image showing preview grid, or None if failed
@@ -2597,11 +2638,55 @@ def generate_preview(
     import numpy as np
 
     try:
-        # Ensure batch dimension
-        if latents.dim() == 4:
+        # Handle various latent shapes
+        ndim = latents.dim()
+
+        # Detect sequence/patchified format (used internally by LTX-V transformer)
+        # Shape is [batch, seq_len, hidden_dim] where hidden_dim is 128
+        if ndim == 3:
+            batch, seq_len, hidden = latents.shape
+            if hidden == 128:
+                # Sequence format [B, seq_len, 128]
+                # Need spatial dimensions to unpatchify (Wan2GP approach)
+                if latent_frames > 0 and latent_height > 0 and latent_width > 0:
+                    expected_tokens = latent_frames * latent_height * latent_width
+                    # Handle conditioning tokens (may be prepended/appended)
+                    if seq_len >= expected_tokens:
+                        # Take only the video tokens (first expected_tokens)
+                        video_tokens = latents[:, :expected_tokens, :]
+                        # Reshape: [B, T*H*W, 128] -> [B, 128, T, H, W]
+                        video_tokens = video_tokens.transpose(1, 2)  # [B, 128, T*H*W]
+                        latents = video_tokens.reshape(batch, 128, latent_frames, latent_height, latent_width)
+                    else:
+                        # Token count mismatch - skip preview
+                        return None
+                else:
+                    # No spatial dimensions provided - cannot unpatchify
+                    return None
+            else:
+                # Not 128 channels, treat as [C, H, W] -> [1, C, 1, H, W]
+                latents = latents.unsqueeze(0).unsqueeze(2)
+        elif ndim == 2:
+            seq_len, hidden = latents.shape
+            if hidden == 128:
+                # Sequence format without batch - cannot preview without dimensions
+                return None
+            # Treat as [H, W] - unusual, skip
+            return None
+        elif ndim == 4:
+            # Could be [B, C, H, W] or [C, T, H, W]
+            # Assume [C, T, H, W] for video latents
             latents = latents.unsqueeze(0)
+        elif ndim != 5:
+            print(f"Warning: Unexpected latent dims: {ndim}, shape: {latents.shape}")
+            return None
 
         B, C, T, H, W = latents.shape
+
+        # Verify this is spatial format with 128 channels
+        if C != 128:
+            # Not in expected spatial format
+            return None
 
         # Select keyframes (temporal subsampling)
         num_keyframes = min(T, num_keyframes)
@@ -2671,6 +2756,10 @@ def create_preview_callback(
     max_height: int = 200,
     stage_name: str = "stage1",
     preview_suffix: str = "",
+    # Latent spatial dimensions for unpatchifying sequence format
+    latent_frames: int = 0,
+    latent_height: int = 0,
+    latent_width: int = 0,
 ):
     """
     Create a callback function for preview generation during denoising.
@@ -2681,6 +2770,9 @@ def create_preview_callback(
         max_height: Maximum preview height
         stage_name: Prefix for filenames (e.g., "stage1", "stage2")
         preview_suffix: Unique suffix for MP4 preview filename
+        latent_frames: Number of latent frames (for unpatchifying sequence format)
+        latent_height: Latent height (for unpatchifying sequence format)
+        latent_width: Latent width (for unpatchifying sequence format)
 
     Returns:
         Callback function compatible with euler_denoising_loop
@@ -2702,6 +2794,9 @@ def create_preview_callback(
             latents=video_state.latent,
             max_height=max_height,
             num_keyframes=4,
+            latent_frames=latent_frames,
+            latent_height=latent_height,
+            latent_width=latent_width,
         )
 
         if preview is not None:
@@ -2974,12 +3069,26 @@ def sliding_window_generate(
         # Create preview callback if enabled
         preview_callback = None
         if args.preview_dir:
+            # Compute latent dimensions for preview unpatchification
+            # Two-stage operates at half resolution in stage 1
+            if generator.one_stage:
+                lf = (window_frames - 1) // 8 + 1
+                lh = args.height // 32
+                lw = args.width // 32
+            else:
+                lf = (window_frames - 1) // 8 + 1
+                lh = (args.height // 2) // 32
+                lw = (args.width // 2) // 32
+
             preview_callback = create_preview_callback(
                 preview_dir=args.preview_dir,
                 preview_interval=args.preview_interval,
                 max_height=args.preview_max_height,
                 stage_name=f"window{window_idx + 1}",
                 preview_suffix=args.preview_suffix,
+                latent_frames=lf,
+                latent_height=lh,
+                latent_width=lw,
             )
 
         # Generate this window
@@ -3306,12 +3415,26 @@ def main():
         # Create preview callback if enabled
         preview_callback = None
         if args.preview_dir:
+            # Compute latent dimensions for preview unpatchification
+            # Two-stage operates at half resolution in stage 1
+            if generator.one_stage:
+                lf = (args.num_frames - 1) // 8 + 1
+                lh = args.height // 32
+                lw = args.width // 32
+            else:
+                lf = (args.num_frames - 1) // 8 + 1
+                lh = (args.height // 2) // 32
+                lw = (args.width // 2) // 32
+
             preview_callback = create_preview_callback(
                 preview_dir=args.preview_dir,
                 preview_interval=args.preview_interval,
                 max_height=args.preview_max_height,
                 stage_name="stage1",
                 preview_suffix=args.preview_suffix,
+                latent_frames=lf,
+                latent_height=lh,
+                latent_width=lw,
             )
 
         video, audio = generator.generate(
