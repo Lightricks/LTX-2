@@ -16,11 +16,16 @@ from ltx_pipelines.ic_lora import ICLoraPipeline
 from ltx_pipelines.keyframe_interpolation import KeyframeInterpolationPipeline
 from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline
 from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
-
+from ltx_pipelines.ti2vid_two_stages_deterministic import (
+    TI2VidTwoStagesPipelineDeterministic,
+    enable_deterministic_mode,
+)
 __all__ = [
     "DistilledPipeline",
     "ICLoraPipeline",
     "KeyframeInterpolationPipeline",
     "TI2VidOneStagePipeline",
     "TI2VidTwoStagesPipeline",
+    "TI2VidTwoStagesPipelineDeterministic",
+    "enable_deterministic_mode",
 ]
