@@ -1,7 +1,11 @@
 import torch
-import triton
 
-from ltx_core.loader.kernels import fused_add_round_kernel
+try:
+    import triton
+    from ltx_core.loader.kernels import fused_add_round_kernel
+    TRITON_AVAILABLE = True
+except ImportError:
+    TRITON_AVAILABLE = False
 from ltx_core.loader.primitives import LoraStateDictWithStrength, StateDict
 
 BLOCK_SIZE = 1024
@@ -84,7 +88,7 @@ def apply_loras(
                 continue
             deltas = weight.clone().to(dtype=target_dtype, device=device)
         elif weight.dtype == torch.float8_e4m3fn:
-            if str(device).startswith("cuda"):
+            if TRITON_AVAILABLE and str(device).startswith("cuda"):
                 deltas = calculate_weight_float8_(deltas, weight)
             else:
                 deltas.add_(weight.to(dtype=deltas.dtype, device=device))
