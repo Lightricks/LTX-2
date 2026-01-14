@@ -79,9 +79,9 @@ class LtxvTrainer:
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
+        self._setup_accelerator()
         self._cached_validation_embeddings = self._load_text_encoder_and_cache_embeddings()
         self._load_models()
-        self._setup_accelerator()
         self._collect_trainable_params()
         self._load_checkpoint()
         self._prepare_models_for_training()
@@ -351,7 +351,7 @@ class LtxvTrainer:
         self._text_encoder = load_text_encoder(
             checkpoint_path=self._config.model.model_path,
             gemma_model_path=self._config.model.text_encoder_path,
-            device="cuda",
+            device=self._accelerator.device,
             dtype=torch.bfloat16,
         )
 
