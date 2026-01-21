@@ -13,6 +13,7 @@ Can be used as a standalone script:
 
 import json
 import os
+import gc
 from pathlib import Path
 from typing import Any
 
@@ -331,6 +332,11 @@ def compute_captions_embeddings(  # noqa: PLR0913
             progress.advance(task)
 
     logger.info(f"Processed {len(dataset):,} captions. Embeddings saved to {output_path}")
+
+    if device.startswith("cuda"):
+        del text_encoder
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 @app.command()
