@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Bug Bounty Tool</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding-bottom: 70px;
+        }
+
+        .header {
+            background: rgba(255, 255, 255, 0.95);
+            padding: 15px 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        .header h1 {
+            font-size: 24px;
+            color: #667eea;
+            text-align: center;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+            padding: 20px;
+        }
+
+        .stat-card {
+            background: white;
+            padding: 15px;
+            border-radius: 12px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+
+        .stat-value {
+            font-size: 28px;
+            font-weight: bold;
+            color: #667eea;
+        }
+
+        .stat-label {
+            font-size: 12px;
+            color: #666;
+            margin-top: 5px;
+        }
+
+        .content {
+            padding: 0 20px 20px;
+        }
+
+        .section {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            display: none;
+        }
+
+        .section.active {
+            display: block;
+        }
+
+        .section-title {
+            font-size: 20px;
+            color: #333;
+            margin-bottom: 15px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .btn {
+            background: #667eea;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 8px;
+            font-size: 14px;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .btn:active {
+            transform: scale(0.95);
+        }
+
+        .btn-small {
+            padding: 6px 12px;
+            font-size: 12px;
+        }
+
+        .btn-danger {
+            background: #ef4444;
+        }
+
+        .btn-success {
+            background: #10b981;
+        }
+
+        .item {
+            background: #f9fafb;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            border-left: 4px solid #667eea;
+        }
+
+        .item-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: start;
+            margin-bottom: 8px;
+        }
+
+        .item-title {
+            font-weight: bold;
+            color: #333;
+            flex: 1;
+        }
+
+        .item-meta {
+            font-size: 12px;
+            color: #666;
+            margin-top: 5px;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: bold;
+            margin-right: 5px;
+        }
+
+        .badge-critical { background: #dc2626; color: white; }
+        .badge-high { background: #f59e0b; color: white; }
+        .badge-medium { background: #3b82f6; color: white; }
+        .badge-low { background: #10b981; color: white; }
+        .badge-info { background: #6b7280; color: white; }
+
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 1000;
+            overflow-y: auto;
+        }
+
+        .modal.active {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .modal-content {
+            background: white;
+            border-radius: 12px;
+            padding: 20px;
+            width: 100%;
+            max-width: 500px;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        .form-label {
+            display: block;
+            font-size: 14px;
+            font-weight: 500;
+            color: #333;
+            margin-bottom: 5px;
+        }
+
+        .form-input, .form-textarea, .form-select {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+
+        .form-textarea {
+            min-height: 80px;
+            resize: vertical;
+        }
+
+        .bottom-nav {
+            position: fixed;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: white;
+            display: flex;
+            justify-content: space-around;
+            padding: 10px 0;
+            box-shadow: 0 -2px 10px rgba(0,0,0,0.1);
+        }
+
+        .nav-item {
+            flex: 1;
+            text-align: center;
+            padding: 8px;
+            cursor: pointer;
+            transition: all 0.3s;
+            border: none;
+            background: none;
+            color: #666;
+        }
+
+        .nav-item.active {
+            color: #667eea;
+        }
+
+        .nav-icon {
+            font-size: 24px;
+            margin-bottom: 4px;
+        }
+
+        .nav-label {
+            font-size: 11px;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 40px 20px;
+            color: #666;
+        }
+
+        .item-actions {
+            display: flex;
+            gap: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🎯 Bug Bounty Tool</h1>
+    </div>
+
+    <div class="stats">
+        <div class="stat-card">
+            <div class="stat-value" id="totalTargets">0</div>
+            <div class="stat-label">Targets</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" id="totalFindings">0</div>
+            <div class="stat-label">Findings</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" id="criticalCount">0</div>
+            <div class="stat-label">Critical</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-value" id="totalBounty">$0</div>
+            <div class="stat-label">Total Bounty</div>
+        </div>
+    </div>
+
+    <div class="content">
+        <!-- Targets Section -->
+        <div class="section active" id="targetsSection">
+            <div class="section-title">
+                <span>Targets</span>
+                <button class="btn btn-small" onclick="openTargetModal()">+ Add</button>
+            </div>
+            <div id="targetsList"></div>
+        </div>
+
+        <!-- Findings Section -->
+        <div class="section" id="findingsSection">
+            <div class="section-title">
+                <span>Findings</span>
+                <button class="btn btn-small" onclick="openFindingModal()">+ Add</button>
+            </div>
+            <div id="findingsList"></div>
+        </div>
+
+        <!-- Notes Section -->
+        <div class="section" id="notesSection">
+            <div class="section-title">
+                <span>Notes</span>
+                <button class="btn btn-small" onclick="openNoteModal()">+ Add</button>
+            </div>
+            <div id="notesList"></div>
+        </div>
+    </div>
+
+    <!-- Target Modal -->
+    <div class="modal" id="targetModal">
+        <div class="modal-content">
+            <h2 style="margin-bottom: 20px;">Add Target</h2>
+            <form id="targetForm">
+                <div class="form-group">
+                    <label class="form-label">Name *</label>
+                    <input type="text" class="form-input" name="name" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">URL *</label>
+                    <input type="url" class="form-input" name="url" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Program</label>
+                    <input type="text" class="form-input" name="program">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Scope</label>
+                    <textarea class="form-textarea" name="scope"></textarea>
+                </div>
+                <div style="display: flex; gap: 10px;">
+                    <button type="submit" class="btn btn-success" style="flex: 1;">Save</button>
+                    <button type="button" class="btn btn-danger" style="flex: 1;" onclick="closeModal('targetModal')">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Finding Modal -->
+    <div class="modal" id="findingModal">
+        <div class="modal-content">
+            <h2 style="margin-bottom: 20px;">Add Finding</h2>
+            <form id="findingForm">
+                <div class="form-group">
+                    <label class="form-label">Title *</label>
+                    <input type="text" class="form-input" name="title" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Severity *</label>
+                    <select class="form-select" name="severity" required>
+                        <option value="critical">Critical</option>
+                        <option value="high">High</option>
+                        <option value="medium">Medium</option>
+                        <option value="low">Low</option>
+                        <option value="info">Info</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Target</label>
+                    <input type="text" class="form-input" name="target">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Description</label>
+                    <textarea class="form-textarea" name="description"></textarea>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Steps to Reproduce</label>
+                    <textarea class="form-textarea" name="steps"></textarea>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Impact</label>
+                    <textarea class="form-textarea" name="impact"></textarea>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Bounty Amount</label>
+                    <input type="number" class="form-input" name="bounty" step="0.01">
+                </div>
+                <div style="display: flex; gap: 10px;">
+                    <button type="submit" class="btn btn-success" style="flex: 1;">Save</button>
+                    <button type="button" class="btn btn-danger" style="flex: 1;" onclick="closeModal('findingModal')">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Note Modal -->
+    <div class="modal" id="noteModal">
+        <div class="modal-content">
+            <h2 style="margin-bottom: 20px;">Add Note</h2>
+            <form id="noteForm">
+                <div class="form-group">
+                    <label class="form-label">Title *</label>
+                    <input type="text" class="form-input" name="title" required>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">Content *</label>
+                    <textarea class="form-textarea" name="content" required style="min-height: 150px;"></textarea>
+                </div>
+                <div style="display: flex; gap: 10px;">
+                    <button type="submit" class="btn btn-success" style="flex: 1;">Save</button>
+                    <button type="button" class="btn btn-danger" style="flex: 1;" onclick="closeModal('noteModal')">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Bottom Navigation -->
+    <div class="bottom-nav">
+        <button class="nav-item active" onclick="switchSection('targets')">
+            <div class="nav-icon">🎯</div>
+            <div class="nav-label">Targets</div>
+        </button>
+        <button class="nav-item" onclick="switchSection('findings')">
+            <div class="nav-icon">🔍</div>
+            <div class="nav-label">Findings</div>
+        </button>
+        <button class="nav-item" onclick="switchSection('notes')">
+            <div class="nav-icon">📝</div>
+            <div class="nav-label">Notes</div>
+        </button>
+    </div>
+
+    <script>
+        // State management
+        let targets = [];
+        let findings = [];
+        let notes = [];
+
+        // Initialize
+        async function init() {
+            await loadStats();
+            await loadTargets();
+            await loadFindings();
+            await loadNotes();
+        }
+
+        // Load stats
+        async function loadStats() {
+            const response = await fetch('/api/stats');
+            const stats = await response.json();
+            document.getElementById('totalTargets').textContent = stats.total_targets;
+            document.getElementById('totalFindings').textContent = stats.total_findings;
+            document.getElementById('criticalCount').textContent = stats.severity_counts.critical;
+            document.getElementById('totalBounty').textContent = '$' + stats.total_bounty.toFixed(2);
+        }
+
+        // Load targets
+        async function loadTargets() {
+            const response = await fetch('/api/targets');
+            targets = await response.json();
+            renderTargets();
+        }
+
+        function renderTargets() {
+            const container = document.getElementById('targetsList');
+            if (targets.length === 0) {
+                container.innerHTML = '<div class="empty-state">No targets yet. Add your first target!</div>';
+                return;
+            }
+            container.innerHTML = targets.map(target => `
+                <div class="item">
+                    <div class="item-header">
+                        <div style="flex: 1;">
+                            <div class="item-title">${target.name}</div>
+                            <div class="item-meta">${target.url}</div>
+                            ${target.program ? `<div class="item-meta">Program: ${target.program}</div>` : ''}
+                        </div>
+                        <div class="item-actions">
+                            <button class="btn btn-small btn-danger" onclick="deleteTarget(${target.id})">Delete</button>
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // Load findings
+        async function loadFindings() {
+            const response = await fetch('/api/findings');
+            findings = await response.json();
+            renderFindings();
+        }
+
+        function renderFindings() {
+            const container = document.getElementById('findingsList');
+            if (findings.length === 0) {
+                container.innerHTML = '<div class="empty-state">No findings yet. Document your first finding!</div>';
+                return;
+            }
+            container.innerHTML = findings.map(finding => `
+                <div class="item">
+                    <div class="item-header">
+                        <div style="flex: 1;">
+                            <div class="item-title">
+                                <span class="badge badge-${finding.severity}">${finding.severity.toUpperCase()}</span>
+                                ${finding.title}
+                            </div>
+                            ${finding.target ? `<div class="item-meta">Target: ${finding.target}</div>` : ''}
+                            ${finding.bounty ? `<div class="item-meta">Bounty: $${finding.bounty}</div>` : ''}
+                        </div>
+                        <div class="item-actions">
+                            <button class="btn btn-small btn-danger" onclick="deleteFinding(${finding.id})">Delete</button>
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // Load notes
+        async function loadNotes() {
+            const response = await fetch('/api/notes');
+            notes = await response.json();
+            renderNotes();
+        }
+
+        function renderNotes() {
+            const container = document.getElementById('notesList');
+            if (notes.length === 0) {
+                container.innerHTML = '<div class="empty-state">No notes yet. Create your first note!</div>';
+                return;
+            }
+            container.innerHTML = notes.map(note => `
+                <div class="item">
+                    <div class="item-header">
+                        <div style="flex: 1;">
+                            <div class="item-title">${note.title}</div>
+                            <div class="item-meta">${note.content.substring(0, 100)}${note.content.length > 100 ? '...' : ''}</div>
+                        </div>
+                        <div class="item-actions">
+                            <button class="btn btn-small btn-danger" onclick="deleteNote(${note.id})">Delete</button>
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // Section switching
+        function switchSection(section) {
+            document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+            document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+            
+            document.getElementById(section + 'Section').classList.add('active');
+            event.currentTarget.classList.add('active');
+        }
+
+        // Modal functions
+        function openTargetModal() {
+            document.getElementById('targetModal').classList.add('active');
+        }
+
+        function openFindingModal() {
+            document.getElementById('findingModal').classList.add('active');
+        }
+
+        function openNoteModal() {
+            document.getElementById('noteModal').classList.add('active');
+        }
+
+        function closeModal(modalId) {
+            document.getElementById(modalId).classList.remove('active');
+        }
+
+        // Form submissions
+        document.getElementById('targetForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const formData = new FormData(e.target);
+            const data = Object.fromEntries(formData);
+            
+            await fetch('/api/targets', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(data)
+            });
+            
+            e.target.reset();
+            closeModal('targetModal');
+            await loadTargets();
+            await loadStats();
+        });
+
+        document.getElementById('findingForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const formData = new FormData(e.target);
+            const data = Object.fromEntries(formData);
+            
+            await fetch('/api/findings', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(data)
+            });
+            
+            e.target.reset();
+            closeModal('findingModal');
+            await loadFindings();
+            await loadStats();
+        });
+
+        document.getElementById('noteForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const formData = new FormData(e.target);
+            const data = Object.fromEntries(formData);
+            
+            await fetch('/api/notes', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(data)
+            });
+            
+            e.target.reset();
+            closeModal('noteModal');
+            await loadNotes();
+        });
+
+        // Delete functions
+        async function deleteTarget(id) {
+            if (confirm('Delete this target?')) {
+                await fetch(`/api/targets/${id}`, {method: 'DELETE'});
+                await loadTargets();
+                await loadStats();
+            }
+        }
+
+        async function deleteFinding(id) {
+            if (confirm('Delete this finding?')) {
+                await fetch(`/api/findings/${id}`, {method: 'DELETE'});
+                await loadFindings();
+                await loadStats();
+            }
+        }
+
+        async function deleteNote(id) {
+            if (confirm('Delete this note?')) {
+                await fetch(`/api/notes/${id}`, {method: 'DELETE'});
+                await loadNotes();
+            }
+        }
+
+        // Initialize on load
+        init();
+    </script>
+</body>
+</html>
