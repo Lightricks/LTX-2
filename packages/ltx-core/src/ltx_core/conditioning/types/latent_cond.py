@@ -3,7 +3,7 @@ import torch
 from ltx_core.conditioning.exceptions import ConditioningError
 from ltx_core.conditioning.item import ConditioningItem
 from ltx_core.tools import LatentTools
-from ltx_core.types import LatentState
+from ltx_core.types import AudioLatentShape, LatentState
 
 
 class VideoConditionByLatentIndex(ConditioningItem):
@@ -41,4 +41,36 @@ class VideoConditionByLatentIndex(ConditioningItem):
         latent_state.clean_latent[:, start_token:stop_token] = tokens
         latent_state.denoise_mask[:, start_token:stop_token] = 1.0 - self.strength
 
+        return latent_state
+
+
+class AudioConditionByLatent(ConditioningItem):
+    """
+    Conditions audio generation by injecting a full latent sequence.
+    Replaces tokens in the latent state with the provided audio latents,
+    and sets denoise strength according to the strength parameter.
+    """
+
+    def __init__(self, latent: torch.Tensor, strength: float):
+        self.latent = latent
+        self.strength = strength
+
+    def apply_to(self, latent_state: LatentState, latent_tools: LatentTools) -> LatentState:
+        if not isinstance(latent_tools.target_shape, AudioLatentShape):
+            raise ConditioningError("Audio conditioning requires an audio latent target shape.")
+
+        cond_batch, cond_channels, cond_frames, cond_bins = self.latent.shape
+        tgt_batch, tgt_channels, tgt_frames, tgt_bins = latent_tools.target_shape.to_torch_shape()
+
+        if (cond_batch, cond_channels, cond_frames, cond_bins) != (tgt_batch, tgt_channels, tgt_frames, tgt_bins):
+            raise ConditioningError(
+                f"Can't apply audio conditioning to latent with shape {latent_tools.target_shape}, "
+                f"expected ({tgt_batch}, {tgt_channels}, {tgt_frames}, {tgt_bins})."
+            )
+
+        tokens = latent_tools.patchifier.patchify(self.latent)
+        latent_state = latent_state.clone()
+        latent_state.latent[:, : tokens.shape[1]] = tokens
+        latent_state.clean_latent[:, : tokens.shape[1]] = tokens
+        latent_state.denoise_mask[:, : tokens.shape[1]] = 1.0 - self.strength
         return latent_state
