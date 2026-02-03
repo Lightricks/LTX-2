@@ -251,7 +251,7 @@ def default_1_stage_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_VIDEO_GUIDER_PARAMS.skip_step,
         help=(
             "Video skip step N controls periodic skipping during the video diffusion process: "
-            "only steps where step_index % (N + 1) == 0 are processed, all others are skipped "
+            "only steps where step_index %% (N + 1) == 0 are processed, all others are skipped "
             f"(e.g., 0 = no skipping; 1 = skip every other step; 2 = skip 2 of every 3 steps; "
             f"default: {DEFAULT_VIDEO_GUIDER_PARAMS.skip_step})."
         ),
@@ -311,7 +311,7 @@ def default_1_stage_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_AUDIO_GUIDER_PARAMS.skip_step,
         help=(
             "Audio skip step N controls periodic skipping during the audio diffusion process: "
-            "only steps where step_index % (N + 1) == 0 are processed, all others are skipped "
+            "only steps where step_index %% (N + 1) == 0 are processed, all others are skipped "
             f"(e.g., 0 = no skipping; 1 = skip every other step; 2 = skip 2 of every 3 steps; "
             f"default: {DEFAULT_AUDIO_GUIDER_PARAMS.skip_step})."
         ),
