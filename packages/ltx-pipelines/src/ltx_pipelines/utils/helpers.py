@@ -477,17 +477,18 @@ def simple_denoising_func(
             denoised_video, denoised_audio = transformer(video=pos_video, audio=pos_audio, perturbations=None)
             return denoised_video, denoised_audio
 
+        # Normal forward pass (no perturbations)
+        pos_denoised_video, pos_denoised_audio = transformer(
+            video=pos_video, audio=pos_audio, perturbations=None
+        )
+
+        # Perturbed forward pass (skip cross-modal attention)
         alt_video = modality_from_latent_state(video_state, video_context, sigma)
         alt_audio = modality_from_latent_state(audio_state, audio_context, sigma)
         batch_size = _get_batch_size(video_state, audio_state)
-        perturbations = [None, _cross_attn_perturbations(batch_size)]
-        denoised_video_list, denoised_audio_list = transformer(
-            video=[pos_video, alt_video],
-            audio=[pos_audio, alt_audio],
-            perturbations=perturbations,
+        alt_denoised_video, alt_denoised_audio = transformer(
+            video=alt_video, audio=alt_audio, perturbations=_cross_attn_perturbations(batch_size)
         )
-        pos_denoised_video, alt_denoised_video = denoised_video_list
-        pos_denoised_audio, alt_denoised_audio = denoised_audio_list
         denoised_video = pos_denoised_video + (alt_guidance_scale - 1.0) * (
             pos_denoised_video - alt_denoised_video
         )
