@@ -26,12 +26,12 @@ dependencies = [
     "scenedetect>=0.6.5.2",
     "sentencepiece>=0.2.0",
     "torch>=2.6.0",
-    "torchaudio>=2.9.0",
+    "torchaudio>=2.7.0",
     "torchcodec>=0.8.1",
     "torchvision>=0.21.0",
     "typer>=0.15.1",
     "wandb>=0.19.11",
-    "setuptools>=80.9.0",
+    "setuptools>=79.0.0",
 ]
 
 [dependency-groups]

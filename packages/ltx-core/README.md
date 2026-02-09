@@ -10,6 +10,7 @@ The foundational library for the LTX-2 Audio-Video generation model. This packag
 - **`loader/`**: Utilities for loading weights from `.safetensors`, fusing LoRAs, and managing memory
 - **`model/`**: PyTorch implementations of the LTX-2 Transformer, Video VAE, Audio VAE, Vocoder and Upscaler
 - **`text_encoders/gemma`**: Gemma text encoder implementation with tokenizers, feature extractors, and separate encoders for audio-video and video-only generation
+- **`quantization/`**: FP8 quantization backends (FP8-TensorRT-LLM scaled MM, FP8 cast) for reduced memory footprint.
 
 ## 🚀 Quick Start
 
@@ -53,6 +54,63 @@ pip install -e packages/ltx-core
 ### Utilities
 
 - **Loader** ([`loader/`](src/ltx_core/loader/)): Model loading from `.safetensors`, LoRA fusion, weight remapping, and memory management
+- **Quantization** ([`quantization/`](src/ltx_core/quantization/)): FP8 quantization backends for reduced memory footprint and faster inference
+
+### Quantization
+
+The `quantization/` module provides FP8 quantization support for the LTX-2 transformer, significantly reducing memory usage while maintaining quality. Two backends are available:
+
+#### FP8 Scaled MM (TensorRT-LLM)
+
+Uses NVIDIA TensorRT-LLM's `cublas_scaled_mm` for efficient FP8 matrix multiplication. Weights are stored in FP8 format with per-tensor scaling, and inputs are quantized dynamically (or statically with calibration data).
+
+**Requirements**: `uv sync --frozen --extra fp8-trtllm`
+
+**Usage with QuantizationPolicy:**
+
+```python
+from ltx_core.quantization import QuantizationPolicy
+
+# Dynamic input quantization (no calibration needed)
+policy = QuantizationPolicy.fp8_scaled_mm()
+
+# Static input quantization with calibration file
+policy = QuantizationPolicy.fp8_scaled_mm(calibration_amax_path="/path/to/amax.json")
+```
+
+The policy provides `sd_ops` and `module_ops` that can be passed to the model builder:
+
+```python
+from ltx_core.loader import SingleGPUModelBuilder
+
+builder = SingleGPUModelBuilder(
+    model=model,
+    device=device,
+    sd_ops=policy.sd_ops,
+    module_ops=policy.module_ops,
+)
+builder.load(checkpoint_path)
+```
+
+**Calibration File Format** (for static input quantization):
+
+```json
+{
+  "amax_values": {
+    "transformer_blocks.0.attn.to_q.input_quantizer": 12.5,
+    "transformer_blocks.0.attn.to_k.input_quantizer": 8.3,
+    ...
+  }
+}
+```
+
+#### FP8 Cast
+
+A simpler approach that casts weights to FP8 for storage and upcasts during inference:
+
+```python
+policy = QuantizationPolicy.fp8_cast()
+```
 
 For complete, production-ready pipeline implementations that combine these building blocks, see the [`ltx-pipelines`](../ltx-pipelines/) package.
 

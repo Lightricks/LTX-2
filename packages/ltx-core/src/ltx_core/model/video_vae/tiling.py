@@ -44,6 +44,31 @@ def compute_trapezoidal_mask_1d(
     return mask.clamp_(0, 1)
 
 
+def compute_rectangular_mask_1d(
+    length: int,
+    left_ramp: int,
+    right_ramp: int,
+) -> torch.Tensor:
+    """
+    Generate a 1D rectangular (pulse) mask.
+    Args:
+        length: Output length of the mask.
+        left_ramp: Number of elements at the start of the mask to set to 0.
+        right_ramp: Number of elements at the end of the mask to set to 0.
+    Returns:
+        A 1D tensor of shape `(length,)` with values 0 or 1.
+    """
+    if length <= 0:
+        raise ValueError("Mask length must be positive.")
+
+    mask = torch.ones(length)
+    if left_ramp > 0:
+        mask[:left_ramp] = 0
+    if right_ramp > 0:
+        mask[-right_ramp:] = 0
+    return mask
+
+
 @dataclass(frozen=True)
 class SpatialTilingConfig:
     """Configuration for dividing each frame into spatial tiles with optional overlap.
@@ -114,12 +139,16 @@ class TilingConfig:
 
 @dataclass(frozen=True)
 class DimensionIntervals:
-    """Intervals which a single dimension of the latent space is split into.
-    Each interval is defined by its start, end, left ramp, and right ramp.
-    The start and end are the indices of the first and last element (exclusive) in the interval.
-    Ramps are regions of the interval where the value of the mask tensor is
-    interpolated between 0 and 1 for blending with neighboring intervals.
-    The left ramp and right ramp values are the lengths of the left and right ramps.
+    """Defines how a single dimension is split into overlapping intervals (tiles).
+    Each list has length N where N is the number of intervals. The i-th element
+    of each list describes the i-th interval.
+    Attributes:
+        starts: Start index of each interval (inclusive).
+        ends: End index of each interval (exclusive).
+        left_ramps: Length of the left blend ramp for each interval.
+            Used to create masks that fade in from 0 to 1.
+        right_ramps: Length of the right blend ramp for each interval.
+            Used to create masks that fade out from 1 to 0.
     """
 
     starts: List[int]
@@ -129,9 +158,11 @@ class DimensionIntervals:
 
 
 @dataclass(frozen=True)
-class LatentIntervals:
-    """Intervals which the latent tensor of given shape is split into.
-    Each dimension of the latent space is split into intervals based on the length along said dimension.
+class TensorTilingSpec:
+    """Specifies how a tensor of a given shape is split into intervals (tiles) along each dimension.
+    Attributes:
+        original_shape: Shape of the tensor being tiled.
+        dimension_intervals: Per-dimension intervals (starts, ends, ramps) for each axis.
     """
 
     original_shape: torch.Size
@@ -209,7 +240,7 @@ class Tile(NamedTuple):
 
 
 def create_tiles_from_intervals_and_mappers(
-    intervals: LatentIntervals,
+    intervals: TensorTilingSpec,
     mappers: List[MappingOperation],
 ) -> List[Tile]:
     full_dim_input_slices = []
@@ -241,20 +272,20 @@ def create_tiles_from_intervals_and_mappers(
 
 
 def create_tiles(
-    latent_shape: torch.Size,
+    tensor_shape: torch.Size,
     splitters: List[SplitOperation],
     mappers: List[MappingOperation],
 ) -> List[Tile]:
-    if len(splitters) != len(latent_shape):
+    if len(splitters) != len(tensor_shape):
         raise ValueError(
-            f"Number of splitters must be equal to number of dimensions in latent shape, "
-            f"got {len(splitters)} and {len(latent_shape)}"
+            f"Number of splitters must be equal to number of dimensions in tensor shape, "
+            f"got {len(splitters)} and {len(tensor_shape)}"
         )
-    if len(mappers) != len(latent_shape):
+    if len(mappers) != len(tensor_shape):
         raise ValueError(
-            f"Number of mappers must be equal to number of dimensions in latent shape, "
-            f"got {len(mappers)} and {len(latent_shape)}"
+            f"Number of mappers must be equal to number of dimensions in tensor shape, "
+            f"got {len(mappers)} and {len(tensor_shape)}"
         )
-    intervals = [splitter(length) for splitter, length in zip(splitters, latent_shape, strict=True)]
-    latent_intervals = LatentIntervals(original_shape=latent_shape, dimension_intervals=tuple(intervals))
-    return create_tiles_from_intervals_and_mappers(latent_intervals, mappers)
+    intervals = [splitter(length) for splitter, length in zip(splitters, tensor_shape, strict=True)]
+    tiling_spec = TensorTilingSpec(original_shape=tensor_shape, dimension_intervals=tuple(intervals))
+    return create_tiles_from_intervals_and_mappers(tiling_spec, mappers)

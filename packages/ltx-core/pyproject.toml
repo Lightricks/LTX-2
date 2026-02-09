@@ -9,7 +9,7 @@ dependencies = [
     "torchaudio",
     "einops",
     "numpy",
-    "transformers~=4.57.0",
+    "transformers>=4.52",
     "safetensors",
     "accelerate",
     "scipy>=1.14",
@@ -17,14 +17,32 @@ dependencies = [
 
 [project.optional-dependencies]
 xformers = ["xformers"]
+fp8-trtllm = [
+    "tensorrt-llm==1.0.0",
+    "onnx>=1.16.0,<1.20.0",
+    "openmpi",
+]
 
+[tool.uv]
+conflicts = [
+  [
+    { extra = "xformers" },
+    { extra = "fp8-trtllm" },
+  ],
+]
 
 [tool.uv.sources]
 xformers = { index = "pytorch" }
+tensorrt-llm = { index = "nvidia" }
 
 [[tool.uv.index]]
 name = "pytorch"
 url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com/"
 explicit = true
 
 [build-system]

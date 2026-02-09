@@ -11,6 +11,7 @@ from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
 from ltx_core.model.video_vae import decode_video as vae_decode_video
+from ltx_core.quantization import QuantizationPolicy
 from ltx_core.text_encoders.gemma import encode_text
 from ltx_core.types import LatentState, VideoPixelShape
 from ltx_pipelines.utils import ModelLedger
@@ -46,7 +47,7 @@ class TI2VidOneStagePipeline:
         gemma_root: str,
         loras: list[LoraPathStrengthAndSDOps],
         device: torch.device = device,
-        fp8transformer: bool = False,
+        quantization: QuantizationPolicy | None = None,
     ):
         self.dtype = torch.bfloat16
         self.device = device
@@ -56,7 +57,7 @@ class TI2VidOneStagePipeline:
             checkpoint_path=checkpoint_path,
             gemma_root_path=gemma_root,
             loras=loras,
-            fp8transformer=fp8transformer,
+            quantization=quantization,
         )
         self.pipeline_components = PipelineComponents(
             dtype=self.dtype,
@@ -169,7 +170,7 @@ def main() -> None:
         checkpoint_path=args.checkpoint_path,
         gemma_root=args.gemma_root,
         loras=args.lora,
-        fp8transformer=args.enable_fp8,
+        quantization=args.quantization,
     )
     video, audio = pipeline(
         prompt=args.prompt,

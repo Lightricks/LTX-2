@@ -150,6 +150,7 @@ class Attention(torch.nn.Module):
         norm_eps: float = 1e-6,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         attention_function: AttentionCallable | AttentionFunction = AttentionFunction.DEFAULT,
+        apply_gated_attention: bool = False,
     ) -> None:
         super().__init__()
         self.rope_type = rope_type
@@ -167,6 +168,12 @@ class Attention(torch.nn.Module):
         self.to_q = torch.nn.Linear(query_dim, inner_dim, bias=True)
         self.to_k = torch.nn.Linear(context_dim, inner_dim, bias=True)
         self.to_v = torch.nn.Linear(context_dim, inner_dim, bias=True)
+
+        # Optional per-head gating
+        if apply_gated_attention:
+            self.to_gate_logits = torch.nn.Linear(query_dim, heads, bias=True)
+        else:
+            self.to_gate_logits = None
 
         self.to_out = torch.nn.Sequential(torch.nn.Linear(inner_dim, query_dim, bias=True), torch.nn.Identity())
 
@@ -191,5 +198,18 @@ class Attention(torch.nn.Module):
             k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
 
         # attention_function can be an enum *or* a custom callable
-        out = self.attention_function(q, k, v, self.heads, mask)
+        out = self.attention_function(q, k, v, self.heads, mask)  # (B, T, H*D)
+
+        # Apply per-head gating if enabled
+        if self.to_gate_logits is not None:
+            gate_logits = self.to_gate_logits(x)  # (B, T, H)
+            b, t, _ = out.shape
+            # Reshape to (B, T, H, D) for per-head gating
+            out = out.view(b, t, self.heads, self.dim_head)
+            # Apply gating: 2 * sigmoid(x) so that zero-init gives identity (2 * 0.5 = 1.0)
+            gates = 2.0 * torch.sigmoid(gate_logits)  # (B, T, H)
+            out = out * gates.unsqueeze(-1)  # (B, T, H, D) * (B, T, H, 1)
+            # Reshape back to (B, T, H*D)
+            out = out.view(b, t, self.heads * self.dim_head)
+
         return self.to_out(out)

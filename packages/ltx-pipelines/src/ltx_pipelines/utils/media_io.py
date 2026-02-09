@@ -1,3 +1,4 @@
+import logging
 import math
 from collections.abc import Generator, Iterator
 from fractions import Fraction
@@ -12,6 +13,8 @@ from torch._prims_common import DeviceLikeType
 from tqdm import tqdm
 
 from ltx_pipelines.utils.constants import DEFAULT_IMAGE_CRF
+
+logger = logging.getLogger(__name__)
 
 
 def resize_aspect_ratio_preserving(image: torch.Tensor, long_side: int) -> torch.Tensor:
@@ -227,6 +230,7 @@ def encode_video(
         _write_audio(container, audio_stream, audio, audio_sample_rate)
 
     container.close()
+    logger.info(f"Video saved to {output_path}")
 
 
 def decode_audio_from_file(path: str, device: torch.device) -> torch.Tensor | None:

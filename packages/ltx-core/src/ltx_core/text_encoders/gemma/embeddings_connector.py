@@ -19,6 +19,7 @@ class _BasicTransformerBlock1D(torch.nn.Module):
         heads: int,
         dim_head: int,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+        apply_gated_attention: bool = False,
     ):
         super().__init__()
 
@@ -27,6 +28,7 @@ class _BasicTransformerBlock1D(torch.nn.Module):
             heads=heads,
             dim_head=dim_head,
             rope_type=rope_type,
+            apply_gated_attention=apply_gated_attention,
         )
 
         self.ff = FeedForward(
@@ -99,6 +101,7 @@ class Embeddings1DConnector(torch.nn.Module):
         num_learnable_registers: int | None = 128,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         double_precision_rope: bool = False,
+        apply_gated_attention: bool = False,
     ):
         super().__init__()
         self.num_attention_heads = num_attention_heads
@@ -117,6 +120,7 @@ class Embeddings1DConnector(torch.nn.Module):
                     heads=num_attention_heads,
                     dim_head=attention_head_dim,
                     rope_type=rope_type,
+                    apply_gated_attention=apply_gated_attention,
                 )
                 for _ in range(num_layers)
             ]
@@ -206,5 +210,6 @@ class Embeddings1DConnectorConfigurator(ModelConfigurator[Embeddings1DConnector]
             positional_embedding_max_pos=pe_max_pos,
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,
+            apply_gated_attention=config.get("connector_apply_gated_attention", False),
         )
         return connector

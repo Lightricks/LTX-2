@@ -2,6 +2,7 @@ from dataclasses import replace
 
 import torch
 
+from ltx_core.loader import SDOps
 from ltx_core.loader.primitives import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import DummyRegistry, Registry
 from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
@@ -15,8 +16,6 @@ from ltx_core.model.audio_vae import (
 )
 from ltx_core.model.transformer import (
     LTXV_MODEL_COMFY_RENAMING_MAP,
-    LTXV_MODEL_COMFY_RENAMING_WITH_TRANSFORMER_LINEAR_DOWNCAST_MAP,
-    UPCAST_DURING_INFERENCE,
     LTXModelConfigurator,
     X0Model,
 )
@@ -29,6 +28,7 @@ from ltx_core.model.video_vae import (
     VideoEncoder,
     VideoEncoderConfigurator,
 )
+from ltx_core.quantization import QuantizationPolicy
 from ltx_core.text_encoders.gemma import (
     AV_GEMMA_TEXT_ENCODER_KEY_OPS,
     AVGemmaTextEncoderModel,
@@ -78,8 +78,9 @@ class ModelLedger:
     registry:
         Optional :class:`Registry` instance for weight caching across builders.
         Defaults to :class:`DummyRegistry` which performs no cross-builder caching.
-    fp8transformer:
-        If ``True``, builds the transformer with FP8 quantization and upcasting during inference.
+    quantization:
+        Optional :class:`QuantizationPolicy` controlling how transformer weights
+        are stored and how matmul is executed. Defaults to None, which means no quantization.
     ### Creating Variants
     Use :meth:`with_loras` to create a new ``ModelLedger`` instance that includes
     additional LoRA configurations while sharing the same registry for weight caching.
@@ -94,7 +95,7 @@ class ModelLedger:
         spatial_upsampler_path: str | None = None,
         loras: LoraPathStrengthAndSDOps | None = None,
         registry: Registry | None = None,
-        fp8transformer: bool = False,
+        quantization: QuantizationPolicy | None = None,
     ):
         self.dtype = dtype
         self.device = device
@@ -103,7 +104,7 @@ class ModelLedger:
         self.spatial_upsampler_path = spatial_upsampler_path
         self.loras = loras or ()
         self.registry = registry or DummyRegistry()
-        self.fp8transformer = fp8transformer
+        self.quantization = quantization
         self.build_model_builders()
 
     def build_model_builders(self) -> None:
@@ -179,7 +180,7 @@ class ModelLedger:
             spatial_upsampler_path=self.spatial_upsampler_path,
             loras=(*self.loras, *loras),
             registry=self.registry,
-            fp8transformer=self.fp8transformer,
+            quantization=self.quantization,
         )
 
     def transformer(self) -> X0Model:
@@ -187,19 +188,26 @@ class ModelLedger:
             raise ValueError(
                 "Transformer not initialized. Please provide a checkpoint path to the ModelLedger constructor."
             )
-        if self.fp8transformer:
-            fp8_builder = replace(
-                self.transformer_builder,
-                module_ops=(UPCAST_DURING_INFERENCE,),
-                model_sd_ops=LTXV_MODEL_COMFY_RENAMING_WITH_TRANSFORMER_LINEAR_DOWNCAST_MAP,
-            )
-            return X0Model(fp8_builder.build(device=self._target_device())).to(self.device).eval()
-        else:
+
+        if self.quantization is None:
             return (
                 X0Model(self.transformer_builder.build(device=self._target_device(), dtype=self.dtype))
                 .to(self.device)
                 .eval()
             )
+        else:
+            sd_ops = self.transformer_builder.model_sd_ops
+            if self.quantization.sd_ops is not None:
+                sd_ops = SDOps(
+                    name=f"sd_ops_chain_{sd_ops.name}+{self.quantization.sd_ops.name}",
+                    mapping=(*sd_ops.mapping, *self.quantization.sd_ops.mapping),
+                )
+            builder = replace(
+                self.transformer_builder,
+                module_ops=(*self.transformer_builder.module_ops, *self.quantization.module_ops),
+                model_sd_ops=sd_ops,
+            )
+            return X0Model(builder.build(device=self._target_device())).to(self.device).eval()
 
     def video_decoder(self) -> VideoDecoder:
         if not hasattr(self, "vae_decoder_builder"):
