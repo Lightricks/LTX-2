@@ -91,6 +91,7 @@ class KeyframeInterpolationPipeline:
         images: list[tuple[str, int, float]],
         tiling_config: TilingConfig | None = None,
         enhance_prompt: bool = False,
+        skip_cleanup: bool = False,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
@@ -108,9 +109,10 @@ class KeyframeInterpolationPipeline:
         v_context_p, a_context_p = context_p
         v_context_n, a_context_n = context_n
 
-        torch.cuda.synchronize()
-        del text_encoder
-        cleanup_memory()
+        if not skip_cleanup:
+            torch.cuda.synchronize()
+            del text_encoder
+            cleanup_memory()
 
         # Stage 1: Initial low resolution video generation.
         video_encoder = self.stage_1_model_ledger.video_encoder()
@@ -167,9 +169,10 @@ class KeyframeInterpolationPipeline:
             device=self.device,
         )
 
-        torch.cuda.synchronize()
-        del transformer
-        cleanup_memory()
+        if not skip_cleanup:
+            torch.cuda.synchronize()
+            del transformer
+            cleanup_memory()
 
         # Stage 2: Upsample and refine the video at higher resolution with distilled LORA.
         upscaled_video_latent = upsample_video(
@@ -178,8 +181,9 @@ class KeyframeInterpolationPipeline:
             upsampler=self.stage_2_model_ledger.spatial_upsampler(),
         )
 
-        torch.cuda.synchronize()
-        cleanup_memory()
+        if not skip_cleanup:
+            torch.cuda.synchronize()
+            cleanup_memory()
 
         transformer = self.stage_2_model_ledger.transformer()
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
@@ -223,10 +227,11 @@ class KeyframeInterpolationPipeline:
             initial_audio_latent=audio_state.latent,
         )
 
-        torch.cuda.synchronize()
-        del transformer
-        del video_encoder
-        cleanup_memory()
+        if not skip_cleanup:
+            torch.cuda.synchronize()
+            del transformer
+            del video_encoder
+            cleanup_memory()
 
         decoded_video = vae_decode_video(
             video_state.latent, self.stage_2_model_ledger.video_decoder(), tiling_config, generator
