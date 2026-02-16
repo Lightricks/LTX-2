@@ -1,10 +1,35 @@
+import logging
+
 import torch
 import triton
 
 from ltx_core.loader.kernels import fused_add_round_kernel
 from ltx_core.loader.primitives import LoraStateDictWithStrength, StateDict
 
+logger = logging.getLogger(__name__)
+
 BLOCK_SIZE = 1024
+
+# FP8 E4M3 (fp8e4nv) Triton kernels require Ada Lovelace (sm_89) or newer.
+# Ampere (sm_86, e.g. A40/A100) can store FP8 tensors but cannot run Triton
+# FP8 arithmetic. Detect once at import time and fall back to pure PyTorch.
+_GPU_SUPPORTS_TRITON_FP8: bool | None = None
+
+
+def _gpu_supports_triton_fp8() -> bool:
+    global _GPU_SUPPORTS_TRITON_FP8
+    if _GPU_SUPPORTS_TRITON_FP8 is None:
+        if torch.cuda.is_available():
+            major, minor = torch.cuda.get_device_capability()
+            _GPU_SUPPORTS_TRITON_FP8 = (major, minor) >= (8, 9)
+            if not _GPU_SUPPORTS_TRITON_FP8:
+                logger.info(
+                    f"GPU compute capability {major}.{minor} < 8.9 — "
+                    f"using PyTorch fallback for FP8 LoRA fusion (no Triton fp8e4nv)"
+                )
+        else:
+            _GPU_SUPPORTS_TRITON_FP8 = False
+    return _GPU_SUPPORTS_TRITON_FP8
 
 
 def fused_add_round_launch(target_weight: torch.Tensor, original_weight: torch.Tensor, seed: int) -> torch.Tensor:
@@ -36,8 +61,14 @@ def fused_add_round_launch(target_weight: torch.Tensor, original_weight: torch.T
 
 
 def calculate_weight_float8_(target_weights: torch.Tensor, original_weights: torch.Tensor) -> torch.Tensor:
-    result = fused_add_round_launch(target_weights, original_weights, seed=0).to(target_weights.dtype)
-    target_weights.copy_(result, non_blocking=True)
+    if _gpu_supports_triton_fp8():
+        result = fused_add_round_launch(target_weights, original_weights, seed=0).to(target_weights.dtype)
+        target_weights.copy_(result, non_blocking=True)
+    else:
+        # Pure PyTorch fallback: add in bfloat16, then deterministic cast to FP8.
+        # Slightly less accurate than stochastic rounding but equivalent for inference.
+        result = (target_weights + original_weights.to(dtype=torch.bfloat16)).to(original_weights.dtype)
+        target_weights.copy_(result.to(target_weights.dtype), non_blocking=True)
     return target_weights
 
 
