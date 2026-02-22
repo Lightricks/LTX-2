@@ -1,6 +1,8 @@
 import gc
 import logging
 from dataclasses import replace
+from typing import Union
+from PIL import Image
 
 import torch
 from tqdm import tqdm
@@ -46,7 +48,7 @@ def cleanup_memory() -> None:
 
 
 def image_conditionings_by_replacing_latent(
-    images: list[tuple[str, int, float]],
+    images: list[tuple[Union[str, Image.Image], int, float]],
     height: int,
     width: int,
     video_encoder: VideoEncoder,
@@ -75,7 +77,7 @@ def image_conditionings_by_replacing_latent(
 
 
 def image_conditionings_by_adding_guiding_latent(
-    images: list[tuple[str, int, float]],
+    images: list[tuple[Union[str, Image.Image], int, float]],
     height: int,
     width: int,
     video_encoder: VideoEncoder,

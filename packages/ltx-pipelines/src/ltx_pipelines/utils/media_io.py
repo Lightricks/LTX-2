@@ -3,6 +3,7 @@ import math
 from collections.abc import Generator, Iterator
 from fractions import Fraction
 from io import BytesIO
+from typing import Union
 
 import av
 import numpy as np
@@ -79,13 +80,16 @@ def normalize_latent(latent: torch.Tensor, device: torch.device, dtype: torch.dt
 
 
 def load_image_conditioning(
-    image_path: str, height: int, width: int, dtype: torch.dtype, device: torch.device
+    image_path: Union[str, Image.Image], height: int, width: int, dtype: torch.dtype, device: torch.device
 ) -> torch.Tensor:
     """
     Loads an image from a path and preprocesses it for conditioning.
     Note: The image is resized to the nearest multiple of 2 for compatibility with video codecs.
     """
-    image = decode_image(image_path=image_path)
+    if isinstance(image_path, Image.Image):
+        image = decode_image_pil(image_path=image_path)
+    else:
+        image = decode_image(image_path=image_path)
     image = preprocess(image=image)
     image = torch.tensor(image, dtype=torch.float32, device=device)
     image = resize_and_center_crop(image, height, width)
@@ -114,6 +118,9 @@ def decode_image(image_path: str) -> np.ndarray:
     np_array = np.array(image)[..., :3]
     return np_array
 
+def decode_image_pil(image: Image.Image) -> np.ndarray:
+    np_array = np.array(image)[..., :3]
+    return np_array
 
 def _write_audio(
     container: av.container.Container, audio_stream: av.audio.AudioStream, samples: torch.Tensor, audio_sample_rate: int

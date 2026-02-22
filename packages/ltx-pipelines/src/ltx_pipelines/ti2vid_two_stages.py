@@ -3,6 +3,9 @@ from collections.abc import Iterator
 
 import torch
 
+from typing import Union
+from PIL import Image
+
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
 from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
 from ltx_core.components.noisers import GaussianNoiser
@@ -91,7 +94,7 @@ class TI2VidTwoStagesPipeline:
         num_inference_steps: int,
         video_guider_params: MultiModalGuiderParams,
         audio_guider_params: MultiModalGuiderParams,
-        images: list[tuple[str, int, float]],
+        images: list[tuple[Union[str, Image.Image], int, float]],
         tiling_config: TilingConfig | None = None,
         enhance_prompt: bool = False,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
