@@ -87,7 +87,7 @@ def load_image_conditioning(
     Note: The image is resized to the nearest multiple of 2 for compatibility with video codecs.
     """
     if isinstance(image_path, Image.Image):
-        image = decode_image_pil(image_path=image_path)
+        image = decode_image_pil(image=image_path)
     else:
         image = decode_image(image_path=image_path)
     image = preprocess(image=image)
