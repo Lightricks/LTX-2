@@ -139,8 +139,10 @@ class QuantizationAction(argparse.Action):
                 raise argparse.ArgumentError(self, msg)
             policy = QuantizationPolicy.fp8_cast()
         elif policy_name == "fp8-scaled-mm":
-            amax_path = resolve_path(values[1]) if len(values) > 1 else None
-            policy = QuantizationPolicy.fp8_scaled_mm(amax_path)
+            if len(values) > 1:
+                msg = f"{option_string} fp8-scaled-mm does not accept additional arguments"
+                raise argparse.ArgumentError(self, msg)
+            policy = QuantizationPolicy.fp8_scaled_mm()
 
         setattr(namespace, self.dest, policy)
 
