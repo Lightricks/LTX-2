@@ -109,6 +109,7 @@ class ICLoraPipeline:
                     )
                 self.reference_downscale_factor = scale
 
+    @torch.inference_mode()
     def __call__(  # noqa: PLR0913
         self,
         prompt: str,

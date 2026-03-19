@@ -73,6 +73,7 @@ class DistilledPipeline:
             device=device,
         )
 
+    @torch.inference_mode()
     def __call__(
         self,
         prompt: str,

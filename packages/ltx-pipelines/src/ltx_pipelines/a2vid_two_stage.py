@@ -77,6 +77,7 @@ class A2VidPipelineTwoStage:
             device=device,
         )
 
+    @torch.inference_mode()
     def __call__(  # noqa: PLR0913
         self,
         prompt: str,
