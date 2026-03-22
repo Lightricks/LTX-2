@@ -90,6 +90,19 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
         model_paths = list(self.model_path) if isinstance(self.model_path, tuple) else [self.model_path]
         model_state_dict = self.load_sd(model_paths, sd_ops=self.model_sd_ops, registry=self.registry, device=device)
 
+        # Extract per-tensor FP8 weight scales before load_state_dict drops them.
+        # Pre-quantized FP8 checkpoints include weight_scale tensors that are not
+        # part of the model's parameter schema, so strict=False silently discards
+        # them.  We stash them on the model so that fp8_cast's upcast forward can
+        # apply them during inference dequantization.
+        _fp8_weight_scales: dict[str, float] = {}
+        for key, value in model_state_dict.sd.items():
+            if key.endswith(".weight_scale") and value.numel() == 1:
+                base_name = key[: -len(".weight_scale")]
+                _fp8_weight_scales[base_name] = value.item()
+        if _fp8_weight_scales:
+            meta_model._fp8_weight_scales = _fp8_weight_scales  # type: ignore[attr-defined]
+
         lora_strengths = [lora.strength for lora in self.loras]
         if not lora_strengths or (min(lora_strengths) == 0 and max(lora_strengths) == 0):
             sd = model_state_dict.sd

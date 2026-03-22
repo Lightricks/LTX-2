@@ -65,11 +65,27 @@ def _upcast_and_round(
     return _fused_add_round_launch(torch.zeros_like(weight, dtype=dtype), weight, seed)
 
 
-def _replace_fwd_with_upcast(layer: torch.nn.Linear, with_stochastic_rounding: bool = False, seed: int = 0) -> None:
+def _replace_fwd_with_upcast(
+    layer: torch.nn.Linear,
+    with_stochastic_rounding: bool = False,
+    seed: int = 0,
+    weight_scale: float | None = None,
+) -> None:
     """
-    Replace linear.forward and rms_norm.forward with a version that:
+    Replace linear.forward with a version that:
       - upcasts weight and bias to input's dtype
-      - returns F.linear or F.rms_norm calculated in that dtype
+      - applies weight_scale if the checkpoint was quantized with per-tensor scaling
+      - returns F.linear calculated in that dtype
+
+    Args:
+        layer: The Linear layer to patch.
+        with_stochastic_rounding: Whether to use stochastic rounding during upcast.
+        seed: Seed for stochastic rounding.
+        weight_scale: Per-tensor scale factor from the FP8 checkpoint. When provided,
+            the dequantized weight is multiplied by this value. This is required for
+            FP8 checkpoints that were quantized with per-tensor scaling (e.g.
+            ``ltx-2.3-22b-dev-fp8.safetensors``) where each weight tensor has an
+            associated ``weight_scale`` stored alongside it.
     """
 
     layer.original_forward = layer.forward
@@ -78,6 +94,13 @@ def _replace_fwd_with_upcast(layer: torch.nn.Linear, with_stochastic_rounding: b
         # assume first arg is the input tensor
         x = args[0]
         w_up = _upcast_and_round(layer.weight, x.dtype, with_stochastic_rounding, seed)
+
+        # Apply per-tensor weight scale from FP8 checkpoint if available.
+        # Without this, pre-quantized FP8 checkpoints produce incorrect outputs
+        # because the raw FP8 values are not in the correct magnitude range.
+        if weight_scale is not None:
+            w_up = w_up * weight_scale
+
         b_up = None
 
         if layer.bias is not None:
@@ -92,12 +115,28 @@ def _amend_forward_with_upcast(
     model: torch.nn.Module, with_stochastic_rounding: bool = False, seed: int = 0
 ) -> torch.nn.Module:
     """
-    Replace the forward method of the model's Linear and RMSNorm layers to forward
+    Replace the forward method of the model's Linear layers to forward
     with upcast and optional stochastic rounding.
+
+    If the model was loaded from a pre-quantized FP8 checkpoint that includes
+    per-tensor ``weight_scale`` values (stashed on the model by the builder as
+    ``_fp8_weight_scales``), those scales are automatically applied during the
+    upcast to produce correctly-scaled outputs.
+
+    This is necessary because pre-quantized FP8 checkpoints (e.g.
+    ``ltx-2.3-22b-dev-fp8.safetensors``) store weights in a scaled FP8 format
+    where the raw FP8 values must be multiplied by their associated
+    ``weight_scale`` to recover the correct magnitude.  Without this, a naive
+    ``.to(bfloat16)`` produces values that are orders of magnitude too large,
+    resulting in noise output.
     """
-    for m in model.modules():
-        if isinstance(m, (torch.nn.Linear)):
-            _replace_fwd_with_upcast(m, with_stochastic_rounding, seed)
+    # Retrieve per-tensor weight scales stashed by the model builder
+    weight_scales: dict[str, float] = getattr(model, "_fp8_weight_scales", {})
+
+    for name, m in model.named_modules():
+        if isinstance(m, torch.nn.Linear):
+            scale = weight_scales.get(name, None)
+            _replace_fwd_with_upcast(m, with_stochastic_rounding, seed, weight_scale=scale)
     return model
 
 
