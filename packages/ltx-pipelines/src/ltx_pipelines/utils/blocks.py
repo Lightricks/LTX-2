@@ -107,12 +107,15 @@ def _streaming_model(
         # returned to the OS.  Without this, sequential streaming models
         # (e.g. text encoder then transformer) exhaust host memory because the
         # CachingHostAllocator keeps freed blocks cached indefinitely.
-        torch.cuda.synchronize(device=target_device)
-        try:
-            if hasattr(torch._C, "_host_emptyCache"):
-                torch._C._host_emptyCache()
-        except Exception:
-            logger.warning("Host empty cache cleanup failed; ignoring.", exc_info=True)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(device=target_device)
+            try:
+                if hasattr(torch._C, "_host_emptyCache"):
+                    torch._C._host_emptyCache()
+            except Exception:
+                logger.warning("Host empty cache cleanup failed; ignoring.", exc_info=True)
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            torch.mps.synchronize()
 
 
 def _build_state(

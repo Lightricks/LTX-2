@@ -30,13 +30,19 @@ from ltx_pipelines.utils.media_io import (
 def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda", torch.cuda.current_device())
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
 
 
 def cleanup_memory() -> None:
     gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+        torch.mps.synchronize()
 
 
 def _conform_latent_length(latent: torch.Tensor, expected_frames_count: int) -> torch.Tensor:

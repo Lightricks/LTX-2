@@ -284,7 +284,10 @@ class LayerStreamingWrapper(nn.Module):
         # Drain all in-flight async H2D copies, then release stream resources.
         # Without the synchronize, clearing the stream/events can trigger
         # use-after-free at the CUDA driver level.
-        torch.cuda.synchronize(device=self._target_device)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize(device=self._target_device)
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            torch.mps.synchronize()
         if self._prefetcher is not None:
             self._prefetcher.cleanup()
             self._prefetcher = None

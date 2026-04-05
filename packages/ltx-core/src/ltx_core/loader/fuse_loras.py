@@ -10,6 +10,8 @@ from ltx_core.quantization.fp8_scaled_mm import quantize_weight_to_fp8_per_tenso
 def _get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda", torch.cuda.current_device())
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
 
 
