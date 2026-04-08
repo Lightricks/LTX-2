@@ -252,20 +252,36 @@ class MultiModalGuider:
         The guider calculates the guidance delta as (scale - 1) * (cond - uncond) for cfg and modality cfg,
         and as scale * (cond - uncond) for stg, steering the denoising process away from the unconditioned
         prediction.
+
+        Guidance math is computed in float32 to avoid bfloat16 precision loss on MPS
+        (Apple Silicon). The STG delta (cond - perturbed) and rescaling (std ratio)
+        are particularly sensitive to catastrophic cancellation in low-precision dtypes.
         """
+        dtype = cond.dtype
+
+        # Upcast to float32 for precision — critical on MPS where fast-math and
+        # bfloat16 rounding cause ~1e-7 errors per op that compound across the
+        # guidance formula and rescaling (see pytorch/pytorch#84936).
+        def _f32(t: torch.Tensor | float) -> torch.Tensor | float:
+            return t.float() if isinstance(t, torch.Tensor) else t
+
+        cond_f, uncond_text_f, uncond_perturbed_f, uncond_modality_f = (
+            _f32(cond), _f32(uncond_text), _f32(uncond_perturbed), _f32(uncond_modality),
+        )
+
         pred = (
-            cond
-            + (self.params.cfg_scale - 1) * (cond - uncond_text)
-            + self.params.stg_scale * (cond - uncond_perturbed)
-            + (self.params.modality_scale - 1) * (cond - uncond_modality)
+            cond_f
+            + (self.params.cfg_scale - 1) * (cond_f - uncond_text_f)
+            + self.params.stg_scale * (cond_f - uncond_perturbed_f)
+            + (self.params.modality_scale - 1) * (cond_f - uncond_modality_f)
         )
 
         if self.params.rescale_scale != 0:
-            factor = cond.std() / pred.std()
+            factor = cond_f.std() / pred.std()
             factor = self.params.rescale_scale * factor + (1 - self.params.rescale_scale)
             pred = pred * factor
 
-        return pred
+        return pred.to(dtype)
 
     def do_unconditional_generation(self) -> bool:
         """Returns True if the guider is doing unconditional generation."""
