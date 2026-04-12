@@ -20,6 +20,7 @@ dependencies = [
     "pandas>=2.2.3",
     "peft>=0.14.0",
     "pillow-heif>=0.21.0",
+    "prodigyopt>=1.1.2",
     "pydantic>=2.10.4",
     "rich>=13.9.4",
     "safetensors>=0.5.0",

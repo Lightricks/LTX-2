@@ -754,13 +754,32 @@ class LtxvTrainer:
         opt_cfg = self._config.optimization
 
         lr = opt_cfg.learning_rate
+        extra = dict(opt_cfg.optimizer_params) if opt_cfg.optimizer_params else {}
         if opt_cfg.optimizer_type == "adamw":
-            optimizer = AdamW(self._trainable_params, lr=lr)
+            optimizer = AdamW(self._trainable_params, lr=lr, **extra)
         elif opt_cfg.optimizer_type == "adamw8bit":
             # noinspection PyUnresolvedReferences
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
 
-            optimizer = AdamW8bit(self._trainable_params, lr=lr)
+            optimizer = AdamW8bit(self._trainable_params, lr=lr, **extra)
+        elif opt_cfg.optimizer_type == "prodigy":
+            try:
+                from prodigyopt import Prodigy  # noqa: PLC0415
+            except ImportError as exc:
+                raise ImportError(
+                    "prodigyopt is required for optimizer_type='prodigy'. "
+                    "Install it with: pip install prodigyopt"
+                ) from exc
+            # Prodigy adapts its own step size; lr=1.0 is the standard starting point.
+            # safeguard_warmup=True is recommended when a warmup scheduler is used.
+            optimizer = Prodigy(self._trainable_params, lr=lr, **extra)
+            logger.info(
+                "Using Prodigy optimizer (D-Adaptation). "
+                "learning_rate=%.4g acts as initial scale factor (recommend 1.0). "
+                "Extra params: %s",
+                lr,
+                extra or "{}",
+            )
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
 

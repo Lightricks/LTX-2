@@ -122,9 +122,22 @@ class OptimizationConfig(ConfigBaseModel):
         description="Maximum gradient norm for clipping",
     )
 
-    optimizer_type: Literal["adamw", "adamw8bit"] = Field(
+    optimizer_type: Literal["adamw", "adamw8bit", "prodigy"] = Field(
         default="adamw",
-        description="Type of optimizer to use for training",
+        description=(
+            "Type of optimizer to use for training. "
+            "'prodigy' uses prodigyopt's D-Adaptation optimizer which automatically "
+            "tunes the learning rate — set learning_rate=1.0 when using it."
+        ),
+    )
+
+    optimizer_params: dict = Field(
+        default_factory=dict,
+        description=(
+            "Extra keyword arguments forwarded verbatim to the optimizer constructor. "
+            "Useful for optimizer-specific settings, e.g. for Prodigy: "
+            "{d_coef: 1.0, use_bias_correction: true, safeguard_warmup: true, weight_decay: 0.01}."
+        ),
     )
 
     scheduler_type: Literal[
