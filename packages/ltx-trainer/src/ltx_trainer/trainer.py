@@ -93,9 +93,9 @@ class LtxvTrainer:
         if IS_MAIN_PROCESS:
             print_config(trainer_config)
         self._training_strategy = get_training_strategy(self._config.training_strategy)
+        self._setup_accelerator()
         self._cached_validation_embeddings = self._load_text_encoder_and_cache_embeddings()
         self._load_models()
-        self._setup_accelerator()
         self._collect_trainable_params()
         self._loaded_checkpoint_path: Path | None = None
         self._load_checkpoint()
@@ -402,7 +402,7 @@ class LtxvTrainer:
         logger.debug("Loading text encoder...")
         text_encoder = load_text_encoder(
             gemma_model_path=self._config.model.text_encoder_path,
-            device="cuda",
+            device=self._accelerator.device,
             dtype=torch.bfloat16,
             load_in_8bit=self._config.acceleration.load_text_encoder_in_8bit,
         )
