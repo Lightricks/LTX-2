@@ -3,8 +3,10 @@ from dataclasses import dataclass, field, replace
 from typing import Generic
 
 import torch
+from torch import nn
 
 from ltx_core.loader.fuse_loras import apply_loras
+from ltx_core.loader.helpers import create_meta_model, load_state_dict, read_model_config
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.primitives import (
     LoRAAdaptableProtocol,
@@ -20,6 +22,56 @@ from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
 from ltx_core.model.model_protocol import ModelConfigurator, ModelType
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _check_uninitialized(model: nn.Module) -> list[str]:
+    """Return names of any parameters/buffers still on meta device."""
+    names = []
+    for name, param in model.named_parameters():
+        if str(param.device) == "meta":
+            names.append(name)
+    for name, buf in model.named_buffers():
+        if str(buf.device) == "meta":
+            names.append(name)
+    return names
+
+
+def _load_model_weights(
+    meta_model: nn.Module,
+    model_path: str | tuple[str, ...],
+    loras: tuple[LoraPathStrengthAndSDOps, ...],
+    loader: StateDictLoader,
+    registry: Registry,
+    device: torch.device,
+    dtype: torch.dtype | None,
+    model_sd_ops: SDOps | None = None,
+    lora_load_device: torch.device | None = None,
+) -> None:
+    """Load base weights and fuse LoRAs into *meta_model* in-place."""
+    if lora_load_device is None:
+        lora_load_device = device
+
+    model_sd = load_state_dict(model_path, loader, registry, device, model_sd_ops)
+
+    lora_strengths = [lora.strength for lora in loras]
+    if not lora_strengths or (min(lora_strengths) == 0 and max(lora_strengths) == 0):
+        sd = model_sd.sd
+        if dtype is not None:
+            sd = {key: value.to(dtype=dtype) for key, value in model_sd.sd.items()}
+        meta_model.load_state_dict(sd, strict=False, assign=True)
+        return
+
+    lora_state_dicts = [load_state_dict([lora.path], loader, registry, lora_load_device, lora.sd_ops) for lora in loras]
+    lora_sd_and_strengths = [
+        LoraStateDictWithStrength(sd, strength) for sd, strength in zip(lora_state_dicts, lora_strengths, strict=True)
+    ]
+    final_sd = apply_loras(
+        model_sd=model_sd,
+        lora_sd_and_strengths=lora_sd_and_strengths,
+        dtype=dtype,
+        destination_sd=model_sd if isinstance(registry, DummyRegistry) else None,
+    )
+    meta_model.load_state_dict(final_sd.sd, strict=False, assign=True)
 
 
 @dataclass(frozen=True)
@@ -69,34 +121,22 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
         return replace(self, lora_load_device=device)
 
     def model_config(self) -> dict:
-        first_shard_path = self.model_path[0] if isinstance(self.model_path, tuple) else self.model_path
-        return self.model_loader.metadata(first_shard_path)
+        return read_model_config(self.model_path, self.model_loader)
 
     def meta_model(self, config: dict, module_ops: tuple[ModuleOps, ...]) -> ModelType:
-        with torch.device("meta"):
-            model = self.model_class_configurator.from_config(config)
-        for module_op in module_ops:
-            if module_op.matcher(model):
-                model = module_op.mutator(model)
-        return model
+        return create_meta_model(self.model_class_configurator, config, module_ops)
 
     def load_sd(
         self, paths: list[str], registry: Registry, device: torch.device | None, sd_ops: SDOps | None = None
     ) -> StateDict:
-        state_dict = registry.get(paths, sd_ops)
-        if state_dict is None:
-            state_dict = self.model_loader.load(paths, sd_ops=sd_ops, device=device)
-            registry.add(paths, sd_ops=sd_ops, state_dict=state_dict)
-        return state_dict
+        return load_state_dict(paths, self.model_loader, registry, device, sd_ops)
 
     def _return_model(self, meta_model: ModelType, device: torch.device) -> ModelType:
-        uninitialized_params = [name for name, param in meta_model.named_parameters() if str(param.device) == "meta"]
-        uninitialized_buffers = [name for name, buffer in meta_model.named_buffers() if str(buffer.device) == "meta"]
-        if uninitialized_params or uninitialized_buffers:
-            logger.warning(f"Uninitialized parameters or buffers: {uninitialized_params + uninitialized_buffers}")
+        uninitialized = _check_uninitialized(meta_model)
+        if uninitialized:
+            logger.warning(f"Uninitialized parameters or buffers: {uninitialized}")
             return meta_model
-        retval = meta_model.to(device)
-        return retval
+        return meta_model.to(device)
 
     def build(
         self,
@@ -107,30 +147,16 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
         device = torch.device("cuda") if device is None else device
         config = self.model_config()
         meta_model = self.meta_model(config, self.module_ops)
-        model_paths = list(self.model_path) if isinstance(self.model_path, tuple) else [self.model_path]
-        model_state_dict = self.load_sd(model_paths, sd_ops=self.model_sd_ops, registry=self.registry, device=device)
 
-        lora_strengths = [lora.strength for lora in self.loras]
-        if not lora_strengths or (min(lora_strengths) == 0 and max(lora_strengths) == 0):
-            sd = model_state_dict.sd
-            if dtype is not None:
-                sd = {key: value.to(dtype=dtype) for key, value in model_state_dict.sd.items()}
-            meta_model.load_state_dict(sd, strict=False, assign=True)
-            return self._return_model(meta_model, device)
-
-        lora_state_dicts = [
-            self.load_sd([lora.path], sd_ops=lora.sd_ops, registry=self.registry, device=self.lora_load_device)
-            for lora in self.loras
-        ]
-        lora_sd_and_strengths = [
-            LoraStateDictWithStrength(sd, strength)
-            for sd, strength in zip(lora_state_dicts, lora_strengths, strict=True)
-        ]
-        final_sd = apply_loras(
-            model_sd=model_state_dict,
-            lora_sd_and_strengths=lora_sd_and_strengths,
+        _load_model_weights(
+            meta_model=meta_model,
+            model_path=self.model_path,
+            loras=self.loras,
+            loader=self.model_loader,
+            registry=self.registry,
+            device=device,
             dtype=dtype,
-            destination_sd=model_state_dict if isinstance(self.registry, DummyRegistry) else None,
+            model_sd_ops=self.model_sd_ops,
+            lora_load_device=self.lora_load_device,
         )
-        meta_model.load_state_dict(final_sd.sd, strict=False, assign=True)
         return self._return_model(meta_model, device)

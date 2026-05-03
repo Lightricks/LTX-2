@@ -48,6 +48,10 @@ uv run python scripts/caption_videos.py videos_dir/ --output dataset.json --use-
 uv run python scripts/caption_videos.py videos_dir/ --output dataset.json \
     --captioner-type gemini_flash --api-key YOUR_API_KEY
 
+# Use Gemini Flash with parallel workers for faster throughput
+uv run python scripts/caption_videos.py videos_dir/ --output dataset.json \
+    --captioner-type gemini_flash --num-workers 5
+
 # Caption without audio processing (video-only)
 uv run python scripts/caption_videos.py videos_dir/ --output dataset.json --no-audio
 
@@ -61,9 +65,10 @@ uv run python scripts/caption_videos.py videos_dir/ --output dataset.json --over
 - **Multiple backends**:
   - `qwen_omni` (default): Local Qwen2.5-Omni model - processes video + audio locally
   - `gemini_flash`: Google Gemini Flash API - cloud-based, requires API key
+- **Parallel captioning** (Gemini Flash only): Use `--num-workers` to run multiple API calls concurrently for faster throughput on large datasets
 - **Structured output**: Captions include visual description, speech transcription, sounds, and on-screen text
 - **Memory optimization**: 8-bit quantization option for limited VRAM
-- **Incremental processing**: Skips already-captioned files by default
+- **Incremental processing**: Skips already-captioned files by default; progress is saved every 5 videos
 - **Multiple output formats**: JSON, JSONL, CSV, or TXT
 
 **Caption format:**
@@ -73,6 +78,26 @@ The captioner produces structured captions with four sections:
 - `[SPEECH]`: Word-for-word transcription of spoken content
 - `[SOUNDS]`: Description of music, ambient sounds, sound effects
 - `[TEXT]`: Any on-screen text visible in the video
+
+**Parallel captioning with Gemini Flash:**
+
+When using `--captioner-type gemini_flash`, you can speed up large dataset captioning by running multiple API calls at the same time using `--num-workers` (accepts 1–10, default is 1):
+
+```bash
+export GEMINI_API_KEY="your-key-here"
+
+# Caption a large dataset with 5 workers running concurrently
+uv run python scripts/caption_videos.py videos_dir/ \
+    --output dataset.json \
+    --captioner-type gemini_flash \
+    --num-workers 5
+```
+
+> [!NOTE]
+> `--num-workers` is only supported with `gemini_flash`. Using it with `qwen_omni` or any other local model will raise an error, because local GPU models are not thread-safe.
+
+> [!TIP]
+> Keep `--num-workers` between 3–5 for most use cases. Very high values (8–10) may hit Gemini API rate limits depending on your quota tier.
 
 **Environment variables (for Gemini Flash):**
 

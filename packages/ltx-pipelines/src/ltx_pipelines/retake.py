@@ -25,7 +25,7 @@ from ltx_pipelines.utils.blocks import (
     PromptEncoder,
     VideoDecoder,
 )
-from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES, detect_params
+from ltx_pipelines.utils.constants import DISTILLED_SIGMAS, detect_params
 from ltx_pipelines.utils.denoisers import GuidedDenoiser, SimpleDenoiser
 from ltx_pipelines.utils.helpers import (
     audio_latent_from_file,
@@ -36,7 +36,7 @@ from ltx_pipelines.utils.media_io import (
     encode_video,
     get_videostream_metadata,
 )
-from ltx_pipelines.utils.types import ModalitySpec
+from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
 
 
 class RetakePipeline:
@@ -74,16 +74,20 @@ class RetakePipeline:
         registry: Registry | None = None,
         distilled: bool = True,
         torch_compile: bool = False,
+        offload_mode: OffloadMode = OffloadMode.NONE,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
         self.distilled = distilled
+        if not distilled:
+            self._scheduler = LTX2Scheduler()
         self.prompt_encoder = PromptEncoder(
             checkpoint_path=checkpoint_path,
             gemma_root=gemma_root,
             dtype=self.dtype,
             device=self.device,
             registry=registry,
+            offload_mode=offload_mode,
         )
         self.image_conditioner = ImageConditioner(
             checkpoint_path=checkpoint_path,
@@ -105,6 +109,7 @@ class RetakePipeline:
             quantization=quantization,
             registry=registry,
             torch_compile=torch_compile,
+            offload_mode=offload_mode,
         )
         self.video_decoder = VideoDecoder(
             checkpoint_path=checkpoint_path,
@@ -139,8 +144,8 @@ class RetakePipeline:
         regenerate_audio: bool = True,
         enhance_prompt: bool = False,
         tiling_config: TilingConfig | None = None,
-        streaming_prefetch_count: int | None = None,
         max_batch_size: int = 1,
+        sigmas: torch.Tensor | None = None,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         """Regenerate ``[start_time, end_time]`` of the source video (retake).
         Parameters
@@ -207,7 +212,6 @@ class RetakePipeline:
             prompts_to_encode,
             enhance_first_prompt=enhance_prompt,
             enhance_prompt_seed=seed,
-            streaming_prefetch_count=streaming_prefetch_count,
         )
 
         v_context_p, a_context_p = contexts[0].video_encoding, contexts[0].audio_encoding
@@ -227,15 +231,18 @@ class RetakePipeline:
             initial_latent=initial_audio_latent,
             frozen=initial_audio_latent is not None and not regenerate_audio,
         )
-        # Build denoiser
+
+        # Build denoiser and resolve sigma schedule.
+        if sigmas is None:
+            sigmas = DISTILLED_SIGMAS if self.distilled else self._scheduler.execute(steps=num_inference_steps)
+        sigmas = sigmas.to(dtype=torch.float32, device=self.device)
+
         if self.distilled:
-            sigmas = torch.tensor(DISTILLED_SIGMA_VALUES).to(dtype=torch.float32, device=self.device)
             denoiser = SimpleDenoiser(
                 v_context=v_context_p,
                 a_context=a_context_p,
             )
         else:
-            sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(dtype=torch.float32, device=self.device)
             v_context_n, a_context_n = contexts[1].video_encoding, contexts[1].audio_encoding
             video_guider = MultiModalGuider(
                 params=video_guider_params,
@@ -263,7 +270,6 @@ class RetakePipeline:
             fps=output_shape.fps,
             video=video_modality_spec,
             audio=audio_modality_spec,
-            streaming_prefetch_count=streaming_prefetch_count,
             max_batch_size=max_batch_size,
         )
 
@@ -303,6 +309,7 @@ def main() -> None:
         quantization=args.quantization,
         distilled=args.distilled,
         torch_compile=args.compile,
+        offload_mode=args.offload_mode,
     )
     params = detect_params(args.distilled_checkpoint_path)
     tiling_config = TilingConfig.default()
@@ -315,7 +322,6 @@ def main() -> None:
         video_guider_params=params.video_guider_params,
         audio_guider_params=params.audio_guider_params,
         tiling_config=tiling_config,
-        streaming_prefetch_count=args.streaming_prefetch_count,
         max_batch_size=args.max_batch_size,
     )
     video_chunks_number = get_video_chunks_number(src.frames, tiling_config)

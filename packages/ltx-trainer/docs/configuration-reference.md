@@ -262,7 +262,6 @@ validation:
   seed: 42                            # Random seed for reproducibility
   inference_steps: 30                 # Number of inference steps
   interval: 100                       # Steps between validation runs
-  videos_per_prompt: 1                # Videos generated per prompt
   guidance_scale: 4.0                 # CFG guidance strength
   stg_scale: 1.0                      # STG guidance strength (0.0 to disable)
   stg_blocks: [ 29 ]                  # Transformer blocks to perturb for STG

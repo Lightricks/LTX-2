@@ -12,6 +12,7 @@ from ltx_pipelines.utils.constants import (
     LTX_2_3_PARAMS,
     PipelineParams,
 )
+from ltx_pipelines.utils.types import OffloadMode
 
 
 class ImageConditioningInput(NamedTuple):
@@ -231,16 +232,19 @@ def basic_arg_parser(
         except ValueError as e:
             raise argparse.ArgumentTypeError(f"must be an integer, got {value}") from e
 
-    # Layer streaming
+    # Weight offloading
     parser.add_argument(
-        "--streaming-prefetch-count",
-        type=_positive_int,
-        default=None,
-        metavar="N",
+        "--offload",
+        dest="offload_mode",
+        type=OffloadMode,
+        default=OffloadMode.NONE,
+        choices=list(OffloadMode),
         help=(
-            "Enable layer streaming prefetching N layers ahead. "
-            "At most 1 + N layers reside on GPU at once. "
-            "Must be >= 1. Example: --streaming-prefetch-count 2"
+            "Weight offloading strategy. "
+            "'none' keeps all weights on GPU (default). "
+            "'cpu' pins weights in CPU RAM, streams to GPU per layer. "
+            "'disk' reads weights from disk on demand (lowest memory). "
+            "Example: --offload cpu"
         ),
     )
 

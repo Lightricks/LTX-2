@@ -273,12 +273,6 @@ class ValidationConfig(ConfigBaseModel):
         gt=0,
     )
 
-    videos_per_prompt: int = Field(
-        default=1,
-        description="Number of videos to generate per validation prompt",
-        gt=0,
-    )
-
     guidance_scale: float = Field(
         default=4.0,
         description="CFG guidance scale to use during validation",

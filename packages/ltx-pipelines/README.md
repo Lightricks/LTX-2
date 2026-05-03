@@ -63,6 +63,7 @@ Available pipeline modules:
 - `ltx_pipelines.keyframe_interpolation` - Keyframe interpolation.
 - `ltx_pipelines.a2vid_two_stage` - Audio-to-video generation conditioned on an input audio.
 - `ltx_pipelines.retake` - Regenerate a time region of an existing video.
+- `ltx_pipelines.hdr_ic_lora` - Video-to-video with HDR output (linear float via LogC3 inverse decode).
 
 Use `--help` with any pipeline module to see all available options and parameters.
 
@@ -78,6 +79,9 @@ Do you have an existing video to modify?
 │
 Do you have an audio file to drive generation?
 ├─ YES → Use A2VidPipelineTwoStage (audio-to-video)
+│
+Do you need HDR output (linear float frames for EXR / tonemapping)?
+├─ YES → Use HDRICLoraPipeline (video-to-video with LogC3 inverse decode)
 │
 Do you need to condition on existing images/videos?
 ├─ YES → Do you have reference videos for video-to-video?
@@ -108,6 +112,7 @@ Do you need to condition on existing images/videos?
 | **KeyframeInterpolationPipeline** | 2 | ✅ | ✅ | Keyframes | Animation, interpolation |
 | **A2VidPipelineTwoStage** | 2 | ✅ | ✅ | Audio + Image | Audio-driven video generation |
 | **RetakePipeline** | 1 | ✅ | ❌ | Source Video | Regenerating a time region of a video |
+| **HDRICLoraPipeline** | 2 | ❌ | ✅ | Video | HDR video-to-video (linear float output for EXR) |
 
 ---
 
@@ -216,6 +221,20 @@ Single-stage generation that encodes the source video and audio into latents, ap
 **Constraints:** Source video frame count must satisfy the 8k+1 format (e.g. 97, 193) and resolution must be multiples of 32.
 
 **Use when:** You want to re-do a specific section of a generated video (e.g. fix a bad segment), selectively regenerate audio or video in a time window, or iterate on part of a result without re-generating the entire clip.
+
+---
+
+### 9. HDRICLoraPipeline
+
+**Best for:** Video-to-video generation with HDR output for EXR export and offline tonemapping.
+
+**Source**: [`src/ltx_pipelines/hdr_ic_lora.py`](src/ltx_pipelines/hdr_ic_lora.py)
+
+Two-stage video-to-video on the distilled model with an HDR IC-LoRA. Decoded latents pass through an HDR inverse transform (ARRI LogC3, auto-detected from LoRA metadata) to produce a **linear HDR float** tensor `[f, h, w, c]`. Video-only (audio skipped). Text embeddings are pre-computed externally and loaded from a `.safetensors` file. Tonemapping and EXR saving are the caller's responsibility. LoRA and embeddings: [`Lightricks/LTX-2.3-22b-IC-LoRA-HDR`](https://huggingface.co/Lightricks/LTX-2.3-22b-IC-LoRA-HDR).
+
+**Extra CLI arguments:** `--input` (mp4 or directory, required), `--output-dir` (required), `--hdr-lora` (required), `--text-embeddings` (pre-computed `.safetensors`, required), `--num-frames`, `--spatial-tile` (tiled VAE decode tile size; reduce on lower-VRAM GPUs), `--skip-mp4` (EXR only, no H.264 preview), `--exr-half` (float16 EXR), `--high-quality` (generates 2x frames internally for smoother output, ~2x slower), `--offload {none,cpu,disk}` (weight offloading; disables FP8 quantization when not `none`).
+
+**Use when:** You need linear HDR float output for EXR export, color grading, or custom tonemapping workflows.
 
 ---
 

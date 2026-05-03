@@ -307,15 +307,14 @@ class InpaintingStrategy(TrainingStrategy):
             audio_pred: Tensor | None,
             inputs: ModelInputs,
     ) -> Tensor:
-        """Compute training loss on inpaint regions only."""
+        """Compute training loss on inpaint regions only. Returns [B,]."""
         # MSE loss
         loss = (video_pred - inputs.video_targets).pow(2)
 
-        # Apply loss mask
+        # Apply loss mask and reduce to per-element [B,]
         loss_mask = inputs.video_loss_mask.unsqueeze(-1).float()
-        loss = loss.mul(loss_mask).div(loss_mask.mean() + 1e-8)
-
-        return loss.mean()
+        masked = loss.mul(loss_mask)
+        return masked.mean(dim=[-2, -1]) / loss_mask.mean(dim=[-2, -1]).clamp(min=1e-8)
 ```
 
 ### Step 5: Register the Strategy

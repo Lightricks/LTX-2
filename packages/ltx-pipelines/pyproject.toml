@@ -1,10 +1,10 @@
 [project]
 name = "ltx-pipelines"
-version = "1.1.0"
+version = "1.1.2"
 description = "Pipelines implementation for Lightricks' LTX-2 model"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["ltx-core", "av", "tqdm", "pillow"]
+dependencies = ["ltx-core", "av", "tqdm", "pillow", "openimageio"]
 
 [build-system]
 requires = ["uv_build>=0.9.8,<0.10.0"]

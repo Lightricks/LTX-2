@@ -240,7 +240,7 @@ class VideoToVideoStrategy(TrainingStrategy):
         _audio_pred: Tensor | None,
         inputs: ModelInputs,
     ) -> Tensor:
-        """Compute masked loss only on target portion."""
+        """Compute masked loss only on target portion. Returns [B,]."""
         # Extract target portion of prediction
         ref_seq_len = inputs.ref_seq_len
         target_pred = video_pred[:, ref_seq_len:, :]
@@ -248,14 +248,11 @@ class VideoToVideoStrategy(TrainingStrategy):
         # Get target portion of loss mask
         target_loss_mask = inputs.video_loss_mask[:, ref_seq_len:]
 
-        # Compute loss
+        # Compute per-element loss [B,]
         loss = (target_pred - inputs.video_targets).pow(2)
-
-        # Apply loss mask
         loss_mask = target_loss_mask.unsqueeze(-1).float()
-        loss = loss.mul(loss_mask).div(loss_mask.mean())
-
-        return loss.mean()
+        masked = loss.mul(loss_mask)
+        return masked.mean(dim=[-2, -1]) / loss_mask.mean(dim=[-2, -1]).clamp(min=1e-8)
 
     def get_checkpoint_metadata(self) -> dict[str, Any]:
         """Get metadata for checkpoint files."""

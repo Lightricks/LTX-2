@@ -231,9 +231,6 @@ validation:
   # Set to null to disable validation during training
   interval: 100
 
-  # Number of videos to generate per prompt
-  videos_per_prompt: 1
-
   # Classifier-free guidance scale
   # Higher values = stronger adherence to prompt but may introduce artifacts
   guidance_scale: 4.0

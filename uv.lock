@@ -2063,7 +2063,7 @@ wheels = [
 
 [[package]]
 name = "ltx-core"
-version = "1.1.0"
+version = "1.1.2"
 source = { editable = "packages/ltx-core" }
 dependencies = [
     { name = "accelerate" },
@@ -2121,11 +2121,13 @@ dev = [{ name = "scikit-image", specifier = ">=0.25.2" }]
 
 [[package]]
 name = "ltx-pipelines"
-version = "1.1.0"
+version = "1.1.2"
 source = { editable = "packages/ltx-pipelines" }
 dependencies = [
     { name = "av" },
     { name = "ltx-core" },
+    { name = "openimageio", version = "3.0.16.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-ltx-core-fp8-trtllm'" },
+    { name = "openimageio", version = "3.1.11.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-ltx-core-xformers' or extra != 'extra-8-ltx-core-fp8-trtllm'" },
     { name = "pillow", version = "10.3.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-ltx-core-fp8-trtllm'" },
     { name = "pillow", version = "12.1.0", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-ltx-core-xformers' or extra != 'extra-8-ltx-core-fp8-trtllm'" },
     { name = "tqdm" },
@@ -2135,13 +2137,14 @@ dependencies = [
 requires-dist = [
     { name = "av" },
     { name = "ltx-core", editable = "packages/ltx-core" },
+    { name = "openimageio" },
     { name = "pillow" },
     { name = "tqdm" },
 ]
 
 [[package]]
 name = "ltx-trainer"
-version = "1.1.0"
+version = "1.1.2"
 source = { editable = "packages/ltx-trainer" }
 dependencies = [
     { name = "accelerate" },
@@ -4042,6 +4045,103 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/dd/5c/c139a7876099916879609372bfa513b7f1257f7f1a908b0bdc1c2328241b/opencv_python_headless-4.11.0.86-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:0e0a27c19dd1f40ddff94976cfe43066fbbe9dfbb2ec1907d66c19caef42a57b", size = 49969856, upload-time = "2025-01-16T13:53:29.654Z" },
     { url = "https://files.pythonhosted.org/packages/95/dd/ed1191c9dc91abcc9f752b499b7928aacabf10567bb2c2535944d848af18/opencv_python_headless-4.11.0.86-cp37-abi3-win32.whl", hash = "sha256:f447d8acbb0b6f2808da71fddd29c1cdd448d2bc98f72d9bb78a7a898fc9621b", size = 29324425, upload-time = "2025-01-16T13:52:49.048Z" },
     { url = "https://files.pythonhosted.org/packages/86/8a/69176a64335aed183529207ba8bc3d329c2999d852b4f3818027203f50e6/opencv_python_headless-4.11.0.86-cp37-abi3-win_amd64.whl", hash = "sha256:6c304df9caa7a6a5710b91709dd4786bf20a74d57672b3c31f7033cc638174ca", size = 39402386, upload-time = "2025-01-16T13:52:56.418Z" },
+]
+
+[[package]]
+name = "openimageio"
+version = "3.0.16.0"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.13' and sys_platform == 'darwin'",
+    "python_full_version == '3.12.*' and sys_platform == 'darwin'",
+    "python_full_version >= '3.13' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version == '3.12.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version >= '3.13' and platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "python_full_version == '3.12.*' and platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "python_full_version >= '3.13' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version == '3.12.*' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version == '3.11.*' and sys_platform == 'darwin'",
+    "python_full_version == '3.11.*' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version == '3.11.*' and platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "python_full_version == '3.11.*' and sys_platform != 'darwin' and sys_platform != 'linux'",
+    "python_full_version < '3.11' and sys_platform == 'darwin'",
+    "python_full_version < '3.11' and platform_machine == 'aarch64' and sys_platform == 'linux'",
+    "python_full_version < '3.11' and platform_machine != 'aarch64' and sys_platform == 'linux'",
+    "python_full_version < '3.11' and sys_platform != 'darwin' and sys_platform != 'linux'",
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ab/45/f4fbc1f32b75493383ad6dc1820ecb789c552f2d231a7880c17a8ea7b276/openimageio-3.0.16.0.tar.gz", hash = "sha256:5308f04f30c98841012c61eba4972b4e0e94446be6ab4c2b7414904ed0c711c7", size = 6482737, upload-time = "2026-03-01T03:43:38.412Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/25/17/9160d6b4332b430a8b24bb5d0db39af2b2c3b483d36d11c5fa8bc9c9468b/openimageio-3.0.16.0-cp310-cp310-macosx_10_15_x86_64.whl", hash = "sha256:aa96e4100248ecc9bbf0b7fb06b1f6ce781592481de1ebfe2a665679c4219381", size = 6557400, upload-time = "2026-03-01T03:42:39.892Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/26/cf15bcbce65ed45f64fa0806889592c18b598795b7f2461429250a066d00/openimageio-3.0.16.0-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:8d4e65c80d3dca5e5daa1663efe620c6c94476be8c86181118f54aaae141cf79", size = 6194167, upload-time = "2026-03-01T03:42:41.685Z" },
+    { url = "https://files.pythonhosted.org/packages/71/55/660e086ee3acbbbab2b19f8cad93c0b0cc1044a660d0189ea9bf0ed20e93/openimageio-3.0.16.0-cp310-cp310-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:84e7c8619c1a583730c73c8c8a247584f5fca980e51d9ec5ad1fd3a34a58aa4e", size = 6391703, upload-time = "2026-03-01T03:42:43.063Z" },
+    { url = "https://files.pythonhosted.org/packages/0c/22/91cd80c88ec41d773e33790895a8b4732884bb5b571d760f0730ea9e184a/openimageio-3.0.16.0-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:b68b7406314b45eb813da12426b3d60046813b0c32c2fadc0ce54264554cfa23", size = 6595708, upload-time = "2026-03-01T03:42:44.732Z" },
+    { url = "https://files.pythonhosted.org/packages/05/95/694fb96fd499c3765fb5239193bef4496e69b98a39eda7c0f1c2e3ebe056/openimageio-3.0.16.0-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:fe0df5af0f255f8abaa9aeb728c4cbdea4bc144a19f510fb0323959b88ddade5", size = 6492976, upload-time = "2026-03-01T03:42:46.473Z" },
+    { url = "https://files.pythonhosted.org/packages/6b/b8/15a357fee630b0016b57bbcbc7e67565dca4d379b0a9916cc10ddf774ae2/openimageio-3.0.16.0-cp310-cp310-win_amd64.whl", hash = "sha256:58bd1f20d6e37759a3d6337f7d2a2929e47e1833ed1f439a1dc3ff841a335d7e", size = 7098417, upload-time = "2026-03-01T03:42:48.093Z" },
+    { url = "https://files.pythonhosted.org/packages/1a/18/a6711865161c82e056ce4001b859a49b1c28830ced8c14dec99bffedb50f/openimageio-3.0.16.0-cp311-cp311-macosx_10_15_x86_64.whl", hash = "sha256:f657f4541dd469e2c9d6cda8b266b33327742142616645ecf971433955ea5eb2", size = 6558184, upload-time = "2026-03-01T03:42:50.653Z" },
+    { url = "https://files.pythonhosted.org/packages/28/49/5ff1c6580ac55073ec7153d9f14b9b9fc5a0cffa3bc9188b21ed11ef6952/openimageio-3.0.16.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:442ac9f06c7592cdc01fc7c9ac827c3be5d2c885c2e71b55ee40e249554a878d", size = 6194989, upload-time = "2026-03-01T03:42:52.385Z" },
+    { url = "https://files.pythonhosted.org/packages/e6/92/25397936a4f881cd5c9731e260009240544d6a959bfd16e14174983a4cea/openimageio-3.0.16.0-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:55ce42888c85262c3be66133be0bc4236a0f445a3568783e57a467324bcbe03c", size = 6392269, upload-time = "2026-03-01T03:42:54.679Z" },
+    { url = "https://files.pythonhosted.org/packages/ca/32/590315956ec40443d6992a5e0ddb11be5615d6aaf38f6d9edf970ce28685/openimageio-3.0.16.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:a7f97ff4ed54d63c6241d1634d2f55004b5f83cf28cdf609302523e2eaec1a09", size = 6596973, upload-time = "2026-03-01T03:42:56.24Z" },
+    { url = "https://files.pythonhosted.org/packages/07/b5/1be18ba1f2ae52598917da774820b4d0020a7ab50e1c54c33ab1820f06d0/openimageio-3.0.16.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:fa87d72410f59d969d64112c9dd2b51999f6553f392f757844bdc85060092de5", size = 6493859, upload-time = "2026-03-01T03:42:57.886Z" },
+    { url = "https://files.pythonhosted.org/packages/0a/a7/a6aa117ed3fd28ed67e08a54f74c3ab10c45f1e2702dbd8f12c248b382ea/openimageio-3.0.16.0-cp311-cp311-win_amd64.whl", hash = "sha256:6af821d1371271e2072755702a7c5d073ec67cc27d1909f4e646c5a62a82879c", size = 7099505, upload-time = "2026-03-01T03:42:59.778Z" },
+    { url = "https://files.pythonhosted.org/packages/9b/2a/a58a9ee65f9d60fe8be646bc1c0fdbbbaafe4c77ad36587523535e9e4c63/openimageio-3.0.16.0-cp312-cp312-macosx_10_15_x86_64.whl", hash = "sha256:c2cf2919ef287135b0cc2113dbdc85b64dc0e2fa4bd5c3887fe09c0fd1926924", size = 6643409, upload-time = "2026-03-01T03:43:01.061Z" },
+    { url = "https://files.pythonhosted.org/packages/7a/c5/4aca1892f48a1bfed8b6434a02ad2762a927c0725cfd0196f3a8f46becbe/openimageio-3.0.16.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:732c7e76840b2df62975ccb91ab176e430a7dbf410acd993a30f6fd7a485e698", size = 6262459, upload-time = "2026-03-01T03:43:02.262Z" },
+    { url = "https://files.pythonhosted.org/packages/b0/68/a9e1d45f347ae2ca08d5a6166af615871c323501a4a92c8825a4e604d32d/openimageio-3.0.16.0-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:7c825270d342cd071b369e69e36869271a7c811155744ebd4c9b8a6dbde24ac7", size = 6392045, upload-time = "2026-03-01T03:43:04.195Z" },
+    { url = "https://files.pythonhosted.org/packages/40/a0/554e03a80c8650be3985b4aa427a80491a8cc462c3cde5890357b5976597/openimageio-3.0.16.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:096e0a4940395f73903a295ec423a338594ce07d405206e9d775ba7168861fd8", size = 6597227, upload-time = "2026-03-01T03:43:05.814Z" },
+    { url = "https://files.pythonhosted.org/packages/cd/36/4792c357fa2b19d5ed4f5bc2b634dcb5f658c541ff33263e09002b680cd7/openimageio-3.0.16.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:331d103b35d1d402ff8c7a9ece77b7c2191f5d6e4b6d8299be08374c4c4b91f8", size = 6493718, upload-time = "2026-03-01T03:43:07.37Z" },
+    { url = "https://files.pythonhosted.org/packages/94/9f/e3da32d705a704ed7f1324345dc0a0ac108667bb16a8ba50da7f4c298c0c/openimageio-3.0.16.0-cp312-cp312-win_amd64.whl", hash = "sha256:dddcd78cb35946907eb2be607ba9d620c05f502652937c9ea250078725b1745e", size = 7103136, upload-time = "2026-03-01T03:43:08.983Z" },
+    { url = "https://files.pythonhosted.org/packages/67/61/0da72a9ed22127a563c12db20025255010661f7162f494741c74242d195d/openimageio-3.0.16.0-cp313-cp313-macosx_10_15_x86_64.whl", hash = "sha256:b160601825a8362eb586a760afabe1ebfd5d3b6869f012ccbe5cd637a621efd2", size = 6643458, upload-time = "2026-03-01T03:43:10.869Z" },
+    { url = "https://files.pythonhosted.org/packages/65/fe/5a743e939c3ce8d822f3a826dc93a6a5914265d613bd81cfddc3c6f91c9b/openimageio-3.0.16.0-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:4259743111db8ea8daf76d44724fcf20f0e2ce641906d36202983ec6092c24d2", size = 6262560, upload-time = "2026-03-01T03:43:12.499Z" },
+    { url = "https://files.pythonhosted.org/packages/de/ae/8c7069774dc198ffd7b193b49c8e3cf897a98bb8c5eb9de754be10957932/openimageio-3.0.16.0-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:5a2a0d97d7091e33b542ae0fb66d7e250ad48a4417dbffa308c48eefd96dc3c6", size = 6392031, upload-time = "2026-03-01T03:43:14.256Z" },
+    { url = "https://files.pythonhosted.org/packages/29/9b/3c05dc022ae1ae9761e2a6d297b10cefaa9cbbcf2feb6a355710d1f4f045/openimageio-3.0.16.0-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:2df45d95e50dcdf4fc07df09b3cfdfb0b6dbfab1dad86a4b744b698058bce62e", size = 6596464, upload-time = "2026-03-01T03:43:16.204Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/82/04d1b969c56c4737783949ccd3446d63b4a0db0003684371b96877a54f53/openimageio-3.0.16.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b64ca87f11057bd60ee15f5280a6e83c719c01ed31fb6b220aa1df7e3966ad3b", size = 6493537, upload-time = "2026-03-01T03:43:17.486Z" },
+    { url = "https://files.pythonhosted.org/packages/e6/97/0bbee7fd1d2e028c4be6292e5f968556a11670bec358d57ba0ff0b0d77de/openimageio-3.0.16.0-cp313-cp313-win_amd64.whl", hash = "sha256:c439c4eb80037aadd34436947eebf3fc06ac61512b0263724bafef6d0878fd76", size = 7103123, upload-time = "2026-03-01T03:43:19.06Z" },
+]
+
+[[package]]
+name = "openimageio"
+version = "3.1.11.0"
+source = { registry = "https://pypi.org/simple" }
+resolution-markers = [
+    "python_full_version >= '3.13' and sys_platform == 'linux'",
+    "python_full_version == '3.12.*' and sys_platform == 'linux'",
+    "python_full_version >= '3.13' and sys_platform != 'linux'",
+    "python_full_version == '3.12.*' and sys_platform != 'linux'",
+    "python_full_version == '3.11.*' and sys_platform == 'linux'",
+    "python_full_version == '3.11.*' and sys_platform != 'linux'",
+    "python_full_version < '3.11' and sys_platform == 'linux'",
+    "python_full_version < '3.11' and sys_platform != 'linux'",
+]
+dependencies = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version < '3.11' and extra != 'extra-8-ltx-core-fp8-trtllm') or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
+    { name = "numpy", version = "2.4.1", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version >= '3.11' and extra != 'extra-8-ltx-core-fp8-trtllm') or (extra == 'extra-8-ltx-core-fp8-trtllm' and extra == 'extra-8-ltx-core-xformers')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/f6/bd/d49fe9f78b244251301da7b4caff7053b151df55ce0e04829004ac9f65ba/openimageio-3.1.11.0.tar.gz", hash = "sha256:7c096607569b0d01266da739bbf7496f1c0a8fb4449092f8f66fde2bf3a20494", size = 6555440, upload-time = "2026-03-01T03:09:00.936Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b9/cc/eb7725c3ca6c76fd5defe92b2d558773b1a7a89a69c483bb33d791b0a723/openimageio-3.1.11.0-cp310-cp310-macosx_10_15_x86_64.whl", hash = "sha256:ef9377cdd84d67c415e6fc67f75553cacad36976cfd3f5ae1f0b2b5a6c46a7ef", size = 6851102, upload-time = "2026-03-01T03:08:18.322Z" },
+    { url = "https://files.pythonhosted.org/packages/2a/54/ffc2d3b70dee7690dae808cfa8787cfa1f109fc7b4cd68632cade9fab5f3/openimageio-3.1.11.0-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:0c497762ec7993c9af51079edd723ca0a37faa085c6115b8e69f151460a60927", size = 6465995, upload-time = "2026-03-01T03:08:19.907Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/7c/e2f32ee394db041af8477d984aef2c04067713e916830fb113ade2dd3426/openimageio-3.1.11.0-cp310-cp310-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:1cfc57d9e790e76e76498b0e5c5a0bed83ae1be6104c635eca114265eefff34c", size = 6501598, upload-time = "2026-03-01T03:08:21.486Z" },
+    { url = "https://files.pythonhosted.org/packages/e1/4d/fa9d641d424d7e16a44a502c440165687adad13ca005507dbf29d8b7febf/openimageio-3.1.11.0-cp310-cp310-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:0f01e9e115b1832bd27bb6a62e29bf435cb27f3f41b589ac7d2838bdda530f15", size = 6789743, upload-time = "2026-03-01T03:08:22.714Z" },
+    { url = "https://files.pythonhosted.org/packages/34/0a/cbde5147af9db425a5c692147da45f849d1203304f195bcae71875b43afb/openimageio-3.1.11.0-cp310-cp310-win_amd64.whl", hash = "sha256:4b57b599294afac5f21885949014ca1469866c3b648375b834d19723c67dc52c", size = 7459665, upload-time = "2026-03-01T03:08:24.267Z" },
+    { url = "https://files.pythonhosted.org/packages/0e/9d/6d67fb8358faeb7f6b195ea35483ffa58d9fd45806dbedea471c79ae8050/openimageio-3.1.11.0-cp311-cp311-macosx_10_15_x86_64.whl", hash = "sha256:d02021c7a4baf0418cde43ebddd0103886cc809c8e85c9c8cd4a1cbe69879c5a", size = 6852201, upload-time = "2026-03-01T03:08:25.864Z" },
+    { url = "https://files.pythonhosted.org/packages/ec/c2/1412eb64ea7a7156ebe335a03118e8d2dc116e63e354d44fceb475b520cc/openimageio-3.1.11.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:daa4396f8094ed94c9b963711b2a680dc8f34c5361be5bc06804b0fc94cb4f4b", size = 6466903, upload-time = "2026-03-01T03:08:27.124Z" },
+    { url = "https://files.pythonhosted.org/packages/75/20/16e4d4a310628d0960588f919a7fc85dd94be4eb37a043f5cacfb9e024fc/openimageio-3.1.11.0-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:0f457ca10c45d4e03dd4d3af13456962bee2ee6abee91bf40a8d21ffa7da1f74", size = 6502239, upload-time = "2026-03-01T03:08:28.637Z" },
+    { url = "https://files.pythonhosted.org/packages/9c/6f/70f75c4fbc958e9f4f829aeb8d88558591cdcdb6dd36e97d8ee6f50c4011/openimageio-3.1.11.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:11655436841f11d268049f5494c6621dfd6370c104b4aa8c20f0724271850796", size = 6790238, upload-time = "2026-03-01T03:08:30.083Z" },
+    { url = "https://files.pythonhosted.org/packages/3b/1e/f85f0393237dbbcec0559c357795462e43eb2fead40d2954a99ebf24c310/openimageio-3.1.11.0-cp311-cp311-win_amd64.whl", hash = "sha256:58eacdc68992c49257be43a30ac424fd6cf617b9de1e516debc14c0bd93af075", size = 7460293, upload-time = "2026-03-01T03:08:31.646Z" },
+    { url = "https://files.pythonhosted.org/packages/cf/2c/24036c501b24f0d4136d9c4605a8861f5affc87df23fa78c279e0a9216c0/openimageio-3.1.11.0-cp312-cp312-macosx_10_15_x86_64.whl", hash = "sha256:53337dd2e11f7f0a07fbe664d21c0d578a0674695da1e5f327764a3f421aff83", size = 6942447, upload-time = "2026-03-01T03:08:33.179Z" },
+    { url = "https://files.pythonhosted.org/packages/69/ca/d84f062cbceb35a8006a9a3393da1893e23ffd8147c53d5f461fa99898cc/openimageio-3.1.11.0-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:8d50f1d8159177561c6d5efcc0f2d7f9fd5393cc147a39b546849da8762bb4f8", size = 6540326, upload-time = "2026-03-01T03:08:34.542Z" },
+    { url = "https://files.pythonhosted.org/packages/6c/f8/ca6f4ca3d5dc2b2cc1411a1083b926d5fc9eb22e57d352333027b3eb4659/openimageio-3.1.11.0-cp312-cp312-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:212dd58364f8e11c0fbd90f82bbaf617afc68b4f3910538d0ac2324ef60a4c28", size = 6503147, upload-time = "2026-03-01T03:08:35.87Z" },
+    { url = "https://files.pythonhosted.org/packages/81/9c/5ea545f62790bc4f8b9c04d433963f9fe5f08548c8663e89a54f1db7002d/openimageio-3.1.11.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:f845304bb17a1fd48f19c972572eb03ee3f96336f2d5599d043cb7ac1c348035", size = 6791359, upload-time = "2026-03-01T03:08:37.412Z" },
+    { url = "https://files.pythonhosted.org/packages/9b/ba/c64923d962dd6c2dd0421feaa6000b081bcf1e26e07a125da94488f9cd39/openimageio-3.1.11.0-cp312-cp312-win_amd64.whl", hash = "sha256:30284fb3367e480eaa345b122ccf38df61bd3885c78b237942a585cefaf0538a", size = 7466181, upload-time = "2026-03-01T03:08:38.931Z" },
+    { url = "https://files.pythonhosted.org/packages/00/81/76375647018dce289e13f8a75c42cddbd9c688baa50d1dc99f73457508f0/openimageio-3.1.11.0-cp313-cp313-macosx_10_15_x86_64.whl", hash = "sha256:35ac810ccf3aa8a4cdc1fb19289dab57e20a9d915a78041a6fa2052d3b7a8c3c", size = 6942555, upload-time = "2026-03-01T03:08:40.539Z" },
+    { url = "https://files.pythonhosted.org/packages/6b/a1/b1a861bc03462bc5ac6e6a9eac3e4f9e28302f0cc14748e0cd3f1f1efadd/openimageio-3.1.11.0-cp313-cp313-macosx_11_0_arm64.whl", hash = "sha256:5d294f1d631baea51cf9d940ee770f789946dcfae187cf78a5b440a3cc88c4c7", size = 6540381, upload-time = "2026-03-01T03:08:41.796Z" },
+    { url = "https://files.pythonhosted.org/packages/c2/5a/79ceb6c7cf57fdce947e9b341c5de1fbf6e219a0db5ce990e69431c54f90/openimageio-3.1.11.0-cp313-cp313-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:78cffd41f1d0e575c56aa5e601a0f3c98347cb9a20d3ca6210b4ef881cef256c", size = 6503197, upload-time = "2026-03-01T03:08:43.23Z" },
+    { url = "https://files.pythonhosted.org/packages/e1/49/6593704b762dfe1296229323219e216fda029c6153622a57f1e865f82160/openimageio-3.1.11.0-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:020e7b5a0d2898dca1c66c7c6f800aa2c307a509ffd3dbed2898562445b5f6bd", size = 6791511, upload-time = "2026-03-01T03:08:44.544Z" },
+    { url = "https://files.pythonhosted.org/packages/60/c2/43c1eeb5dcc7620a212c1705dc03547d20c917f3761fd6a2bde3fa3b9fb1/openimageio-3.1.11.0-cp313-cp313-win_amd64.whl", hash = "sha256:cb331042a297bd3de87b4eed5efed4c337e1446aaed3807ac4899c129e33d61a", size = 7466220, upload-time = "2026-03-01T03:08:45.78Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/b9/6b09045f1a92cd38a59fd3c03dd59374f27c03270943ebd5844247633c70/openimageio-3.1.11.0-cp314-cp314-macosx_10_15_x86_64.whl", hash = "sha256:f7c9b14c3981cd992b33f8a47735ce099687cddc9d05ffdd03b87490c0bcdd47", size = 6940155, upload-time = "2026-03-01T03:08:47.09Z" },
+    { url = "https://files.pythonhosted.org/packages/13/d8/f10343f5ddf6bc9003f8e9c1eae3b2d4b5cfed01fccde6fffe5a7cafce33/openimageio-3.1.11.0-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:4f5e106054c01c5a768c6442b712493bfe21526dd4e202e3c18245a0224e6d53", size = 6536784, upload-time = "2026-03-01T03:08:48.364Z" },
+    { url = "https://files.pythonhosted.org/packages/4b/6f/4709da066a4dafef14b5bb0e7e221fa9d65e196806ce22721862627ab37c/openimageio-3.1.11.0-cp314-cp314-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:4c2affc140802fdc42b2f01aeebedfdd64ff29891fdc2e2c708d4653852eff2b", size = 6503379, upload-time = "2026-03-01T03:08:49.947Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/5b/de755dfb3a8837592263511fc14966901d1b8d880eeb3cde9d65b8f02e81/openimageio-3.1.11.0-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ee25034ceff73b8f08ae4b562a5a62cfcdaa0e873ce913c5df72d9dc2a0d56c7", size = 6791460, upload-time = "2026-03-01T03:08:51.483Z" },
+    { url = "https://files.pythonhosted.org/packages/20/fb/159531b67af2ddca76dc1bbfcc31e4b94a8d91215ae0fa168e0243327b3b/openimageio-3.1.11.0-cp314-cp314-win_amd64.whl", hash = "sha256:1945317959ac1905e97c8d9479efc716bb765dec82a647365d37e046e154a46c", size = 7767018, upload-time = "2026-03-01T03:08:52.707Z" },
 ]
 
 [[package]]
@@ -7005,7 +7105,7 @@ dependencies = [
     { name = "torch", version = "2.9.1", source = { registry = "https://pypi.org/simple" } },
 ]
 wheels = [
-    { url = "https://download.pytorch.org/whl/cu129/xformers-0.0.33%2B5d4b92a5.d20251029-cp39-abi3-linux_x86_64.whl" },
+    { url = "https://download.pytorch.org/whl/cu129/xformers-0.0.33%2B5d4b92a5.d20251029-cp39-abi3-linux_x86_64.whl", upload-time = "2025-10-30T00:15:46Z" },
 ]
 
 [[package]]

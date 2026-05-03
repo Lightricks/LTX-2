@@ -19,6 +19,8 @@ Basic usage:
 Advanced usage:
     # Use Gemini Flash API (requires GEMINI_API_KEY or GOOGLE_API_KEY env var)
     caption_videos.py videos_dir/ --captioner-type gemini_flash
+    # Use Gemini Flash with parallel workers (2-10 workers, cloud API only)
+    caption_videos.py videos_dir/ --captioner-type gemini_flash --num-workers 5
     # Disable audio processing (video-only captions)
     caption_videos.py videos_dir/ --no-audio
     # Process videos with specific extensions and save as JSON
@@ -27,6 +29,7 @@ Advanced usage:
 
 import csv
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
 from pathlib import Path
 
@@ -70,7 +73,7 @@ class OutputFormat(str, Enum):
     JSONL = "jsonl"  # JSON Lines file with one JSON object per line
 
 
-def caption_media(
+def caption_media(  # noqa: PLR0913
     input_path: Path,
     output_path: Path,
     captioner: MediaCaptioningModel,
@@ -81,6 +84,7 @@ def caption_media(
     clean_caption: bool,
     output_format: OutputFormat,
     override: bool,
+    num_workers: int = 1,
 ) -> None:
     """Caption videos and images using the provided captioning model.
     Args:
@@ -94,6 +98,7 @@ def caption_media(
         clean_caption: Whether to clean up captions
         output_format: Format to save the captions in
         override: Whether to override existing captions
+        num_workers: Number of parallel workers (only for cloud-based captioners like Gemini)
     """
 
     # Get list of media files to process
@@ -121,9 +126,13 @@ def caption_media(
         console.print("[bold yellow]All media already have captions. Use --override to recaption.[/]")
         return
 
-    # Process media files
+    if num_workers > 1:
+        console.print(f"Running with [bold cyan]{num_workers}[/] parallel workers.")
+
     captions = existing_captions.copy()
     successfully_captioned = 0
+    completed_since_save = 0
+
     progress = Progress(
         SpinnerColumn(),
         TextColumn("{task.description}"),
@@ -135,36 +144,47 @@ def caption_media(
         console=console,
     )
 
+    def process_one(media_file: Path) -> tuple[str, str]:
+        """Caption a single media file and return (relative_path, caption)."""
+        caption = captioner.caption(
+            path=media_file,
+            fps=fps,
+            include_audio=include_audio,
+            clean_caption=clean_caption,
+        )
+        rel_path = str(media_file.resolve().relative_to(base_dir))
+        return rel_path, caption
+
     with progress:
-        task = progress.add_task("Captioning", total=len(media_to_process))
+        task = progress.add_task(
+            f"Captioning (workers: {num_workers})" if num_workers > 1 else "Captioning",
+            total=len(media_to_process),
+        )
 
-        for i, media_file in enumerate(media_to_process):
-            progress.update(task, description=f"Captioning [bold blue]{media_file.name}[/]")
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(process_one, f): f for f in media_to_process}
 
-            try:
-                # Generate caption for the media
-                caption = captioner.caption(
-                    path=media_file,
-                    fps=fps,
-                    include_audio=include_audio,
-                    clean_caption=clean_caption,
-                )
+            for future in as_completed(futures):
+                media_file = futures[future]
+                progress.update(task, description=f"Captioning [bold blue]{media_file.name}[/]")
 
-                # Convert absolute path to relative path (relative to the output file's directory)
-                rel_path = str(media_file.resolve().relative_to(base_dir))
-                # Store the caption with the relative path as key
-                captions[rel_path] = caption
-                successfully_captioned += 1
-            except Exception as e:
-                console.print(f"[bold red]Error captioning {media_file}: {e}[/]")
+                try:
+                    rel_path, caption = future.result()
 
-            if i % SAVE_INTERVAL == 0:
-                _save_captions(captions, output_path, output_format)
+                    captions[rel_path] = caption
+                    successfully_captioned += 1
+                    completed_since_save += 1
 
-            # Advance progress bar
-            progress.advance(task)
+                    if completed_since_save >= SAVE_INTERVAL:
+                        _save_captions(captions, output_path, output_format)
+                        completed_since_save = 0
 
-    # Save captions to file
+                except Exception as e:
+                    console.print(f"[bold red]Error captioning {media_file.name}: {e}[/]")
+
+                progress.advance(task)
+
+    # Final save with everything accumulated
     _save_captions(captions, output_path, output_format)
 
     # Print summary
@@ -407,6 +427,18 @@ def main(  # noqa: PLR0913
         envvar=["GOOGLE_API_KEY", "GEMINI_API_KEY"],
         help="API key for Gemini Flash (can also use GOOGLE_API_KEY or GEMINI_API_KEY env var)",
     ),
+    num_workers: int = typer.Option(
+        1,
+        "--num-workers",
+        "-w",
+        min=1,
+        max=10,
+        help=(
+            "Number of parallel workers for captioning (1-10). "
+            "Values above 1 are only supported for cloud-based captioners (gemini_flash). "
+            "Using multiple workers with a local model will raise an error."
+        ),
+    ),
 ) -> None:
     """Auto-caption videos with audio using multimodal models.
     This script supports audio-visual captioning using:
@@ -423,6 +455,17 @@ def main(  # noqa: PLR0913
         # Caption with custom instruction
         caption_videos.py video.mp4 -o captions.json -i "Describe this video in detail"
     """
+
+    # Parallel workers are only safe for cloud-based (stateless) captioners.
+    # Local models like Qwen-Omni hold GPU state and are not thread-safe.
+    if num_workers > 1 and captioner_type != CaptionerType.GEMINI_FLASH:
+        console.print(
+            "[bold red]Error:[/] --num-workers > 1 is only supported with [bold]--captioner-type gemini_flash[/].\n"
+            "Local models (e.g. qwen_omni) run on GPU and are not thread-safe — "
+            "parallel calls would cause memory corruption or incorrect results.\n"
+            "Either set [bold]--num-workers 1[/] (default) or switch to [bold]--captioner-type gemini_flash[/]."
+        )
+        raise typer.Exit(code=1)
 
     # Determine device for local models
     device_str = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -479,6 +522,7 @@ def main(  # noqa: PLR0913
         clean_caption=clean_caption,
         output_format=output_format,
         override=override,
+        num_workers=num_workers,
     )
 
 

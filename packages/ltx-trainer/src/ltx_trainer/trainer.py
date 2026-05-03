@@ -2,8 +2,9 @@ import os
 import re
 import time
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import torch
 import wandb
@@ -39,6 +40,7 @@ from ltx_trainer.model_loader import load_embeddings_processor, load_text_encode
 from ltx_trainer.model_loader import load_model as load_ltx_model
 from ltx_trainer.progress import TrainingProgress
 from ltx_trainer.quantization import quantize_model
+from ltx_trainer.sigma_tracker import SigmaBucketTracker
 from ltx_trainer.timestep_samplers import SAMPLERS
 from ltx_trainer.training_state import ConfigFingerprint, RngStates, TrainingState
 from ltx_trainer.training_strategies import get_training_strategy
@@ -77,6 +79,14 @@ class TrainingStats(BaseModel):
     num_processes: int
 
 
+@dataclass(frozen=True)
+class TrainingStepOutput:
+    """Output from a single training step."""
+
+    loss: Tensor  # [B,] per-element loss (unreduced)
+    sigma: Tensor  # [B,] sampled sigma, detached from computational graph
+
+
 class LtxvTrainer:
     def __init__(self, trainer_config: LtxTrainerConfig) -> None:
         self._config = trainer_config
@@ -95,7 +105,8 @@ class LtxvTrainer:
         self._checkpoint_paths: list[Path] = []
         self._training_state_paths: list[Path] = []
         self._training_state_size_warned = False
-        self._init_wandb()
+        self._wandb_run = None
+        self._sigma_tracker = SigmaBucketTracker()
 
     def train(  # noqa: PLR0912, PLR0915
         self,
@@ -127,6 +138,10 @@ class LtxvTrainer:
         if training_state is not None and not self._restore_training_state(training_state):
             initial_step = 0
             resuming = False
+
+        # Initialize W&B after restore so we only resume the run when state restore succeeds.
+        resume_run_id = training_state.wandb_run_id if resuming and training_state is not None else None
+        self._init_wandb(resume_run_id=resume_run_id)
 
         self._init_dataloader()
         data_iter = iter(self._dataloader)
@@ -191,8 +206,8 @@ class LtxvTrainer:
                     if is_optimization_step:
                         self._global_step += 1
 
-                    loss = self._training_step(batch)
-                    self._accelerator.backward(loss)
+                    output = self._training_step(batch)
+                    self._accelerator.backward(output.loss.mean())
 
                     if self._accelerator.sync_gradients and cfg.optimization.max_grad_norm > 0:
                         self._accelerator.clip_grad_norm_(
@@ -244,9 +259,10 @@ class LtxvTrainer:
                     # Update progress and log metrics
                     current_lr = self._optimizer.param_groups[0]["lr"]
                     step_time = (time.time() - step_start_time) * cfg.optimization.gradient_accumulation_steps
+                    step_loss = output.loss.detach().mean().item()
 
                     progress.update_training(
-                        loss=loss.item(),
+                        loss=step_loss,
                         lr=current_lr,
                         step_time=step_time,
                         advance=is_optimization_step,
@@ -254,14 +270,16 @@ class LtxvTrainer:
 
                     # Log metrics to W&B (only on main process and optimization steps)
                     if IS_MAIN_PROCESS and is_optimization_step:
-                        self._log_metrics(
-                            {
-                                "train/loss": loss.item(),
-                                "train/learning_rate": current_lr,
-                                "train/step_time": step_time,
-                                "train/global_step": self._global_step,
-                            }
-                        )
+                        # Track per-element loss by sigma bucket
+                        self._sigma_tracker.update(output.sigma.cpu().tolist(), output.loss.detach().cpu().tolist())
+                        metrics = {
+                            "train/loss": step_loss,
+                            "train/learning_rate": current_lr,
+                            "train/step_time": step_time,
+                            "train/global_step": self._global_step,
+                        }
+                        metrics.update(self._sigma_tracker.get_metrics())
+                        self._log_metrics(metrics)
 
                     # Fallback logging when progress bars are disabled
                     if disable_progress_bars and IS_MAIN_PROCESS and self._global_step % 20 == 0:
@@ -274,7 +292,7 @@ class LtxvTrainer:
                             total_time = "calculating..."
                         logger.info(
                             f"Step {self._global_step}/{cfg.optimization.steps} - "
-                            f"Loss: {loss.item():.4f}, LR: {current_lr:.2e}, "
+                            f"Loss: {step_loss:.4f}, LR: {current_lr:.2e}, "
                             f"Time/Step: {step_time:.2f}s, Total Time: {total_time}",
                         )
 
@@ -330,7 +348,7 @@ class LtxvTrainer:
 
         return saved_path, stats
 
-    def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> Tensor:
+    def _training_step(self, batch: dict[str, dict[str, Tensor]]) -> TrainingStepOutput:
         """Perform a single training step using the configured strategy."""
         # Apply embedding connectors to transform pre-computed text embeddings
         conditions = batch["conditions"]
@@ -366,8 +384,9 @@ class LtxvTrainer:
 
         # Use strategy to compute loss
         loss = self._training_strategy.compute_loss(video_pred, audio_pred, model_inputs)
+        sigma = model_inputs.video.sigma.detach() if model_inputs.video.enabled else model_inputs.audio.sigma.detach()
 
-        return loss
+        return TrainingStepOutput(loss=loss, sigma=sigma)
 
     @free_gpu_memory_context(after=True)
     def _load_text_encoder_and_cache_embeddings(self) -> list[CachedPromptEmbeddings] | None:
@@ -1083,8 +1102,8 @@ class LtxvTrainer:
     def _save_training_state(self, save_dir: Path) -> None:
         """Save training state alongside checkpoint for resume.
         Respects checkpoints.save_training_state config:
-        - "full": optimizer + scheduler + RNG + step
-        - "minimal": scheduler + RNG + step only
+        - "full": optimizer + scheduler + RNG + step + wandb_run_id
+        - "minimal": scheduler + RNG + step + wandb_run_id
         - "off": skip entirely
         """
         if not IS_MAIN_PROCESS:
@@ -1120,6 +1139,7 @@ class LtxvTrainer:
             ),
             lr_scheduler_state_dict=self._lr_scheduler.state_dict() if self._lr_scheduler is not None else None,
             optimizer_state_dict=optimizer_state,
+            wandb_run_id=self._wandb_run.id if self._wandb_run is not None else None,
         )
 
         state_path = save_dir / f"training_state_step_{self._global_step:05d}.pt"
@@ -1185,20 +1205,24 @@ class LtxvTrainer:
 
         logger.info(f"💾 Training configuration saved to: {config_path.relative_to(self._config.output_dir)}")
 
-    def _init_wandb(self) -> None:
+    def _init_wandb(self, resume_run_id: str | None = None) -> None:
         """Initialize Weights & Biases run."""
         if not self._config.wandb.enabled or not IS_MAIN_PROCESS:
             self._wandb_run = None
             return
 
         wandb_config = self._config.wandb
-        run = wandb.init(
-            project=wandb_config.project,
-            entity=wandb_config.entity,
-            name=Path(self._config.output_dir).name,
-            tags=wandb_config.tags,
-            config=self._config.model_dump(),
-        )
+        init_kwargs: dict[str, Any] = {
+            "project": wandb_config.project,
+            "entity": wandb_config.entity,
+            "name": Path(self._config.output_dir).name,
+            "tags": wandb_config.tags,
+            "config": self._config.model_dump(),
+        }
+        if resume_run_id is not None:
+            init_kwargs["id"] = resume_run_id
+            init_kwargs["resume"] = "allow"
+        run = wandb.init(**init_kwargs)
         self._wandb_run = run
 
     def _log_metrics(self, metrics: dict[str, float]) -> None:

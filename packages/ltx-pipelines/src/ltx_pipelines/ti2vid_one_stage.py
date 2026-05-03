@@ -20,7 +20,11 @@ from ltx_pipelines.utils import (
     combined_image_conditionings,
     get_device,
 )
-from ltx_pipelines.utils.args import ImageConditioningInput, default_1_stage_arg_parser, detect_checkpoint_path
+from ltx_pipelines.utils.args import (
+    ImageConditioningInput,
+    default_1_stage_arg_parser,
+    detect_checkpoint_path,
+)
 from ltx_pipelines.utils.blocks import (
     AudioDecoder,
     DiffusionStage,
@@ -31,7 +35,7 @@ from ltx_pipelines.utils.blocks import (
 from ltx_pipelines.utils.constants import detect_params
 from ltx_pipelines.utils.denoisers import FactoryGuidedDenoiser
 from ltx_pipelines.utils.media_io import encode_video
-from ltx_pipelines.utils.types import ModalitySpec
+from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
 
 
 class TI2VidOneStagePipeline:
@@ -52,15 +56,18 @@ class TI2VidOneStagePipeline:
         quantization: QuantizationPolicy | None = None,
         registry: Registry | None = None,
         torch_compile: bool = False,
+        offload_mode: OffloadMode = OffloadMode.NONE,
     ):
         self.dtype = torch.bfloat16
         self.device = device or get_device()
+        self._scheduler = LTX2Scheduler()
         self.prompt_encoder = PromptEncoder(
             checkpoint_path=checkpoint_path,
             gemma_root=gemma_root,
             dtype=self.dtype,
             device=self.device,
             registry=registry,
+            offload_mode=offload_mode,
         )
         self.image_conditioner = ImageConditioner(
             checkpoint_path=checkpoint_path,
@@ -76,6 +83,7 @@ class TI2VidOneStagePipeline:
             quantization=quantization,
             registry=registry,
             torch_compile=torch_compile,
+            offload_mode=offload_mode,
         )
         self.video_decoder = VideoDecoder(
             checkpoint_path=checkpoint_path,
@@ -104,9 +112,9 @@ class TI2VidOneStagePipeline:
         audio_guider_params: MultiModalGuiderParams | MultiModalGuiderFactory,
         images: list[ImageConditioningInput],
         enhance_prompt: bool = False,
-        streaming_prefetch_count: int | None = None,
         tiling_config: TilingConfig | None = None,
         max_batch_size: int = 1,
+        sigmas: torch.Tensor | None = None,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         assert_resolution(height=height, width=width, is_two_stage=False)
 
@@ -119,7 +127,6 @@ class TI2VidOneStagePipeline:
             enhance_first_prompt=enhance_prompt,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
             enhance_prompt_seed=seed,
-            streaming_prefetch_count=streaming_prefetch_count,
         )
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
@@ -135,7 +142,9 @@ class TI2VidOneStagePipeline:
             )
         )
 
-        sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(dtype=torch.float32, device=self.device)
+        sigmas = (sigmas if sigmas is not None else self._scheduler.execute(steps=num_inference_steps)).to(
+            dtype=torch.float32, device=self.device
+        )
 
         video_guider_factory = create_multimodal_guider_factory(
             params=video_guider_params,
@@ -166,7 +175,6 @@ class TI2VidOneStagePipeline:
             audio=ModalitySpec(
                 context=a_context_p,
             ),
-            streaming_prefetch_count=streaming_prefetch_count,
             max_batch_size=max_batch_size,
         )
 
@@ -188,6 +196,7 @@ def main() -> None:
         loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
         torch_compile=args.compile,
+        offload_mode=args.offload_mode,
     )
     video, audio = pipeline(
         prompt=args.prompt,
@@ -215,7 +224,6 @@ def main() -> None:
             stg_blocks=args.audio_stg_blocks,
         ),
         images=args.images,
-        streaming_prefetch_count=args.streaming_prefetch_count,
         max_batch_size=args.max_batch_size,
     )
 

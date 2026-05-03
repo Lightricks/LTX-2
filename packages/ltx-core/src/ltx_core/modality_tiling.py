@@ -67,11 +67,16 @@ class VideoModalityTilingHelper:
 
     # -- tile modality -----------------------------------------------------
 
-    def tile_modality(self, modality: Modality, tile: Tile) -> tuple[Modality, TilingContext]:
+    def tile_modality(
+        self, modality: Modality, tile: Tile, *, normalize_positions: bool = True
+    ) -> tuple[Modality, TilingContext]:
         """Slice *modality* to the tokens covered by *tile*.
         Selects generated tokens belonging to the tile's spatial region
         and conditioning tokens that overlap with the tile (or have
         negative time coordinates).
+        Args:
+            normalize_positions: When True, shift all positions so the
+                tile's generated tokens start at zero in every dimension.
         Returns:
             A ``(tiled_modality, context)`` tuple.  Pass *context* to
             :meth:`blend` together with the model output.
@@ -83,11 +88,18 @@ class VideoModalityTilingHelper:
             keep_indices = keep_mask.nonzero(as_tuple=False).squeeze(1)
             tile_attention_mask = modality.attention_mask[:, keep_indices, :][:, :, keep_indices]
 
+        positions = modality.positions[:, :, keep_mask, :]
+        if normalize_positions:
+            num_tile_gen = self._tile_generated_token_count(tile)
+            gen_pos = positions[:, :, :num_tile_gen, :]  # (B, 3, num_tile_gen, 2)
+            offset = gen_pos[..., 0].amin(dim=2, keepdim=True).unsqueeze(-1)  # (B, 3, 1, 1)
+            positions = positions - offset
+
         tiled = replace(
             modality,
             latent=modality.latent[:, keep_mask, :],
             timesteps=modality.timesteps[:, keep_mask],
-            positions=modality.positions[:, :, keep_mask, :],
+            positions=positions,
             attention_mask=tile_attention_mask,
         )
 

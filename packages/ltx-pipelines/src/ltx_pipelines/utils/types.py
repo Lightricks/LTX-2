@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Protocol
 
 import torch
@@ -74,3 +77,21 @@ class ModalitySpec:
     noise_scale: float = 1.0
     frozen: bool = False
     initial_latent: torch.Tensor | None = None
+
+
+class OffloadMode(Enum):
+    """Weight offloading strategy.
+    Controls where model weights reside during inference:
+    - ``NONE``: All weights on GPU (no streaming). Fastest inference,
+      requires enough VRAM for the full model (~28 GB for LTX-2).
+    - ``CPU``: Weights pinned in CPU RAM, streamed layer-by-layer to a
+      small GPU buffer. First pass reads from disk; subsequent passes
+      reuse the CPU cache. Requires ~36 GB RAM + ~5 GB VRAM.
+    - ``DISK``: Weights read from disk on demand through a small CPU
+      buffer, then streamed to GPU. Every pass re-reads from disk.
+      Lowest memory: ~5 GB RAM + ~5 GB VRAM.
+    """
+
+    NONE = "none"
+    CPU = "cpu"
+    DISK = "disk"
