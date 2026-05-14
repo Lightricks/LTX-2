@@ -867,7 +867,7 @@ def tiled_encode_video(  # noqa: PLR0912, PLR0915
             chunks = encoded_batch.chunk(len(mini_batch), dim=0)
 
             for entry, encoded_tile in zip(mini_batch, chunks, strict=True):
-                _, _, tile_out_frames, tile_out_height, tile_out_width = encoded_tile.shape
+                _, _, tile_out_frames, _, _ = encoded_tile.shape
                 actual_tile_h = entry["actual_tile_h"]
                 actual_tile_w = entry["actual_tile_w"]
                 encoded_tile_trimmed = encoded_tile[:, :, :, :actual_tile_h, :actual_tile_w]
