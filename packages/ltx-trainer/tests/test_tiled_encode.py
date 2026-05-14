@@ -68,11 +68,6 @@ def video_small():
     return torch.rand(1, 3, 9, 256, 256, generator=gen)
 
 
-# ---------------------------------------------------------------------------
-# Baseline tests (4)
-# ---------------------------------------------------------------------------
-
-
 def test_output_shape(vae, video_896):
     out = tiled_encode_video(vae, video_896)
     assert out.shape == (1, 128, 2, 28, 28), f"unexpected shape {out.shape}"
@@ -112,11 +107,6 @@ def test_encode_video_threads_tile_batch_size(vae, video_896):
     )
 
 
-# ---------------------------------------------------------------------------
-# New tests for F001 / F002
-# ---------------------------------------------------------------------------
-
-
 def test_tile_batch_size_larger_than_tile_count(vae, video_896):
     """tile_batch_size=100 > number of tiles (4); exercises partial-last-sub-list path."""
     out_large = tiled_encode_video(vae, video_896, tile_batch_size=100)
@@ -142,11 +132,6 @@ def test_tile_batch_size_identical_output_mixed_shapes(vae, video_960):
     assert torch.allclose(out_seq, out_bat, atol=1e-6), (
         f"mixed-shape max abs diff between tile_batch_size=1 and tile_batch_size=4: {max_diff}"
     )
-
-
-# ---------------------------------------------------------------------------
-# Regression guards (pre-existing behaviour, unchanged by fix)
-# ---------------------------------------------------------------------------
 
 
 def test_tile_size_not_divisible_raises(vae, video_896):
