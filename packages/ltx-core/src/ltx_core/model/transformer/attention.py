@@ -18,6 +18,12 @@ try:
 except ImportError:
     flash_attn_interface = None
 
+if flash_attn_interface is not None:
+    print("Using Flash Attention.")
+elif memory_efficient_attention is not None:
+    print("Using xformers.")
+else:
+    print("Neither Flash Attention nor xFormers xformers is available. Use PytorchAttention.")
 
 class AttentionCallable(Protocol):
     def __call__(
