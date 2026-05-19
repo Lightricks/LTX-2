@@ -259,6 +259,7 @@ class VideoEncoder(nn.Module):
         Args:
             sample: Input video (B, C, F, H, W). F should be 1 + 8*k (e.g., 1, 9, 17, 25, 33...).
                 If not, the encoder crops the last frames to the nearest valid length.
+                Should be normalized to [-1, 1] range before encoding.
         Returns:
             Normalized latent means (B, 128, F', H', W') where F' = 1+(F-1)/8, H' = H/32, W' = W/32.
             Example: (B, 3, 33, 512, 512) -> (B, 128, 5, 16, 16).
@@ -605,8 +606,8 @@ class VideoDecoder(nn.Module):
         # many video frames and pixels correspond to a single latent cell.
         self.video_downscale_factors = SpatioTemporalScaleFactors(
             time=8,
-            width=32,
             height=32,
+            width=32,
         )
 
         self.patch_size = patch_size
@@ -698,6 +699,9 @@ class VideoDecoder(nn.Module):
             When causal=False, allows future frame dependencies in convolutions but maintains same output shape.
         """
         batch_size = sample.shape[0]
+        output_dtype = sample.dtype
+        weights_dtype = next(self.parameters()).dtype
+        sample = sample.to(weights_dtype)
 
         # Add noise if timestep conditioning is enabled
         if self.timestep_conditioning:
@@ -770,7 +774,7 @@ class VideoDecoder(nn.Module):
         # Example: (B, 48, F, 128, 128) -> (B, 3, F, 512, 512) with patch_size=4
         sample = unpatchify(sample, patch_size_hw=self.patch_size, patch_size_t=1)
 
-        return sample
+        return sample.to(output_dtype)
 
     def _prepare_tiles(
         self,
@@ -903,22 +907,21 @@ class VideoDecoder(nn.Module):
         tiling_config: TilingConfig | None = None,
         generator: torch.Generator | None = None,
     ) -> Iterator[torch.Tensor]:
-        """Decode a video latent tensor, yielding uint8 chunks ``[f, h, w, c]``.
+        """Decode a video latent tensor, yielding float chunks ``[f, h, w, c]`` in ``[0, 1]``.
         Subclasses (e.g. ``DistributedVideoDecoder``) may override this to
         control eagerness or distribution across ranks.
         """
 
-        def convert_to_uint8(frames: torch.Tensor) -> torch.Tensor:
-            frames = (((frames + 1.0) / 2.0).clamp(0.0, 1.0) * 255.0).to(torch.uint8)
-            frames = rearrange(frames[0], "c f h w -> f h w c")
-            return frames
+        def to_rgb(frames: torch.Tensor) -> torch.Tensor:
+            video = rearrange(frames[0], "c f h w -> f h w c")
+            return video.add_(1.0).mul_(0.5).clamp_(0.0, 1.0)
 
         if tiling_config is not None:
             for frames in self.tiled_decode(latent, tiling_config, generator=generator):
-                yield convert_to_uint8(frames)
+                yield to_rgb(frames)
         else:
             decoded = self(latent, generator=generator)
-            yield convert_to_uint8(decoded)
+            yield to_rgb(decoded)
 
     def _group_tiles_by_temporal_slice(self, tiles: List[Tile]) -> List[List[Tile]]:
         """Group tiles by their temporal output slice."""

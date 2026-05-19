@@ -5,11 +5,14 @@ with optional audio support.
 
 from fractions import Fraction
 from pathlib import Path
+from typing import Literal
 
 import av
 import numpy as np
 import torch
 from torch import Tensor
+
+VideoFormat = Literal["CFHW", "FCHW"]
 
 
 def get_video_frame_count(video_path: str | Path) -> int:
@@ -68,6 +71,7 @@ def save_video(
     fps: float = 24.0,
     audio: torch.Tensor | None = None,
     audio_sample_rate: int | None = None,
+    video_format: VideoFormat | None = None,
 ) -> None:
     """Save a video tensor to a file using PyAV, optionally with audio.
     Args:
@@ -76,12 +80,16 @@ def save_video(
         fps: Frames per second for the output video
         audio: Optional audio tensor of shape [C, samples] or [samples, C] in range [-1, 1]
         audio_sample_rate: Sample rate for the audio (required if audio is provided)
+        video_format: Explicit layout of ``video_tensor``, either ``"CFHW"`` or ``"FCHW"``.
+            When ``None`` (default), the layout is auto-detected using a heuristic that only
+            works when ``shape[1] > 3`` — the ambiguous ``[C=3, F=3, H, W]`` / ``[F=3, C=3, H, W]``
+            case requires passing this argument explicitly.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Normalize to [F, H, W, C] uint8 numpy array
-    video_np = _prepare_video_array(video_tensor)
+    video_np = _prepare_video_array(video_tensor, video_format=video_format)
     _, height, width, _ = video_np.shape
 
     with av.open(str(output_path), mode="w") as container:
@@ -113,11 +121,21 @@ def save_video(
             _write_audio(container, audio_stream, audio, audio_sample_rate)
 
 
-def _prepare_video_array(video_tensor: torch.Tensor) -> np.ndarray:
-    """Convert video tensor to [F, H, W, C] uint8 numpy array."""
-    # Handle [C, F, H, W] vs [F, C, H, W] format
-    if video_tensor.shape[0] == 3 and video_tensor.shape[1] > 3:
+def _prepare_video_array(
+    video_tensor: torch.Tensor,
+    video_format: VideoFormat | None = None,
+) -> np.ndarray:
+    """Convert video tensor to [F, H, W, C] uint8 numpy array.
+    If ``video_format`` is provided, it is trusted. Otherwise, the layout is auto-detected
+    using a heuristic that only fires when ``shape[0] == 3 and shape[1] > 3`` (CFHW). The
+    ambiguous ``[C=3, F=3, H, W]`` / ``[F=3, C=3, H, W]`` case cannot be disambiguated and
+    defaults to the FCHW interpretation — callers must pass ``video_format`` explicitly for
+    3-frame CFHW tensors.
+    """
+    if video_format == "CFHW":
         video_tensor = video_tensor.permute(1, 0, 2, 3)  # [C, F, H, W] -> [F, C, H, W]
+    elif video_format is None and video_tensor.shape[0] == 3 and video_tensor.shape[1] > 3:
+        video_tensor = video_tensor.permute(1, 0, 2, 3)
 
     # Normalize to [0, 255] uint8
     if video_tensor.max() <= 1.0:

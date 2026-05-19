@@ -57,7 +57,7 @@ class LTXModel(torch.nn.Module):
         audio_cross_attention_dim: int = 2048,
         audio_positional_embedding_max_pos: list[int] | None = None,
         av_ca_timestep_scale_multiplier: int = 1,
-        rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+        rope_type: LTXRopeType = LTXRopeType.SPLIT,
         double_precision_rope: bool = False,
         apply_gated_attention: bool = False,
         caption_projection: torch.nn.Module | None = None,

@@ -36,7 +36,7 @@ from ltx_pipelines.utils.media_io import (
     encode_video,
     get_videostream_metadata,
 )
-from ltx_pipelines.utils.types import ModalitySpec
+from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
 
 
 class RetakePipeline:
@@ -74,6 +74,7 @@ class RetakePipeline:
         registry: Registry | None = None,
         distilled: bool = True,
         torch_compile: bool = False,
+        offload_mode: OffloadMode = OffloadMode.NONE,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
@@ -86,6 +87,7 @@ class RetakePipeline:
             dtype=self.dtype,
             device=self.device,
             registry=registry,
+            offload_mode=offload_mode,
         )
         self.image_conditioner = ImageConditioner(
             checkpoint_path=checkpoint_path,
@@ -107,6 +109,7 @@ class RetakePipeline:
             quantization=quantization,
             registry=registry,
             torch_compile=torch_compile,
+            offload_mode=offload_mode,
         )
         self.video_decoder = VideoDecoder(
             checkpoint_path=checkpoint_path,
@@ -141,7 +144,6 @@ class RetakePipeline:
         regenerate_audio: bool = True,
         enhance_prompt: bool = False,
         tiling_config: TilingConfig | None = None,
-        streaming_prefetch_count: int | None = None,
         max_batch_size: int = 1,
         sigmas: torch.Tensor | None = None,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
@@ -210,7 +212,6 @@ class RetakePipeline:
             prompts_to_encode,
             enhance_first_prompt=enhance_prompt,
             enhance_prompt_seed=seed,
-            streaming_prefetch_count=streaming_prefetch_count,
         )
 
         v_context_p, a_context_p = contexts[0].video_encoding, contexts[0].audio_encoding
@@ -269,7 +270,6 @@ class RetakePipeline:
             fps=output_shape.fps,
             video=video_modality_spec,
             audio=audio_modality_spec,
-            streaming_prefetch_count=streaming_prefetch_count,
             max_batch_size=max_batch_size,
         )
 
@@ -307,8 +307,9 @@ def main() -> None:
         gemma_root=args.gemma_root,
         loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
-        distilled=args.distilled,
+        distilled=True,
         torch_compile=args.compile,
+        offload_mode=args.offload_mode,
     )
     params = detect_params(args.distilled_checkpoint_path)
     tiling_config = TilingConfig.default()
@@ -321,7 +322,6 @@ def main() -> None:
         video_guider_params=params.video_guider_params,
         audio_guider_params=params.audio_guider_params,
         tiling_config=tiling_config,
-        streaming_prefetch_count=args.streaming_prefetch_count,
         max_batch_size=args.max_batch_size,
     )
     video_chunks_number = get_video_chunks_number(src.frames, tiling_config)

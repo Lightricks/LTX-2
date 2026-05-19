@@ -13,12 +13,14 @@ Can be used as a standalone script:
 
 import json
 import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import torch
 import typer
+from accelerate import PartialState
 from rich.console import Console
 from rich.progress import (
     BarColumn,
@@ -30,7 +32,7 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from transformers.utils.logging import disable_progress_bar
 
 from ltx_trainer import logger
@@ -232,9 +234,14 @@ def compute_captions_embeddings(  # noqa: PLR0913
     batch_size: int = 8,
     device: str = "cuda",
     load_in_8bit: bool = False,
+    overwrite: bool = False,
 ) -> None:
     """
     Process captions and save text embeddings.
+    Under ``accelerate launch``, each process handles an interleaved shard of
+    the dataset (rank/world read from ``accelerate.PartialState``). Already-
+    computed ``.pt`` outputs are skipped unless ``overwrite=True``; writes are
+    atomic so an interrupted run is safe to resume.
     Args:
         dataset_file: Path to metadata file (CSV/JSON/JSONL) containing captions and media paths
         output_dir: Directory to save embeddings
@@ -247,11 +254,12 @@ def compute_captions_embeddings(  # noqa: PLR0913
         batch_size: Batch size for processing
         device: Device to use for computation
         load_in_8bit: Whether to load the Gemma text encoder in 8-bit precision
+        overwrite: Re-encode every item even if its output exists. Use when rerunning with
+            changed parameters (different text encoder, lora_trigger, etc.) so stale
+            outputs are replaced.
     """
-
     console = Console()
 
-    # Create dataset
     dataset = CaptionsDataset(
         dataset_file=dataset_file,
         caption_column=caption_column,
@@ -263,6 +271,24 @@ def compute_captions_embeddings(  # noqa: PLR0913
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
+
+    # TODO(batch-tokenization): The current Gemma tokenizer doesn't support batched tokenization.
+    if batch_size > 1:
+        logger.warning(
+            "Batch size greater than 1 is not currently supported with the Gemma tokenizer. "
+            "Overriding batch_size to 1. This will be fixed in a future update."
+        )
+        batch_size = 1
+
+    dataloader = _build_sharded_dataloader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=2,
+        is_done=lambda idx: (output_path / dataset.output_paths[idx]).is_file(),
+        overwrite=overwrite,
+    )
+    if dataloader is None:
+        return
 
     # Load text encoder and embeddings processor
     with console.status("[bold]Loading Gemma text encoder...", spinner="dots"):
@@ -279,21 +305,7 @@ def compute_captions_embeddings(  # noqa: PLR0913
         )
 
     logger.info("Text encoder and embeddings processor loaded successfully")
-
-    # TODO(batch-tokenization): The current Gemma tokenizer doesn't support batched tokenization.
-    if batch_size > 1:
-        logger.warning(
-            "Batch size greater than 1 is not currently supported with the Gemma tokenizer. "
-            "Overriding batch_size to 1. This will be fixed in a future update."
-        )
-        batch_size = 1
-
-    # Create dataloader
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=2)
-
-    # Process batches
-    total_batches = len(dataloader)
-    logger.info(f"Processing captions in {total_batches:,} batches...")
+    logger.info(f"Processing captions in {len(dataloader):,} batches...")
 
     with Progress(
         SpinnerColumn(),
@@ -333,11 +345,44 @@ def compute_captions_embeddings(  # noqa: PLR0913
                         embedding_data["audio_prompt_embeds"] = audio_prompt_embeds[0].cpu().contiguous()
 
                     output_file = output_path / output_rel_path
-                    torch.save(embedding_data, output_file)
+                    _atomic_save(embedding_data, output_file)
 
             progress.advance(task)
 
-    logger.info(f"Processed {len(dataset):,} captions. Embeddings saved to {output_path}")
+    logger.info(f"Processed {len(dataloader.dataset):,} captions -> {output_path}")  # type: ignore[arg-type]
+
+
+def _atomic_save(data: Any, out: Path) -> None:  # noqa: ANN401
+    """Save to ``out`` atomically via per-PID temp file + replace.
+    Crash mid-write leaves an orphan ``.tmp.<pid>`` file that the skip logic
+    ignores. The per-PID suffix makes concurrent writes from multiple ranks
+    collision-free.
+    """
+    tmp = out.with_suffix(f"{out.suffix}.tmp.{os.getpid()}")
+    torch.save(data, tmp)
+    tmp.replace(out)
+
+
+def _build_sharded_dataloader(
+    dataset: Dataset,
+    *,
+    batch_size: int,
+    num_workers: int,
+    is_done: Callable[[int], bool],
+    overwrite: bool,
+) -> DataLoader | None:
+    """Return a DataLoader over this rank's interleaved shard of ``dataset``.
+    When ``overwrite`` is False, items whose outputs already exist (per
+    ``is_done``) are filtered out. Returns ``None`` if this rank has nothing
+    to do, so the caller can early-return without loading any models.
+    """
+    state = PartialState()
+    todo = [i for i in range(state.process_index, len(dataset), state.num_processes) if overwrite or not is_done(i)]
+    if not todo:
+        logger.info(f"Rank {state.process_index}/{state.num_processes}: nothing to do")
+        return None
+    logger.info(f"Rank {state.process_index}/{state.num_processes}: processing {len(todo):,} of {len(dataset):,} items")
+    return DataLoader(Subset(dataset, todo), batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
 
 @app.command()
@@ -387,8 +432,15 @@ def main(  # noqa: PLR0913
         default=False,
         help="Load the Gemma text encoder in 8-bit precision to save GPU memory (requires bitsandbytes)",
     ),
+    overwrite: bool = typer.Option(
+        default=False,
+        help="Re-encode every caption even if its output exists. Use when rerunning with "
+        "changed parameters (different text encoder, lora_trigger, etc.) so stale outputs are replaced.",
+    ),
 ) -> None:
     """Process text captions and save embeddings for video generation training.
+    For multi-GPU preprocessing, invoke under ``accelerate launch`` - each process
+    will handle an interleaved shard of the dataset.
     This script processes captions from metadata files and saves text embeddings
     that can be used for training video generation models. The output embeddings
     will maintain the same folder structure and naming as the corresponding media files.
@@ -428,6 +480,7 @@ def main(  # noqa: PLR0913
         batch_size=batch_size,
         device=device,
         load_in_8bit=load_text_encoder_in_8bit,
+        overwrite=overwrite,
     )
 
 

@@ -1,4 +1,11 @@
+from enum import Enum
+
 from transformers import AutoTokenizer
+
+
+class PaddingSide(str, Enum):
+    LEFT = "left"
+    RIGHT = "right"
 
 
 class LTXVGemmaTokenizer:
@@ -8,18 +15,18 @@ class LTXVGemmaTokenizer:
     ensuring correct settings and output formatting for downstream consumption.
     """
 
-    def __init__(self, tokenizer_path: str, max_length: int = 256):
+    def __init__(self, tokenizer_path: str, max_length: int = 256, padding_side: PaddingSide = PaddingSide.LEFT):
         """
         Initialize the tokenizer.
         Args:
             tokenizer_path (str): Path to the pretrained tokenizer files or model directory.
             max_length (int, optional): Max sequence length for encoding. Defaults to 256.
+            padding_side (PaddingSide, optional): Side to pad on. Defaults to ``PaddingSide.LEFT``.
         """
         self.tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_path, local_files_only=True, model_max_length=max_length
         )
-        # Gemma expects left padding for chat-style prompts; for plain text it doesn't matter much.
-        self.tokenizer.padding_side = "left"
+        self.tokenizer.padding_side = padding_side.value
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 

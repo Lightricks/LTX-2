@@ -17,12 +17,20 @@ class VideoConditionByKeyframeIndex(ConditioningItem):
         keyframes: Keyframe latents [B, C, F, H, W].
         frame_idx: Frame index offset for positional encoding.
         strength: Conditioning strength (1.0 = clean, 0.0 = fully denoised).
+        num_pixel_frames: Number of pixel frames the keyframe latent originally encodes.
     """
 
-    def __init__(self, keyframes: torch.Tensor, frame_idx: int, strength: float):
+    def __init__(
+        self,
+        keyframes: torch.Tensor,
+        frame_idx: int,
+        strength: float,
+        num_pixel_frames: int = 1,
+    ):
         self.keyframes = keyframes
         self.frame_idx = frame_idx
         self.strength = strength
+        self.num_pixel_frames = num_pixel_frames
 
     def apply_to(
         self,
@@ -41,6 +49,11 @@ class VideoConditionByKeyframeIndex(ConditioningItem):
         )
 
         positions[:, 0, ...] += self.frame_idx
+        # If the keyframe latent encodes a single pixel frame,
+        # narrow the temporal end to [start, start + 1) instead of the
+        # VAE-scaled range.
+        if self.num_pixel_frames == 1:
+            positions[:, 0, ..., 1:] = positions[:, 0, ..., :1] + 1
         positions = positions.to(dtype=torch.float32)
         positions[:, 0, ...] /= latent_tools.fps
 

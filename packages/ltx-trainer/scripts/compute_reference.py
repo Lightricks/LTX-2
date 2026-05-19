@@ -241,8 +241,8 @@ def main(
         help="Path to input video/image file or directory containing media files",
         exists=True,
     ),
-    output: Path | None = typer.Option(  # noqa: B008
-        None,
+    output: Path = typer.Option(  # noqa: B008
+        ...,
         "--output",
         "-o",
         help="Path to json output file for reference video paths. "

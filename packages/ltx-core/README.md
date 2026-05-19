@@ -77,13 +77,17 @@ model = builder.build(device=torch.device("cuda"))
 Use the `.lora()` method to attach one or more LoRA adapters before calling `.build()`:
 
 ```python
+from ltx_core.loader import SDOps
+
+lora_sd_ops = SDOps(name="identity").with_matching()  # or a model-specific key-renaming SDOps
+
 builder = (
     SingleGPUModelBuilder(
         model_class_configurator=MyModelConfigurator,
         model_path="/path/to/model.safetensors",
     )
-    .lora("/path/to/lora_a.safetensors", strength=0.8)
-    .lora("/path/to/lora_b.safetensors", strength=0.5)
+    .lora("/path/to/lora_a.safetensors", 0.8, lora_sd_ops)
+    .lora("/path/to/lora_b.safetensors", 0.5, lora_sd_ops)
 )
 model = builder.build(device=torch.device("cuda"))
 ```
@@ -103,7 +107,7 @@ builder = SingleGPUModelBuilder(
     model_class_configurator=MyModelConfigurator,
     model_path="/path/to/model.safetensors",
     lora_load_device=torch.device("cuda"),
-).lora("/path/to/lora.safetensors", strength=1.0)
+).lora("/path/to/lora.safetensors", 1.0, lora_sd_ops)
 
 model = builder.build(device=torch.device("cuda"))
 ```

@@ -16,9 +16,10 @@ class LTXRopeType(Enum):
 def apply_rotary_emb(
     input_tensor: torch.Tensor,
     freqs_cis: Tuple[torch.Tensor, torch.Tensor],
-    rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+    rope_type: LTXRopeType = LTXRopeType.SPLIT,
 ) -> torch.Tensor:
     if rope_type == LTXRopeType.INTERLEAVED:
+        # Note: INTERLEAVED rope is a legacy mode. Prefer SPLIT instead.
         return apply_interleaved_rotary_emb(input_tensor, *freqs_cis)
     elif rope_type == LTXRopeType.SPLIT:
         return apply_split_rotary_emb(input_tensor, *freqs_cis)
@@ -45,6 +46,11 @@ def apply_split_rotary_emb(
     needs_reshape = False
     if input_tensor.ndim != 4 and cos_freqs.ndim == 4:
         b, h, t, _ = cos_freqs.shape
+        if input_tensor.shape[0] != b:
+            raise ValueError(
+                f"apply_split_rotary_emb: input_tensor batch ({input_tensor.shape[0]}) "
+                f"must equal cos_freqs batch ({b})."
+            )
         input_tensor = input_tensor.reshape(b, t, h, -1).swapaxes(1, 2)
         needs_reshape = True
 
@@ -183,7 +189,7 @@ def precompute_freqs_cis(
     max_pos: list[int] | None = None,
     use_middle_indices_grid: bool = False,
     num_attention_heads: int = 32,
-    rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+    rope_type: LTXRopeType = LTXRopeType.SPLIT,
     freq_grid_generator: Callable[[float, int, int, torch.device], torch.Tensor] = generate_freq_grid_pytorch,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if max_pos is None:

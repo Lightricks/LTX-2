@@ -6,7 +6,7 @@ from typing import Callable
 import torch
 from tqdm import tqdm
 
-from ltx_core.components.diffusion_steps import Res2sDiffusionStep
+from ltx_core.components.diffusion_steps import EulerCfgPpDiffusionStep, Res2sDiffusionStep
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.model.transformer import X0Model
 from ltx_core.utils import to_denoised, to_velocity
@@ -60,13 +60,15 @@ def euler_denoising_loop(
     denoiser:
         A callable implementing :class:`Denoiser`. It is invoked as
         ``denoiser(transformer, video_state, audio_state, sigmas, step_index)``
-        and must return ``(denoised_video, denoised_audio)``.
+        and must return a :class:`~ltx_pipelines.utils.types.DenoisedLatentResult`.
     ### Returns
     tuple[LatentState | None, LatentState | None]
         Final ``(video_state, audio_state)`` after the denoising loop.
     """
     for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
-        denoised_video, denoised_audio = denoiser(transformer, video_state, audio_state, sigmas, step_idx)
+        video_result, audio_result = denoiser(transformer, video_state, audio_state, sigmas, step_idx)
+        denoised_video = video_result.denoised if video_result is not None else None
+        denoised_audio = audio_result.denoised if audio_result is not None else None
 
         video_state = _step_state(video_state, denoised_video, stepper, sigmas, step_idx)
         audio_state = _step_state(audio_state, denoised_audio, stepper, sigmas, step_idx)
@@ -110,7 +112,9 @@ def gradient_estimating_euler_denoising_loop(
         return current_velocity, denoised_sample
 
     for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
-        denoised_video, denoised_audio = denoiser(transformer, video_state, audio_state, sigmas, step_idx)
+        video_result, audio_result = denoiser(transformer, video_state, audio_state, sigmas, step_idx)
+        denoised_video = video_result.denoised if video_result is not None else None
+        denoised_audio = audio_result.denoised if audio_result is not None else None
 
         if video_state is not None and denoised_video is not None:
             denoised_video = post_process_latent(denoised_video, video_state.denoise_mask, video_state.clean_latent)
@@ -141,6 +145,11 @@ def gradient_estimating_euler_denoising_loop(
             )
 
     return (video_state, audio_state)
+
+
+def _get_plain_noise(x: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
+    """Draw standard Gaussian noise matching the shape, dtype, and device of ``x``."""
+    return torch.randn(x.shape, generator=generator, dtype=x.dtype, device=x.device)
 
 
 def _channelwise_normalize(x: torch.Tensor) -> torch.Tensor:
@@ -278,7 +287,9 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
         # ====================================================================
         # STAGE 1: Evaluate at current point
         # ====================================================================
-        denoised_video_1, denoised_audio_1 = denoiser(transformer, video_state, audio_state, sigmas, step_idx)
+        video_result, audio_result = denoiser(transformer, video_state, audio_state, sigmas, step_idx)
+        denoised_video_1 = video_result.denoised if video_result is not None else None
+        denoised_audio_1 = audio_result.denoised if audio_result is not None else None
         if video_state is not None and denoised_video_1 is not None:
             denoised_video_1 = post_process_latent(denoised_video_1, video_state.denoise_mask, video_state.clean_latent)
         if audio_state is not None and denoised_audio_1 is not None:
@@ -355,13 +366,15 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
             else None
         )
 
-        denoised_video_2, denoised_audio_2 = denoiser(
+        video_result_2, audio_result_2 = denoiser(
             transformer,
             video_state=mid_video_state,
             audio_state=mid_audio_state,
             sigmas=torch.stack([sub_sigma]).to(sigmas.device),
             step_index=0,
         )
+        denoised_video_2 = video_result_2.denoised if video_result_2 is not None else None
+        denoised_audio_2 = audio_result_2.denoised if audio_result_2 is not None else None
         if video_state is not None and denoised_video_2 is not None:
             denoised_video_2 = post_process_latent(denoised_video_2, video_state.denoise_mask, video_state.clean_latent)
         if audio_state is not None and denoised_audio_2 is not None:
@@ -410,12 +423,132 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
 
     # Final step if we need to fully remove the noise
     if sigmas[-1] == 0:
-        denoised_video_1, denoised_audio_1 = denoiser(transformer, video_state, audio_state, sigmas, n_full_steps)
+        video_result_final, audio_result_final = denoiser(transformer, video_state, audio_state, sigmas, n_full_steps)
+        denoised_video_1 = video_result_final.denoised if video_result_final is not None else None
+        denoised_audio_1 = audio_result_final.denoised if audio_result_final is not None else None
         if video_state is not None and denoised_video_1 is not None:
             denoised_video_1 = post_process_latent(denoised_video_1, video_state.denoise_mask, video_state.clean_latent)
             video_state = replace(video_state, latent=denoised_video_1.to(model_dtype))
         if audio_state is not None and denoised_audio_1 is not None:
             denoised_audio_1 = post_process_latent(denoised_audio_1, audio_state.denoise_mask, audio_state.clean_latent)
             audio_state = replace(audio_state, latent=denoised_audio_1.to(model_dtype))
+
+    return video_state, audio_state
+
+
+def euler_cfg_pp_denoising_loop(
+    sigmas: torch.Tensor,
+    video_state: LatentState | None,
+    audio_state: LatentState | None,
+    stepper: EulerCfgPpDiffusionStep,
+    transformer: X0Model,
+    denoiser: Denoiser,
+    noise_seed: int = -1,
+    new_noise_fn: Callable[[torch.Tensor, torch.Generator], torch.Tensor] = _get_plain_noise,
+    model_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[LatentState | None, LatentState | None]:
+    """
+    Joint audio-video denoising loop using the CFG++ corrected Euler sampler.
+    Applies the CFG++ update rule at each step: the ODE derivative is computed
+    from the unconditioned denoised prediction rather than the standard velocity,
+    and an ancestral DDIM noise injection is applied in the rescaled sigma space.
+    Requires a guided denoiser whose :class:`~ltx_pipelines.utils.types.DenoisedLatentResult`
+    carries ``uncond`` tensors (i.e. CFG must be enabled).
+    Either ``video_state`` or ``audio_state`` may be ``None`` for absent modalities.
+    When both are present, noise is drawn from the same seeded generator (video
+    first, audio second) to produce a consistent random sequence.
+    ### Parameters
+    sigmas:
+        1-D tensor of noise levels defining the sampling schedule.
+    video_state:
+        Current video :class:`~ltx_core.types.LatentState`, or ``None``.
+    audio_state:
+        Current audio :class:`~ltx_core.types.LatentState`, or ``None``.
+    stepper:
+        :class:`~ltx_core.components.diffusion_steps.EulerCfgPpDiffusionStep`
+        instance carrying ``eta`` and ``s_noise`` parameters.
+    transformer:
+        The diffusion model passed to the denoiser at each step.
+    denoiser:
+        Callable implementing :class:`~ltx_pipelines.utils.types.Denoiser`.
+    noise_seed:
+        Integer seed for the noise generator. Default ``-1``.
+    new_noise_fn:
+        ``(latent, generator) -> noise`` callable. Defaults to plain
+        ``torch.randn`` (no channel-wise normalization). Pass
+        :func:`_get_new_noise` for the normalized variant used in res2s.
+    model_dtype:
+        Dtype for latent state updates. Default ``bfloat16``.
+    ### Returns
+    tuple[LatentState | None, LatentState | None]
+        Final ``(video_state, audio_state)`` after the denoising loop.
+    """
+    if not isinstance(stepper, EulerCfgPpDiffusionStep):
+        raise ValueError(f"stepper must be an instance of EulerCfgPpDiffusionStep, got {type(stepper).__name__}")
+
+    present_state = video_state or audio_state
+    if present_state is None:
+        raise ValueError("At least one of video_state or audio_state must be provided")
+
+    generator = torch.Generator(device=present_state.latent.device).manual_seed(noise_seed)
+    draw_noise = stepper.eta > 0 and stepper.s_noise > 0
+
+    for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
+        video_result, audio_result = denoiser(transformer, video_state, audio_state, sigmas, step_idx)
+        denoised_video = video_result.denoised if video_result is not None else None
+        denoised_audio = audio_result.denoised if audio_result is not None else None
+        uncond_video = video_result.uncond if video_result is not None else None
+        uncond_audio = audio_result.uncond if audio_result is not None else None
+
+        if video_state is not None and not isinstance(uncond_video, torch.Tensor):
+            raise ValueError(
+                "euler_cfg_pp_denoising_loop requires video DenoisedLatentResult.uncond to be a tensor. "
+                "Use GuidedDenoiser or FactoryGuidedDenoiser with cfg_scale != 1 "
+                "or force_uncond_pass=True and a negative_context."
+            )
+        if audio_state is not None and not isinstance(uncond_audio, torch.Tensor):
+            raise ValueError(
+                "euler_cfg_pp_denoising_loop requires audio DenoisedLatentResult.uncond to be a tensor. "
+                "Use GuidedDenoiser or FactoryGuidedDenoiser with cfg_scale != 1 "
+                "or force_uncond_pass=True and a negative_context."
+            )
+
+        if video_state is not None and denoised_video is not None:
+            denoised_video = post_process_latent(denoised_video, video_state.denoise_mask, video_state.clean_latent)
+        if audio_state is not None and denoised_audio is not None:
+            denoised_audio = post_process_latent(denoised_audio, audio_state.denoise_mask, audio_state.clean_latent)
+
+        if sigmas[step_idx + 1] == 0:
+            if video_state is not None and denoised_video is not None:
+                video_state = replace(video_state, latent=denoised_video.to(model_dtype))
+            if audio_state is not None and denoised_audio is not None:
+                audio_state = replace(audio_state, latent=denoised_audio.to(model_dtype))
+            return video_state, audio_state
+
+        # Draw noise consecutively from the same generator: video first, audio second.
+        noise_video = new_noise_fn(video_state.latent, generator) if (video_state is not None and draw_noise) else None
+        noise_audio = new_noise_fn(audio_state.latent, generator) if (audio_state is not None and draw_noise) else None
+
+        if video_state is not None and denoised_video is not None:
+            x_next = stepper.step(
+                sample=video_state.latent,
+                denoised_sample=denoised_video,
+                sigmas=sigmas,
+                step_index=step_idx,
+                uncond_denoised=uncond_video,
+                noise=noise_video,
+            )
+            video_state = replace(video_state, latent=x_next.to(model_dtype))
+
+        if audio_state is not None and denoised_audio is not None:
+            x_next = stepper.step(
+                sample=audio_state.latent,
+                denoised_sample=denoised_audio,
+                sigmas=sigmas,
+                step_index=step_idx,
+                uncond_denoised=uncond_audio,
+                noise=noise_audio,
+            )
+            audio_state = replace(audio_state, latent=x_next.to(model_dtype))
 
     return video_state, audio_state

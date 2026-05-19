@@ -27,7 +27,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
         idx: int,
         video: TransformerConfig | None = None,
         audio: TransformerConfig | None = None,
-        rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+        rope_type: LTXRopeType = LTXRopeType.SPLIT,
         norm_eps: float = 1e-6,
         attention_function: AttentionFunction | AttentionCallable = AttentionFunction.DEFAULT,
     ):

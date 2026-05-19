@@ -33,7 +33,7 @@ from ltx_pipelines.utils.helpers import (
 )
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.samplers import res2s_audio_video_denoising_loop
-from ltx_pipelines.utils.types import ModalitySpec
+from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
 
 
 class TI2VidTwoStagesHQPipeline:
@@ -61,6 +61,7 @@ class TI2VidTwoStagesHQPipeline:
         quantization: QuantizationPolicy | None = None,
         registry: Registry | None = None,
         torch_compile: bool = False,
+        offload_mode: OffloadMode = OffloadMode.NONE,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
@@ -77,7 +78,9 @@ class TI2VidTwoStagesHQPipeline:
             sd_ops=distilled_lora[0].sd_ops,
         )
 
-        self.prompt_encoder = PromptEncoder(checkpoint_path, gemma_root, self.dtype, self.device, registry=registry)
+        self.prompt_encoder = PromptEncoder(
+            checkpoint_path, gemma_root, self.dtype, self.device, registry=registry, offload_mode=offload_mode
+        )
         self.image_conditioner = ImageConditioner(checkpoint_path, self.dtype, self.device, registry=registry)
         self.upsampler = VideoUpsampler(
             checkpoint_path, spatial_upsampler_path, self.dtype, self.device, registry=registry
@@ -93,6 +96,7 @@ class TI2VidTwoStagesHQPipeline:
             quantization=quantization,
             registry=registry,
             torch_compile=torch_compile,
+            offload_mode=offload_mode,
         )
         self.stage_2 = DiffusionStage(
             checkpoint_path,
@@ -102,6 +106,7 @@ class TI2VidTwoStagesHQPipeline:
             quantization=quantization,
             registry=registry,
             torch_compile=torch_compile,
+            offload_mode=offload_mode,
         )
 
     @torch.inference_mode()
@@ -120,7 +125,6 @@ class TI2VidTwoStagesHQPipeline:
         images: list[ImageConditioningInput],
         tiling_config: TilingConfig | None = None,
         enhance_prompt: bool = False,
-        streaming_prefetch_count: int | None = None,
         max_batch_size: int = 1,
         stage_1_sigmas: torch.Tensor | None = None,
         stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
@@ -136,7 +140,6 @@ class TI2VidTwoStagesHQPipeline:
             enhance_first_prompt=enhance_prompt,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
             enhance_prompt_seed=seed,
-            streaming_prefetch_count=streaming_prefetch_count,
         )
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
@@ -190,7 +193,6 @@ class TI2VidTwoStagesHQPipeline:
             video=ModalitySpec(context=v_context_p, conditionings=stage_1_conditionings),
             audio=ModalitySpec(context=a_context_p),
             loop=res2s_audio_video_denoising_loop,
-            streaming_prefetch_count=streaming_prefetch_count,
             max_batch_size=max_batch_size,
         )
 
@@ -231,7 +233,6 @@ class TI2VidTwoStagesHQPipeline:
                 initial_latent=audio_state.latent,
             ),
             loop=res2s_audio_video_denoising_loop,
-            streaming_prefetch_count=streaming_prefetch_count,
         )
 
         decoded_video = self.video_decoder(video_state.latent, tiling_config, generator)
@@ -254,6 +255,7 @@ def main() -> None:
         loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
         torch_compile=args.compile,
+        offload_mode=args.offload_mode,
     )
     tiling_config = TilingConfig.default()
     video_chunks_number = get_video_chunks_number(args.num_frames, tiling_config)
@@ -284,7 +286,6 @@ def main() -> None:
         ),
         images=args.images,
         tiling_config=tiling_config,
-        streaming_prefetch_count=args.streaming_prefetch_count,
         max_batch_size=args.max_batch_size,
     )
 

@@ -12,6 +12,7 @@ Example usage:
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -22,7 +23,11 @@ from ltx_core.text_encoders.gemma.encoders.base_encoder import GemmaTextEncoder
 from ltx_core.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
 
 
-def load_8bit_gemma(gemma_model_path: str | Path, dtype: torch.dtype = torch.bfloat16) -> GemmaTextEncoder:
+def load_8bit_gemma(
+    gemma_model_path: str | Path,
+    dtype: torch.dtype = torch.bfloat16,
+    device: torch.device | str | int | None = None,
+) -> GemmaTextEncoder:
     """Load the Gemma text encoder in 8-bit precision using bitsandbytes.
     Only the Gemma LLM backbone is loaded here.  The embeddings processor
     (feature extractor + connectors) should be loaded separately via
@@ -30,6 +35,10 @@ def load_8bit_gemma(gemma_model_path: str | Path, dtype: torch.dtype = torch.bfl
     Args:
         gemma_model_path: Path to Gemma model directory
         dtype: Data type for non-quantized model weights
+        device: Device to place the quantized model on. When ``None`` (default),
+            the device is inferred from ``LOCAL_RANK`` if CUDA is available, so
+            multi-process launches put each rank's encoder on its own GPU
+            instead of all colliding on ``cuda:0``.
     Returns:
         GemmaTextEncoder with 8-bit quantized Gemma backbone
     Raises:
@@ -46,13 +55,23 @@ def load_8bit_gemma(gemma_model_path: str | Path, dtype: torch.dtype = torch.bfl
     gemma_path = _find_gemma_subpath(gemma_model_path, "model*.safetensors")
     tokenizer_path = _find_gemma_subpath(gemma_model_path, "tokenizer.model")
 
+    # Pin the entire model to a single device. `device_map="auto"` collides on cuda:0
+    # in multi-process launches because every rank picks the same default device.
+    device_map: str | dict[str, int | str | torch.device]
+    if device is not None:
+        device_map = {"": device}
+    elif torch.cuda.is_available():
+        device_map = {"": int(os.environ.get("LOCAL_RANK", "0"))}
+    else:
+        device_map = "auto"
+
     quantization_config = BitsAndBytesConfig(load_in_8bit=True)
     with _suppress_accelerate_memory_warnings():
         gemma_model = Gemma3ForConditionalGeneration.from_pretrained(
             gemma_path,
             quantization_config=quantization_config,
             torch_dtype=torch.bfloat16,
-            device_map="auto",
+            device_map=device_map,
             local_files_only=True,
         )
 

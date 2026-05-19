@@ -27,6 +27,7 @@ tmp
 *.sft
 
 # Media files
+*.exr
 *.gif
 *.heic
 *.heif
@@ -39,6 +40,10 @@ tmp
 *.png
 *.wav
 *.webp
+
+# HDR IC-LoRA e2e test baseline (checked in via Git LFS)
+!packages/ltx-pipelines/tests/assets/expected_hdr_ic_lora_exr/frame_*.exr
+!packages/ltx-pipelines/tests/assets/hdr_ic_lora_test_input.mp4
 
 # Binary files
 *.so

@@ -1,5 +1,5 @@
 """Batch-splitting adapter for the transformer.
-Wraps an ``X0Model`` (or ``LayerStreamingWrapper``) and splits batched inputs
+Wraps an ``X0Model`` (or ``BlockStreamingWrapper``) and splits batched inputs
 into smaller chunks before forwarding, then concatenates the results. This
 controls peak activation memory at the cost of more forward passes.
 The adapter is transparent — it has the same ``forward`` signature as
@@ -42,7 +42,7 @@ class BatchSplitAdapter(nn.Module):
     Has the same ``forward`` signature as ``X0Model``:
     ``(video, audio, perturbations) -> (denoised_video, denoised_audio)``.
     Args:
-        model: The model to wrap (``X0Model``, ``LayerStreamingWrapper``, etc.).
+        model: The model to wrap (``X0Model``, ``BlockStreamingWrapper``, etc.).
         max_batch_size: Maximum batch size per forward pass. Input batches
             larger than this are split into sequential chunks.
     """

@@ -20,6 +20,7 @@ from ltx_core.guidance.perturbations import (
 from ltx_core.model.transformer import X0Model
 from ltx_core.types import LatentState
 from ltx_pipelines.utils.helpers import modality_from_latent_state
+from ltx_pipelines.utils.types import DenoisedLatentResult
 
 _POSITIVE_ONLY_GUIDER = MultiModalGuider(
     params=MultiModalGuiderParams(cfg_scale=1.0, stg_scale=0.0, modality_scale=1.0),
@@ -53,7 +54,7 @@ def _repeat_state(state: LatentState, n: int) -> LatentState:
     )
 
 
-def _guided_denoise(  # noqa: PLR0913
+def _guided_denoise(  # noqa: PLR0913,PLR0915
     transformer: X0Model,
     video_state: LatentState | None,
     audio_state: LatentState | None,
@@ -66,7 +67,8 @@ def _guided_denoise(  # noqa: PLR0913
     last_denoised_video: torch.Tensor | None,
     last_denoised_audio: torch.Tensor | None,
     step_index: int,
-) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    force_uncond_pass: bool = False,
+) -> tuple[DenoisedLatentResult | None, DenoisedLatentResult | None]:
     """Core guided denoising — batches all guidance passes into one transformer call.
     Collects per-pass contexts first, then builds a single batched Modality
     per present modality via :func:`modality_from_latent_state`.  When wrapped
@@ -80,7 +82,9 @@ def _guided_denoise(  # noqa: PLR0913
     a_skip = audio_guider.should_skip_step(step_index)
 
     if v_skip and a_skip:
-        return last_denoised_video, last_denoised_audio
+        video_result = DenoisedLatentResult.result_or_none(denoised=last_denoised_video)
+        audio_result = DenoisedLatentResult.result_or_none(denoised=last_denoised_audio)
+        return video_result, audio_result
 
     if video_state is not None and v_context is None:
         raise ValueError("v_context is required when video_state is provided")
@@ -91,10 +95,12 @@ def _guided_denoise(  # noqa: PLR0913
     _pass = tuple[str, torch.Tensor | None, torch.Tensor | None, PerturbationConfig]
     passes: list[_pass] = [("cond", v_context, a_context, PerturbationConfig.empty())]
 
-    if video_guider.do_unconditional_generation() or audio_guider.do_unconditional_generation():
-        if video_guider.do_unconditional_generation() and video_guider.negative_context is None:
+    v_needs_neg = video_guider.do_unconditional_generation() or (force_uncond_pass and video_state is not None)
+    a_needs_neg = audio_guider.do_unconditional_generation() or (force_uncond_pass and audio_state is not None)
+    if v_needs_neg or a_needs_neg:
+        if v_needs_neg and video_guider.negative_context is None:
             raise ValueError("Negative context is required for unconditioned denoising")
-        if audio_guider.do_unconditional_generation() and audio_guider.negative_context is None:
+        if a_needs_neg and audio_guider.negative_context is None:
             raise ValueError("Negative context is required for unconditioned denoising")
         v_neg = video_guider.negative_context if video_guider.negative_context is not None else v_context
         a_neg = audio_guider.negative_context if audio_guider.negative_context is not None else a_context
@@ -172,7 +178,14 @@ def _guided_denoise(  # noqa: PLR0913
 
     denoised_video = last_denoised_video if v_skip else video_guider.calculate(cond_v, uncond_v, ptb_v, mod_v)
     denoised_audio = last_denoised_audio if a_skip else audio_guider.calculate(cond_a, uncond_a, ptb_a, mod_a)
-    return denoised_video, denoised_audio
+    return (
+        DenoisedLatentResult.result_or_none(
+            denoised=denoised_video, uncond=uncond_v, cond=cond_v, ptb=ptb_v, mod=mod_v
+        ),
+        DenoisedLatentResult.result_or_none(
+            denoised=denoised_audio, uncond=uncond_a, cond=cond_a, ptb=ptb_a, mod=mod_a
+        ),
+    )
 
 
 class SimpleDenoiser:
@@ -195,11 +208,15 @@ class SimpleDenoiser:
         audio_state: LatentState | None,
         sigmas: torch.Tensor,
         step_index: int,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[DenoisedLatentResult | None, DenoisedLatentResult | None]:
         sigma = sigmas[step_index]
         pos_video = modality_from_latent_state(video_state, self.v_context, sigma) if video_state is not None else None
         pos_audio = modality_from_latent_state(audio_state, self.a_context, sigma) if audio_state is not None else None
-        return transformer(video=pos_video, audio=pos_audio, perturbations=None)
+        denoised_video, denoised_audio = transformer(video=pos_video, audio=pos_audio, perturbations=None)
+        return (
+            DenoisedLatentResult.result_or_none(denoised=denoised_video),
+            DenoisedLatentResult.result_or_none(denoised=denoised_audio),
+        )
 
 
 class GuidedDenoiser:
@@ -214,11 +231,13 @@ class GuidedDenoiser:
         a_context: torch.Tensor | None,
         video_guider: MultiModalGuider | None = None,
         audio_guider: MultiModalGuider | None = None,
+        force_uncond_pass: bool = False,
     ) -> None:
         self.v_context = v_context
         self.a_context = a_context
         self.video_guider = video_guider
         self.audio_guider = audio_guider
+        self.force_uncond_pass = force_uncond_pass
         self._last_denoised_video: torch.Tensor | None = None
         self._last_denoised_audio: torch.Tensor | None = None
 
@@ -229,8 +248,8 @@ class GuidedDenoiser:
         audio_state: LatentState | None,
         sigmas: torch.Tensor,
         step_index: int,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        denoised_video, denoised_audio = _guided_denoise(
+    ) -> tuple[DenoisedLatentResult | None, DenoisedLatentResult | None]:
+        guided_denoise_result_v, guided_denoise_result_a = _guided_denoise(
             transformer=transformer,
             video_state=video_state,
             audio_state=audio_state,
@@ -242,10 +261,11 @@ class GuidedDenoiser:
             last_denoised_video=self._last_denoised_video,
             last_denoised_audio=self._last_denoised_audio,
             step_index=step_index,
+            force_uncond_pass=self.force_uncond_pass,
         )
-        self._last_denoised_video = denoised_video
-        self._last_denoised_audio = denoised_audio
-        return denoised_video, denoised_audio
+        self._last_denoised_video = guided_denoise_result_v.denoised
+        self._last_denoised_audio = guided_denoise_result_a.denoised
+        return guided_denoise_result_v, guided_denoise_result_a
 
 
 class FactoryGuidedDenoiser:
@@ -257,11 +277,13 @@ class FactoryGuidedDenoiser:
         a_context: torch.Tensor | None,
         video_guider_factory: MultiModalGuiderFactory | None = None,
         audio_guider_factory: MultiModalGuiderFactory | None = None,
+        force_uncond_pass: bool = False,
     ) -> None:
         self.v_context = v_context
         self.a_context = a_context
         self.video_guider_factory = video_guider_factory
         self.audio_guider_factory = audio_guider_factory
+        self.force_uncond_pass = force_uncond_pass
         self._last_denoised_video: torch.Tensor | None = None
         self._last_denoised_audio: torch.Tensor | None = None
         self._sigma_vals_cached: list[float] | None = None
@@ -273,7 +295,7 @@ class FactoryGuidedDenoiser:
         audio_state: LatentState | None,
         sigmas: torch.Tensor,
         step_index: int,
-    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    ) -> tuple[DenoisedLatentResult | None, DenoisedLatentResult | None]:
         if self._sigma_vals_cached is None:
             self._sigma_vals_cached = sigmas.detach().cpu().tolist()
         sigma_val = self._sigma_vals_cached[step_index]
@@ -287,7 +309,7 @@ class FactoryGuidedDenoiser:
             else None
         )
 
-        denoised_video, denoised_audio = _guided_denoise(
+        guided_denoise_result_v, guided_denoise_result_a = _guided_denoise(
             transformer=transformer,
             video_state=video_state,
             audio_state=audio_state,
@@ -299,7 +321,8 @@ class FactoryGuidedDenoiser:
             last_denoised_video=self._last_denoised_video,
             last_denoised_audio=self._last_denoised_audio,
             step_index=step_index,
+            force_uncond_pass=self.force_uncond_pass,
         )
-        self._last_denoised_video = denoised_video
-        self._last_denoised_audio = denoised_audio
-        return denoised_video, denoised_audio
+        self._last_denoised_video = guided_denoise_result_v.denoised
+        self._last_denoised_audio = guided_denoise_result_a.denoised
+        return guided_denoise_result_v, guided_denoise_result_a

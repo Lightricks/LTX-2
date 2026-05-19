@@ -138,7 +138,7 @@ class VideoLatentTools(LatentTools):
             LatentState(
                 latent=initial_latent,
                 denoise_mask=denoise_mask,
-                positions=positions.to(dtype),
+                positions=positions,
                 clean_latent=clean_latent,
             )
         )

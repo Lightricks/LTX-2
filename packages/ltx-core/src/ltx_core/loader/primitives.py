@@ -13,6 +13,10 @@ if TYPE_CHECKING:
     from ltx_core.loader.registry import Registry
 
 
+# Per-key shape and dtype description for a flat collection of tensors.
+TensorLayout = dict[str, tuple[torch.Size, torch.dtype]]
+
+
 @dataclass(frozen=True)
 class StateDict:
     """
@@ -52,7 +56,15 @@ class StateDictLoader(Protocol):
         """
 
 
-class ModelBuilderProtocol(Protocol[ModelType]):
+class BuilderProtocol(Protocol[ModelType]):
+    """Protocol for model builders that produce a model via ``build()``."""
+
+    def build(
+        self, device: torch.device | None = None, dtype: torch.dtype | None = None, **kwargs: object
+    ) -> ModelType: ...
+
+
+class ModelBuilderProtocol(BuilderProtocol[ModelType], Protocol[ModelType]):
     """
     Protocol for building PyTorch models from configuration dictionaries.
     Implementations must provide:

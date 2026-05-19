@@ -1,7 +1,7 @@
 import shutil
 import tempfile
 from pathlib import Path
-from typing import List, Union
+from typing import List, Optional, Union
 
 import imageio
 from huggingface_hub import HfApi, create_repo
@@ -12,7 +12,11 @@ from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
 
 
-def push_to_hub(weights_path: Path, sampled_videos_paths: List[Path], config: LtxTrainerConfig) -> None:
+def push_to_hub(
+    weights_path: Path,
+    sampled_videos_paths: Optional[List[Path]],
+    config: LtxTrainerConfig,
+) -> None:
     """Push the trained LoRA weights to HuggingFace Hub."""
     if not config.hub.hub_model_id:
         logger.warning("⚠️ HuggingFace hub_model_id not specified, skipping push to hub")
@@ -108,7 +112,7 @@ def convert_video_to_gif(video_path: Path, output_path: Path) -> None:
 
 def _create_model_card(
     output_dir: Union[str, Path],
-    videos: List[Path],
+    videos: Optional[List[Path]],
     config: LtxTrainerConfig,
 ) -> Path:
     """Generate and save a model card for the trained model."""

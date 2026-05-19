@@ -1,5 +1,6 @@
 import torch
 
+from ltx_core.loader.kernels import TRITON_AVAILABLE
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.sd_ops import KeyValueOperationResult, SDOps
 from ltx_core.model.transformer.model import LTXModel
@@ -7,8 +8,13 @@ from ltx_core.model.transformer.model import LTXModel
 BLOCK_SIZE = 1024
 
 
-def _fused_add_round_launch(target_weight: torch.Tensor, original_weight: torch.Tensor, seed: int) -> torch.Tensor:
-    # Lazy import triton - only available on CUDA platforms
+def fused_add_round_launch(target_weight: torch.Tensor, original_weight: torch.Tensor, seed: int) -> torch.Tensor:
+    if not TRITON_AVAILABLE:
+        raise RuntimeError(
+            "fused_add_round_launch requires Triton, which is not available on this platform. "
+            "Callers should gate on ltx_core.loader.kernels.TRITON_AVAILABLE and use a "
+            "deterministic-rounding fallback instead."
+        )
     import triton  # noqa: PLC0415
 
     from ltx_core.loader.kernels import fused_add_round_kernel  # noqa: PLC0415
@@ -53,10 +59,13 @@ def _upcast_and_round(
     """
     Upcast the weight to the given dtype and optionally apply stochastic rounding.
     Input weight needs to have float8_e4m3fn or float8_e5m2 dtype.
+    Stochastic rounding is implemented via a Triton kernel. When Triton is not
+    available (e.g., on Windows), this falls back to deterministic (nearest)
+    rounding via ``weight.to(dtype)``.
     """
-    if not with_stochastic_rounding:
+    if not with_stochastic_rounding or not TRITON_AVAILABLE or weight.device.type != "cuda":
         return weight.to(dtype)
-    return _fused_add_round_launch(torch.zeros_like(weight, dtype=dtype), weight, seed)
+    return fused_add_round_launch(torch.zeros_like(weight, dtype=dtype), weight, seed)
 
 
 class Fp8CastLinear(torch.nn.Linear):
@@ -82,14 +91,26 @@ class Fp8CastLinear(torch.nn.Linear):
 def _replace_fwd_with_upcast(layer: torch.nn.Linear, with_stochastic_rounding: bool = False, seed: int = 0) -> None:
     """
     Intended to be applied via __class__ reassignment to existing nn.Linear
-    instances so that their parameter and buffer tensors are preserved in-place,
-    avoiding re-instantiation. Forward remains defined at the class level, which
-    is required for torch.compile compatibility — instance-level closure
-    monkey-patches cause graph breaks.
+    instances. Forward remains defined at the class level, which is required for
+    torch.compile compatibility — instance-level closure monkey-patches cause
+    graph breaks.
+    Also retypes ``weight`` and ``bias`` to fp8 so the meta param dtype matches
+    the post-load tensor dtype (sd_ops downcasts checkpoint bf16 -> fp8 at load).
+    Block streaming relies on this to derive pool buffer layout from the meta
+    model without an eager checkpoint read.
     """
     layer.__class__ = Fp8CastLinear
     layer._with_stochastic_rounding = with_stochastic_rounding
     layer._seed = seed
+    layer.weight = torch.nn.Parameter(
+        torch.empty(layer.weight.shape, dtype=torch.float8_e4m3fn, device=layer.weight.device),
+        requires_grad=layer.weight.requires_grad,
+    )
+    if layer.bias is not None:
+        layer.bias = torch.nn.Parameter(
+            torch.empty(layer.bias.shape, dtype=torch.float8_e4m3fn, device=layer.bias.device),
+            requires_grad=layer.bias.requires_grad,
+        )
 
 
 def _amend_forward_with_upcast(

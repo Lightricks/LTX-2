@@ -64,6 +64,6 @@ class TilingConfig:
     @classmethod
     def default(cls) -> "TilingConfig":
         return cls(
-            spatial_config=SpatialTilingConfig(tile_size_in_pixels=512, tile_overlap_in_pixels=64),
-            temporal_config=TemporalTilingConfig(tile_size_in_frames=64, tile_overlap_in_frames=24),
+            spatial_config=SpatialTilingConfig(tile_size_in_pixels=768, tile_overlap_in_pixels=64),
+            temporal_config=TemporalTilingConfig(tile_size_in_frames=80, tile_overlap_in_frames=24),
         )

@@ -85,6 +85,7 @@ def print_config(config: LtxTrainerConfig) -> None:
                     ("Mixed Precision", accel.mixed_precision_mode or "[dim]—[/]"),
                     ("Quantization", str(accel.quantization) if accel.quantization else "[dim]—[/]"),
                     ("Text Encoder 8bit", fmt(accel.load_text_encoder_in_8bit)),
+                    ("Optimizer CPU Offload", fmt(accel.offload_optimizer_during_validation)),
                 ],
             ),
             (

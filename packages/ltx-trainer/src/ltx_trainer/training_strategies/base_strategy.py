@@ -3,7 +3,6 @@ This module defines the abstract base class that all training strategies must im
 along with the base configuration class.
 """
 
-import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -251,13 +250,17 @@ class TrainingStrategy(ABC):
             device: Target device
             first_frame_conditioning_p: Probability of conditioning on the first frame
         Returns:
-            Boolean mask where True indicates first frame tokens (if conditioning is enabled)
+            Boolean mask where True indicates first frame tokens (if conditioning is enabled).
+            The conditioning decision is drawn independently per batch element so the training
+            signal across samples in a batch is i.i.d.
         """
         conditioning_mask = torch.zeros(batch_size, sequence_length, dtype=torch.bool, device=device)
 
-        if first_frame_conditioning_p > 0 and random.random() < first_frame_conditioning_p:
+        if first_frame_conditioning_p > 0:
             first_frame_end_idx = height * width
             if first_frame_end_idx < sequence_length:
-                conditioning_mask[:, :first_frame_end_idx] = True
+                # Per-sample Bernoulli draw so each batch element is independently conditioned.
+                per_sample_condition = torch.rand(batch_size, device=device) < first_frame_conditioning_p
+                conditioning_mask[per_sample_condition, :first_frame_end_idx] = True
 
         return conditioning_mask

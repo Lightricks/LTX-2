@@ -34,7 +34,7 @@ from ltx_pipelines.utils.helpers import (
     get_device,
 )
 from ltx_pipelines.utils.media_io import encode_video
-from ltx_pipelines.utils.types import ModalitySpec
+from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
 
 
 class DistilledPipeline:
@@ -54,12 +54,18 @@ class DistilledPipeline:
         quantization: QuantizationPolicy | None = None,
         registry: Registry | None = None,
         torch_compile: bool = False,
+        offload_mode: OffloadMode = OffloadMode.NONE,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
 
         self.prompt_encoder = PromptEncoder(
-            distilled_checkpoint_path, gemma_root, self.dtype, self.device, registry=registry
+            distilled_checkpoint_path,
+            gemma_root,
+            self.dtype,
+            self.device,
+            registry=registry,
+            offload_mode=offload_mode,
         )
         self.image_conditioner = ImageConditioner(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
         self.stage = DiffusionStage(
@@ -70,6 +76,7 @@ class DistilledPipeline:
             quantization=quantization,
             registry=registry,
             torch_compile=torch_compile,
+            offload_mode=offload_mode,
         )
         self.upsampler = VideoUpsampler(
             distilled_checkpoint_path, spatial_upsampler_path, self.dtype, self.device, registry=registry
@@ -88,7 +95,6 @@ class DistilledPipeline:
         images: list[ImageConditioningInput],
         tiling_config: TilingConfig | None = None,
         enhance_prompt: bool = False,
-        streaming_prefetch_count: int | None = None,
         stage_1_sigmas: torch.Tensor = DISTILLED_SIGMAS,
         stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
@@ -102,7 +108,6 @@ class DistilledPipeline:
             [prompt],
             enhance_first_prompt=enhance_prompt,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
-            streaming_prefetch_count=streaming_prefetch_count,
         )
         video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
 
@@ -130,7 +135,6 @@ class DistilledPipeline:
             fps=frame_rate,
             video=ModalitySpec(context=video_context, conditionings=stage_1_conditionings),
             audio=ModalitySpec(context=audio_context),
-            streaming_prefetch_count=streaming_prefetch_count,
         )
 
         # Stage 2: Upsample and refine the video at higher resolution with distilled LORA.
@@ -167,7 +171,6 @@ class DistilledPipeline:
                 noise_scale=stage_2_sigmas[0].item(),
                 initial_latent=audio_state.latent,
             ),
-            streaming_prefetch_count=streaming_prefetch_count,
         )
 
         decoded_video = self.video_decoder(video_state.latent, tiling_config, generator)
@@ -189,6 +192,7 @@ def main() -> None:
         loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
         torch_compile=args.compile,
+        offload_mode=args.offload_mode,
     )
     tiling_config = TilingConfig.default()
     video_chunks_number = get_video_chunks_number(args.num_frames, tiling_config)
@@ -202,7 +206,6 @@ def main() -> None:
         images=args.images,
         tiling_config=tiling_config,
         enhance_prompt=args.enhance_prompt,
-        streaming_prefetch_count=args.streaming_prefetch_count,
     )
 
     encode_video(

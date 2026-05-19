@@ -37,6 +37,11 @@ def cleanup_memory() -> None:
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
+    try:
+        if hasattr(torch._C, "_host_emptyCache"):
+            torch._C._host_emptyCache()
+    except Exception:
+        logging.warning("Host empty cache cleanup failed; ignoring.", exc_info=True)
 
 
 def _conform_latent_length(latent: torch.Tensor, expected_frames_count: int) -> torch.Tensor:

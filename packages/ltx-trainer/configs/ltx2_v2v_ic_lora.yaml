@@ -166,6 +166,11 @@ acceleration:
   # Useful when GPU memory is limited
   load_text_encoder_in_8bit: false
 
+  # Offload optimizer state to CPU during validation video sampling.
+  # Helps avoid OOM when VAE decoder + transformer + optimizer state can't coexist
+  # on the GPU (full fine-tune, high-rank LoRA). No effect for FSDP.
+  offload_optimizer_during_validation: false
+
 # -----------------------------------------------------------------------------
 # Data Configuration
 # -----------------------------------------------------------------------------
@@ -231,9 +236,6 @@ validation:
   # Generate validation videos every N training steps
   # Set to null to disable validation during training
   interval: 100
-
-  # Number of videos to generate per prompt
-  videos_per_prompt: 1
 
   # Classifier-free guidance scale
   # Higher values = stronger adherence to prompt but may introduce artifacts

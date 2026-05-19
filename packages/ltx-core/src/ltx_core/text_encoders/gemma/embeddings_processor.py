@@ -19,12 +19,32 @@ def convert_to_additive_mask(attention_mask: torch.Tensor, dtype: torch.dtype) -
     ) * torch.finfo(dtype).max
 
 
-def _to_binary_mask(encoded: torch.Tensor, encoded_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Convert connector output mask to binary mask and apply to encoded tensor."""
-    binary_mask = (encoded_mask < 0.000001).to(torch.int64)
-    binary_mask = binary_mask.reshape([encoded.shape[0], encoded.shape[1], 1])
-    encoded = encoded * binary_mask
-    return encoded, binary_mask
+def _compute_right_pad_order(additive_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute the index permutation that places valid tokens before pads in each row.
+    Stable sort: valid tokens keep their relative order. Idempotent for inputs already
+    right-padded. The sort and reordered mask depend only on the mask, so they can be
+    computed once and reused across multiple feature tensors that share the mask.
+    Args:
+        additive_mask: (B, 1, 1, S) additive mask, ``0.0`` for valid, ``-finfo.max`` for pad.
+    Returns:
+        ``(sort_idx, reordered_additive_mask)``: ``sort_idx`` is (B, S); the reordered mask
+        has the same shape as the input.
+    """
+    binary = (additive_mask[:, 0, 0, :] >= 0).to(torch.int32)  # (B, S)
+    sort_idx = torch.argsort(binary, dim=-1, descending=True, stable=True)  # (B, S)
+    new_binary = torch.gather(binary, 1, sort_idx)
+    new_additive = (new_binary.to(additive_mask.dtype) - 1) * torch.finfo(additive_mask.dtype).max
+    return sort_idx, new_additive[:, None, None, :]
+
+
+def _apply_right_pad_order(features: torch.Tensor, sort_idx: torch.Tensor) -> torch.Tensor:
+    """Apply a precomputed right-pad permutation (from ``_compute_right_pad_order``) to features."""
+    return torch.gather(features, 1, sort_idx.unsqueeze(-1).expand_as(features))
+
+
+def _to_binary_mask(encoded_mask: torch.Tensor, lead_shape: tuple[int, int]) -> torch.Tensor:
+    """Convert connector output mask to a binary (0/1) mask shaped ``(B, S, 1)`` for broadcasting."""
+    return (encoded_mask < 0.000001).to(torch.int64).reshape([lead_shape[0], lead_shape[1], 1])
 
 
 class EmbeddingsProcessor(nn.Module):
@@ -57,12 +77,19 @@ class EmbeddingsProcessor(nn.Module):
         if self.audio_connector is None and audio_features is not None:
             raise ValueError("Audio features were provided but no audio connector is configured.")
 
-        video_encoded, video_mask = self.video_connector(video_features, additive_attention_mask)
-        video_encoded, binary_mask = _to_binary_mask(video_encoded, video_mask)
+        # Connectors expect right-padded input ([valid, pad]). Normalize layout here so the
+        # upstream tokenizer can keep using either side without coupling to the connector.
+        # The sort index depends only on the mask, so compute it once and reuse for audio.
+        sort_idx, mask_for_connector = _compute_right_pad_order(additive_attention_mask)
+        video_features = _apply_right_pad_order(video_features, sort_idx)
+        video_encoded, video_mask = self.video_connector(video_features, mask_for_connector)
+        binary_mask = _to_binary_mask(video_mask, video_encoded.shape[:2])
+        video_encoded = video_encoded * binary_mask
 
         audio_encoded = None
         if self.audio_connector is not None:
-            audio_encoded, _ = self.audio_connector(audio_features, additive_attention_mask)
+            audio_features = _apply_right_pad_order(audio_features, sort_idx)
+            audio_encoded, _ = self.audio_connector(audio_features, mask_for_connector)
 
         return video_encoded, audio_encoded, binary_mask.squeeze(-1)
 

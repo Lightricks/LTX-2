@@ -153,7 +153,7 @@ class Attention(torch.nn.Module):
         heads: int = 8,
         dim_head: int = 64,
         norm_eps: float = 1e-6,
-        rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+        rope_type: LTXRopeType = LTXRopeType.SPLIT,
         attention_function: AttentionCallable | AttentionFunction = AttentionFunction.DEFAULT,
         apply_gated_attention: bool = False,
     ) -> None:

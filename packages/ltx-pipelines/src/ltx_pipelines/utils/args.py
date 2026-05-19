@@ -1,4 +1,5 @@
 import argparse
+from collections.abc import Sequence
 from pathlib import Path
 from typing import NamedTuple
 
@@ -12,6 +13,7 @@ from ltx_pipelines.utils.constants import (
     LTX_2_3_PARAMS,
     PipelineParams,
 )
+from ltx_pipelines.utils.types import OffloadMode
 
 
 class ImageConditioningInput(NamedTuple):
@@ -114,35 +116,34 @@ def resolve_path(path: str) -> str:
 QUANTIZATION_POLICIES = ("fp8-cast", "fp8-scaled-mm")
 
 
-class QuantizationAction(argparse.Action):
-    def __call__(
-        self,
-        parser: argparse.ArgumentParser,  # noqa: ARG002
-        namespace: argparse.Namespace,
-        values: list[str],
-        option_string: str | None = None,
-    ) -> None:
-        if len(values) > 2:
-            msg = (
-                f"{option_string} accepts at most 2 arguments (POLICY and optional AMAX_PATH), got {len(values)} values"
+def _resolve_quantization(namespace: argparse.Namespace) -> None:
+    # Resolution is deferred until after parse_args because fp8-scaled-mm needs the
+    # checkpoint path, which isn't on the namespace when the --quantization argument
+    # is parsed.
+    name = getattr(namespace, "quantization", None)
+    if name is None or isinstance(name, QuantizationPolicy):
+        return
+    if name == "fp8-cast":
+        namespace.quantization = QuantizationPolicy.fp8_cast()
+        return
+    if name == "fp8-scaled-mm":
+        ckpt = getattr(namespace, "checkpoint_path", None) or getattr(namespace, "distilled_checkpoint_path", None)
+        if ckpt is None:
+            raise SystemExit(
+                "--quantization fp8-scaled-mm requires --checkpoint-path (or --distilled-checkpoint-path)."
             )
-            raise argparse.ArgumentError(self, msg)
+        namespace.quantization = QuantizationPolicy.fp8_scaled_mm(ckpt)
 
-        policy_name = values[0]
-        if policy_name not in QUANTIZATION_POLICIES:
-            msg = f"Unknown quantization policy '{policy_name}'. Choose from: {', '.join(QUANTIZATION_POLICIES)}"
-            raise argparse.ArgumentError(self, msg)
 
-        if policy_name == "fp8-cast":
-            if len(values) > 1:
-                msg = f"{option_string} fp8-cast does not accept additional arguments"
-                raise argparse.ArgumentError(self, msg)
-            policy = QuantizationPolicy.fp8_cast()
-        elif policy_name == "fp8-scaled-mm":
-            amax_path = resolve_path(values[1]) if len(values) > 1 else None
-            policy = QuantizationPolicy.fp8_scaled_mm(amax_path)
-
-        setattr(namespace, self.dest, policy)
+class _PipelineArgumentParser(argparse.ArgumentParser):
+    def parse_args(  # type: ignore[override]
+        self,
+        args: Sequence[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> argparse.Namespace:
+        ns = super().parse_args(args, namespace)
+        _resolve_quantization(ns)
+        return ns
 
 
 def detect_checkpoint_path(distilled: bool = False) -> str:
@@ -158,7 +159,7 @@ def basic_arg_parser(
     params: PipelineParams = LTX_2_3_PARAMS,
     distilled: bool = False,
 ) -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser()
+    parser = _PipelineArgumentParser()
     if distilled:
         parser.add_argument(
             "--distilled-checkpoint-path",
@@ -231,16 +232,19 @@ def basic_arg_parser(
         except ValueError as e:
             raise argparse.ArgumentTypeError(f"must be an integer, got {value}") from e
 
-    # Layer streaming
+    # Weight offloading
     parser.add_argument(
-        "--streaming-prefetch-count",
-        type=_positive_int,
-        default=None,
-        metavar="N",
+        "--offload",
+        dest="offload_mode",
+        type=OffloadMode,
+        default=OffloadMode.NONE,
+        choices=list(OffloadMode),
         help=(
-            "Enable layer streaming prefetching N layers ahead. "
-            "At most 1 + N layers reside on GPU at once. "
-            "Must be >= 1. Example: --streaming-prefetch-count 2"
+            "Weight offloading strategy. "
+            "'none' keeps all weights on GPU (default). "
+            "'cpu' pins weights in CPU RAM, streams to GPU per layer. "
+            "'disk' reads weights from disk on demand (lowest memory). "
+            "Example: --offload cpu"
         ),
     )
 
@@ -260,16 +264,14 @@ def basic_arg_parser(
 
     parser.add_argument(
         "--quantization",
-        dest="quantization",
-        action=QuantizationAction,
-        nargs="+",
-        metavar=("POLICY", "AMAX_PATH"),
+        choices=QUANTIZATION_POLICIES,
         default=None,
         help=(
             f"Quantization policy: {', '.join(QUANTIZATION_POLICIES)}. "
             "fp8-cast uses FP8 casting with upcasting during inference. "
-            "fp8-scaled-mm uses FP8 scaled matrix multiplication (optionally provide amax calibration file path). "
-            "Example: --quantization fp8-cast or --quantization fp8-scaled-mm /path/to/amax.json"
+            "fp8-scaled-mm uses FP8 scaled matrix multiplication; the layer set is auto-discovered "
+            "from the checkpoint's .weight_scale tensors. "
+            "Example: --quantization fp8-cast or --quantization fp8-scaled-mm"
         ),
     )
     parser.add_argument(
@@ -341,6 +343,53 @@ def video_editing_arg_parser(
     parser.add_argument("--video-path", type=resolve_path, required=True, help="Path to the source video.")
     parser.add_argument("--start-time", type=float, required=True, help="Start time of the region to regenerate (s).")
     parser.add_argument("--end-time", type=float, required=True, help="End time of the region to regenerate (s).")
+    return parser
+
+
+def lipdub_arg_parser(
+    params: PipelineParams = LTX_2_3_PARAMS,
+) -> argparse.ArgumentParser:
+    """Argument parser for the lip-dub pipeline.
+    Frame count and frame rate are derived from the reference video at runtime (the frame count
+    is silently snapped down to the nearest 8k+1), so this parser intentionally omits
+    --num-frames, --frame-rate, and --image. Distilled checkpoint only.
+    """
+    parser = basic_arg_parser(params=params, distilled=True)
+    parser.add_argument(
+        "--height",
+        type=int,
+        default=params.stage_2_height,
+        help=(
+            f"Height of the generated video in pixels, should be divisible by 64 (default: {params.stage_2_height})."
+        ),
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=params.stage_2_width,
+        help=f"Width of the generated video in pixels, should be divisible by 64 (default: {params.stage_2_width}).",
+    )
+    parser.add_argument(
+        "--spatial-upsampler-path",
+        type=resolve_path,
+        required=True,
+        help=(
+            "Path to the spatial upsampler model used to increase the resolution "
+            "of the generated video in the latent space."
+        ),
+    )
+    parser.add_argument(
+        "--reference-video",
+        type=resolve_path,
+        required=True,
+        help="Reference video file (video + audio track used for IC-LoRA and audio identity).",
+    )
+    parser.add_argument(
+        "--reference-strength",
+        type=float,
+        default=1.0,
+        help="Strength for IC-LoRA video reference conditioning (default: 1.0).",
+    )
     return parser
 
 
