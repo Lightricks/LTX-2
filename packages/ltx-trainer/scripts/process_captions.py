@@ -232,7 +232,7 @@ def compute_captions_embeddings(  # noqa: PLR0913
     lora_trigger: str | None = None,
     remove_llm_prefixes: bool = False,
     batch_size: int = 8,
-    device: str = "cuda",
+    device: str = "auto",
     load_in_8bit: bool = False,
     overwrite: bool = False,
 ) -> None:
@@ -417,8 +417,8 @@ def main(  # noqa: PLR0913
         help="Batch size for processing",
     ),
     device: str = typer.Option(
-        default="cuda",
-        help="Device to use for computation",
+        default="auto",
+        help="Device to use for computation ('auto', 'cuda', 'mps', or 'cpu')",
     ),
     lora_trigger: str | None = typer.Option(
         default=None,

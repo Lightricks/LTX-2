@@ -26,7 +26,7 @@ class WeightSource(Protocol):
         """Return CPU weights for block *idx*."""
         ...
 
-    def release(self, idx: int, event: torch.cuda.Event) -> None:
+    def release(self, idx: int, event: object | None = None) -> None:
         """Signal that an async operation using these weights is guarded by *event*."""
         ...
 
@@ -41,7 +41,7 @@ class DiskWeightSource(WeightSource):
     def __init__(self, pool: WeightPool, reader: DiskBlockReader) -> None:
         self._pool = pool
         self._cache: OrderedDict[int, dict[str, torch.Tensor]] = OrderedDict()
-        self._events: dict[int, torch.cuda.Event] = {}
+        self._events: dict[int, object] = {}
         self._reader = reader
 
     @property
@@ -62,9 +62,10 @@ class DiskWeightSource(WeightSource):
         self._cache[idx] = weights
         return weights
 
-    def release(self, idx: int, event: torch.cuda.Event) -> None:
+    def release(self, idx: int, event: object | None = None) -> None:
         """Attach an H2D event -- waited before this buffer is recycled."""
-        self._events[idx] = event
+        if event is not None:
+            self._events[idx] = event
 
     def cleanup(self) -> None:
         """Clear cache and close the disk reader."""
@@ -92,7 +93,7 @@ class PinnedWeightSource(WeightSource):
     def get(self, idx: int) -> dict[str, torch.Tensor]:
         return self._weights[idx]
 
-    def release(self, idx: int, event: torch.cuda.Event) -> None:
+    def release(self, idx: int, event: object | None = None) -> None:
         pass
 
     def cleanup(self) -> None:

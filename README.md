@@ -24,6 +24,14 @@ uv sync --frozen
 source .venv/bin/activate
 ```
 
+### Hardware Backends
+
+The code automatically selects the best available PyTorch backend in this order: CUDA, MPS, then CPU. On Apple Silicon
+Macs with an MPS-enabled PyTorch install, pipeline and utility-script defaults now use `torch.device("mps")`; pass
+`--device cpu`, `--device cuda`, or `--device mps` when you need to override auto-selection. CUDA-only optimizations
+such as TensorRT-LLM FP8 scaled matrix multiplication, FlashAttention, xFormers, and bitsandbytes 8-bit loading remain
+NVIDIA-specific.
+
 ### Required Models
 
 Download the following models from the [LTX-2.3 HuggingFace repository](https://huggingface.co/Lightricks/LTX-2.3):

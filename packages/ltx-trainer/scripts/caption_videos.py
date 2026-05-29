@@ -33,7 +33,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
 from pathlib import Path
 
-import torch
 import typer
 from rich.console import Console
 from rich.progress import (
@@ -47,6 +46,7 @@ from rich.progress import (
 )
 from transformers.utils.logging import disable_progress_bar
 
+from ltx_core.devices import resolve_device
 from ltx_trainer.captioning import CaptionerType, MediaCaptioningModel, create_captioner
 
 VIDEO_EXTENSIONS = ["mp4", "avi", "mov", "mkv", "webm"]
@@ -375,7 +375,7 @@ def main(  # noqa: PLR0913
         None,
         "--device",
         "-d",
-        help="Device to use for inference (e.g., 'cuda', 'cuda:0', 'cpu'). Only for local models.",
+        help="Device to use for inference (e.g., 'auto', 'cuda', 'mps', 'cpu'). Only for local models.",
     ),
     use_8bit: bool = typer.Option(
         False,
@@ -468,7 +468,7 @@ def main(  # noqa: PLR0913
         raise typer.Exit(code=1)
 
     # Determine device for local models
-    device_str = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    device_str = str(resolve_device(device))
 
     # Parse extensions
     ext_list = [ext.strip() for ext in extensions.split(",")]

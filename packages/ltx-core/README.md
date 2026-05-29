@@ -58,7 +58,7 @@ pip install -e packages/ltx-core
 
 ### Loader
 
-The `loader/` module provides `SingleGPUModelBuilder`, a frozen dataclass that loads a PyTorch model from `.safetensors` checkpoints and optionally fuses one or more LoRA adapters.
+The `loader/` module provides `SingleGPUModelBuilder`, a frozen dataclass that loads a PyTorch model from `.safetensors` checkpoints and optionally fuses one or more LoRA adapters. When no device is supplied it automatically picks CUDA, then MPS, then CPU.
 
 #### Basic usage
 
@@ -69,7 +69,7 @@ builder = SingleGPUModelBuilder(
     model_class_configurator=MyModelConfigurator,
     model_path="/path/to/model.safetensors",
 )
-model = builder.build(device=torch.device("cuda"))
+model = builder.build()
 ```
 
 #### Loading LoRA adapters
@@ -89,27 +89,27 @@ builder = (
     .lora("/path/to/lora_a.safetensors", 0.8, lora_sd_ops)
     .lora("/path/to/lora_b.safetensors", 0.5, lora_sd_ops)
 )
-model = builder.build(device=torch.device("cuda"))
+model = builder.build()
 ```
 
 #### Memory-efficient LoRA loading (`lora_load_device`)
 
-By default, LoRA weights are loaded onto the **CPU** (`lora_load_device=torch.device("cpu")`).  This means each LoRA adapter is kept in CPU memory and transferred to the GPU sequentially during weight fusion, which keeps peak GPU memory low even when fusing large adapters.
+By default, LoRA weights are loaded onto the **CPU** (`lora_load_device=torch.device("cpu")`).  This means each LoRA adapter is kept in CPU memory and transferred to the accelerator sequentially during weight fusion, which keeps peak accelerator memory low even when fusing large adapters.
 
-If all adapters fit comfortably in GPU memory you can skip the CPU staging by setting `lora_load_device` to the target CUDA device:
+If all adapters fit comfortably in accelerator memory you can skip the CPU staging by setting `lora_load_device` to the target CUDA or MPS device:
 
 ```python
 import torch
 from ltx_core.loader import SingleGPUModelBuilder
 
-# Load LoRA weights directly onto the GPU (faster, but uses more GPU memory)
+# Load LoRA weights directly onto the accelerator (faster, but uses more accelerator memory)
 builder = SingleGPUModelBuilder(
     model_class_configurator=MyModelConfigurator,
     model_path="/path/to/model.safetensors",
-    lora_load_device=torch.device("cuda"),
+    lora_load_device=torch.device("mps"),
 ).lora("/path/to/lora.safetensors", 1.0, lora_sd_ops)
 
-model = builder.build(device=torch.device("cuda"))
+model = builder.build(device=torch.device("mps"))
 ```
 
 ### Quantization
@@ -144,7 +144,7 @@ builder = SingleGPUModelBuilder(
     module_ops=policy.module_ops,
     fuse_rule=policy.fuse_rule,
 )
-model = builder.build(device=torch.device("cuda"))
+model = builder.build()
 ```
 
 #### FP8 Cast

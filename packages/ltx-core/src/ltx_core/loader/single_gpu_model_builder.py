@@ -5,6 +5,7 @@ from typing import Generic
 import torch
 from torch import nn
 
+from ltx_core.devices import DeviceSpec, resolve_device
 from ltx_core.loader.fuse_loras import FuseRule, apply_loras, bf16_fuse_rule
 from ltx_core.loader.helpers import create_meta_model, load_state_dict, read_model_config
 from ltx_core.loader.module_ops import ModuleOps
@@ -81,7 +82,7 @@ def _load_model_weights(
 @dataclass(frozen=True)
 class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType], LoRAAdaptableProtocol):
     """
-    Builder for PyTorch models residing on a single GPU.
+    Builder for PyTorch models residing on a single accelerator.
     Attributes:
         model_class_configurator: Class responsible for constructing the model from a config dict.
         model_path: Path (or tuple of shard paths) to the model's `.safetensors` checkpoint(s).
@@ -94,7 +95,7 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
         lora_load_device: Device used when loading LoRA weight tensors from disk. Defaults to
             ``torch.device("cpu")``, which keeps LoRA weights in CPU memory and transfers them to
             the target GPU sequentially during fusion, reducing peak GPU memory usage compared to
-            loading all LoRA weights directly onto the GPU at once.
+            loading all LoRA weights directly onto the accelerator at once.
         fuse_rule: Per-policy LoRA merge rule. Defaults to ``bf16_fuse_rule``;
     """
 
@@ -123,8 +124,8 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
     def with_registry(self, registry: Registry) -> "SingleGPUModelBuilder":
         return replace(self, registry=registry)
 
-    def with_lora_load_device(self, device: torch.device) -> "SingleGPUModelBuilder":
-        return replace(self, lora_load_device=device)
+    def with_lora_load_device(self, device: DeviceSpec) -> "SingleGPUModelBuilder":
+        return replace(self, lora_load_device=resolve_device(device))
 
     def with_fuse_rule(self, fuse_rule: FuseRule) -> "SingleGPUModelBuilder":
         return replace(self, fuse_rule=fuse_rule)
@@ -136,9 +137,10 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
         return create_meta_model(self.model_class_configurator, config, module_ops)
 
     def load_sd(
-        self, paths: list[str], registry: Registry, device: torch.device | None, sd_ops: SDOps | None = None
+        self, paths: list[str], registry: Registry, device: DeviceSpec = None, sd_ops: SDOps | None = None
     ) -> StateDict:
-        return load_state_dict(paths, self.model_loader, registry, device, sd_ops)
+        resolved_device = resolve_device(device) if device is not None else None
+        return load_state_dict(paths, self.model_loader, registry, resolved_device, sd_ops)
 
     def _return_model(self, meta_model: ModelType, device: torch.device) -> ModelType:
         uninitialized = _check_uninitialized(meta_model)
@@ -149,11 +151,11 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
 
     def build(
         self,
-        device: torch.device | None = None,
+        device: DeviceSpec = None,
         dtype: torch.dtype | None = None,
         **kwargs: object,  # noqa: ARG002
     ) -> ModelType:
-        device = torch.device("cuda") if device is None else device
+        device = resolve_device(device)
         config = self.model_config()
         meta_model = self.meta_model(config, self.module_ops)
 

@@ -83,9 +83,9 @@ class DiskBlockReader:
 
 
 class LoraSource:
-    """Pinned-memory cache of matched LoRA A/B factors backed by a single buffer."""
+    """CPU cache of matched LoRA A/B factors backed by a single buffer."""
 
-    def __init__(self, path: str, sd_ops: SDOps | None, strength: float) -> None:
+    def __init__(self, path: str, sd_ops: SDOps | None, strength: float, pin_memory: bool = True) -> None:
         self.strength = strength
         self._pinned_ab: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
@@ -117,7 +117,7 @@ class LoraSource:
                     _SAFETENSORS_DTYPE_TO_TORCH[b_slice_view.get_dtype()],
                 )
 
-            all_views = allocate_layout_views(layout, pin_memory=True)
+            all_views = allocate_layout_views(layout, pin_memory=pin_memory)
 
             for prefix in matched_prefixes:
                 a_view = all_views[f"{prefix}.A"]
@@ -153,7 +153,7 @@ class LoraSource:
         if pair is None:
             return None
         a, b = pair
-        if device is not None and device.type == "cuda":
+        if device is not None and device.type != "cpu":
             a = a.to(device=device, non_blocking=True)
             b = b.to(device=device, non_blocking=True)
         if dtype is not None:

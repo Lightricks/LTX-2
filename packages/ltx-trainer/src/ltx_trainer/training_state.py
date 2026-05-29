@@ -18,6 +18,7 @@ class RngStates(BaseModel):
 
     torch_state: torch.Tensor
     cuda_state: torch.Tensor | None = None
+    mps_state: torch.Tensor | None = None
 
 
 class TrainingState(BaseModel):

@@ -5,6 +5,7 @@ from typing import Literal
 import torch
 from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
 
+from ltx_core.devices import resolve_device
 from ltx_trainer import logger
 
 QuantizationOptions = Literal[
@@ -64,16 +65,16 @@ def quantize_model(
         model: The model to quantize.
         precision: The quantization precision (e.g. "int8-quanto", "fp8-quanto").
         quantize_activations: Whether to quantize activations in addition to weights.
-        device: Device to use for quantization. If None, uses CUDA if available, else CPU.
+        device: Device to use for quantization. If None, uses CUDA, then MPS, then CPU.
     Returns:
         The quantized model.
     """
     from optimum.quanto import freeze, quantize  # noqa: PLC0415
 
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    elif isinstance(device, str):
-        device = torch.device(device)
+    device = resolve_device(device)
+
+    if device.type == "mps" and precision in ("fp8-quanto", "fp8uz-quanto"):
+        raise ValueError("FP8 quantization is not supported on MPS devices. Use int2, int4, or int8 instead.")
 
     weight_quant = _get_quanto_dtype(precision)
 
@@ -185,8 +186,6 @@ def _get_quanto_dtype(precision: QuantizationOptions) -> torch.dtype:
     elif precision == "int8-quanto":
         return qint8
     elif precision in ("fp8-quanto", "fp8uz-quanto"):
-        if torch.backends.mps.is_available():
-            raise ValueError("FP8 quantization is not supported on MPS devices. Use int2, int4, or int8 instead.")
         if precision == "fp8-quanto":
             return qfloat8
         elif precision == "fp8uz-quanto":

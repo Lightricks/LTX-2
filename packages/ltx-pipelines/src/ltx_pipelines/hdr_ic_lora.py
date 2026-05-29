@@ -57,7 +57,7 @@ from ltx_pipelines.utils.blocks import (
 )
 from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES, STAGE_2_DISTILLED_SIGMA_VALUES
 from ltx_pipelines.utils.denoisers import SimpleDenoiser
-from ltx_pipelines.utils.helpers import get_device, modality_from_latent_state
+from ltx_pipelines.utils.helpers import cleanup_memory, get_device, modality_from_latent_state
 from ltx_pipelines.utils.media_io import ResizeMode, align_resolution, load_video_conditioning_hdr
 from ltx_pipelines.utils.quantization_factory import QuantizationKind
 from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
@@ -721,7 +721,7 @@ def _process_single_video(  # noqa: PLR0913
 
     del hdr_video
     gc.collect()
-    torch.cuda.empty_cache()
+    cleanup_memory()
 
     if not skip_mp4:
         # Wait for EXR saves to finish before encoding.
@@ -818,6 +818,8 @@ Max frames by resolution (fp8_cast, bfloat16 VAE, tiled decode)
         "and keeps every other frame for smoother output. ~2x slower.",
     )
     return parser
+
+
 @torch.inference_mode()
 def main() -> None:
     """Batch HDR IC-LoRA inference: per-frame EXR + tonemapped ProRes .mov."""

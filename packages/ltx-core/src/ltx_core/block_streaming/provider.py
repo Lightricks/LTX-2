@@ -9,6 +9,7 @@ import torch
 from ltx_core.block_streaming.disk import LoraSource
 from ltx_core.block_streaming.pool import WeightPool
 from ltx_core.block_streaming.source import WeightSource
+from ltx_core.devices import synchronize_device
 from ltx_core.loader.fuse_loras import FuseRule, aggregate_lora_products, bf16_fuse_rule
 from ltx_core.loader.primitives import StateDict
 
@@ -37,13 +38,14 @@ def _contiguous_byte_view(weights: dict[str, torch.Tensor]) -> torch.Tensor | No
 
 
 class WeightsProvider:
-    """Provides GPU-ready block weights via H2D copy from a pinned CPU weight source.
+    """Provides accelerator-ready block weights via copies from a CPU weight source.
     Args:
-        pool: Pre-allocated GPU weight buffer pool.
-        copy_stream: Dedicated CUDA stream for async H2D copies.
-        target_device: GPU device for compute.
-        source: Pinned CPU weight source.
-        lora_sources: LoRA adapters fused on H2D copy.
+        pool: Pre-allocated accelerator weight buffer pool.
+        copy_stream: Dedicated CUDA stream for async H2D copies. ``None`` uses
+            synchronous copies, which is used for MPS/CPU.
+        target_device: Accelerator device for compute.
+        source: CPU weight source.
+        lora_sources: LoRA adapters fused after copying.
         blocks_prefix: State-dict prefix for LoRA key matching.
         fuse_rule: Per-policy LoRA merge rule (must be streaming-compatible:
             no companion-key emission). Defaults to ``bf16_fuse_rule``.
@@ -52,7 +54,7 @@ class WeightsProvider:
     def __init__(
         self,
         pool: WeightPool,
-        copy_stream: torch.cuda.Stream,
+        copy_stream: torch.cuda.Stream | None,
         target_device: torch.device,
         source: WeightSource,
         lora_sources: list[LoraSource] | None = None,
@@ -62,7 +64,7 @@ class WeightsProvider:
         self._copy_stream = copy_stream
         self._pool = pool
         self._cache: OrderedDict[int, dict[str, torch.Tensor]] = OrderedDict()
-        self._events: dict[int, torch.cuda.Event] = {}
+        self._events: dict[int, object] = {}
         self._target_device = target_device
         self._source = source
         self._lora_sources = lora_sources or []
@@ -70,7 +72,7 @@ class WeightsProvider:
         self._fuse_rule = fuse_rule
 
     def get(self, idx: int) -> dict[str, torch.Tensor]:
-        """Return GPU weights for block *idx*. Does H2D copy on miss."""
+        """Return accelerator weights for block *idx*. Copies from CPU on miss."""
         if idx in self._cache:
             return self._cache[idx]
 
@@ -82,30 +84,30 @@ class WeightsProvider:
         gpu_weights = self._pool.acquire()
         cpu_weights = self._source.get(idx)
 
-        h2d_event = self._copy_to_gpu(idx, gpu_weights, cpu_weights)
+        h2d_event = self._copy_to_device(idx, gpu_weights, cpu_weights)
         self._source.release(idx, event=h2d_event)
 
         self._cache[idx] = gpu_weights
         return gpu_weights
 
-    def _copy_to_gpu(
+    def _copy_to_device(
         self,
         idx: int,
         gpu_weights: dict[str, torch.Tensor],
         cpu_weights: dict[str, torch.Tensor],
-    ) -> torch.cuda.Event:
-        """Enqueue H2D copy + LoRA fusion on the copy stream and wait on compute.
+    ) -> object | None:
+        """Copy weights to the target device and fuse LoRAs.
         The wait is intentionally inside this method so callers -- and
         instrumentation regions wrapping it -- observe the full transfer time.
         """
+        if self._copy_stream is None:
+            self._copy_weights(gpu_weights, cpu_weights, non_blocking=False)
+            if self._lora_sources:
+                self._fuse_block_loras(idx, gpu_weights)
+            return None
+
         with torch.cuda.stream(self._copy_stream):
-            gpu_view = _contiguous_byte_view(gpu_weights)
-            cpu_view = _contiguous_byte_view(cpu_weights)
-            if gpu_view is not None and cpu_view is not None and gpu_view.numel() == cpu_view.numel():
-                gpu_view.copy_(cpu_view, non_blocking=True)
-            else:
-                for name, gpu_tensor in gpu_weights.items():
-                    gpu_tensor.copy_(cpu_weights[name], non_blocking=True)
+            self._copy_weights(gpu_weights, cpu_weights, non_blocking=True)
             if self._lora_sources:
                 self._fuse_block_loras(idx, gpu_weights)
             h2d_event = torch.cuda.Event()
@@ -114,14 +116,33 @@ class WeightsProvider:
         torch.cuda.current_stream(self._target_device).wait_event(h2d_event)
         return h2d_event
 
-    def release(self, idx: int, event: torch.cuda.Event) -> None:
+    @staticmethod
+    def _copy_weights(
+        gpu_weights: dict[str, torch.Tensor],
+        cpu_weights: dict[str, torch.Tensor],
+        *,
+        non_blocking: bool,
+    ) -> None:
+        gpu_view = _contiguous_byte_view(gpu_weights)
+        cpu_view = _contiguous_byte_view(cpu_weights)
+        if gpu_view is not None and cpu_view is not None and gpu_view.numel() == cpu_view.numel():
+            gpu_view.copy_(cpu_view, non_blocking=non_blocking)
+        else:
+            for name, gpu_tensor in gpu_weights.items():
+                gpu_tensor.copy_(cpu_weights[name], non_blocking=non_blocking)
+
+    def release(self, idx: int, event: object | None = None) -> None:
         """Attach a compute-done event -- waited before this buffer is recycled."""
-        self._events[idx] = event
+        if event is not None:
+            self._events[idx] = event
 
     def cleanup(self) -> None:
         """Synchronize streams and release all resources."""
-        self._copy_stream.synchronize()
-        torch.cuda.current_stream(self._target_device).synchronize()
+        if self._copy_stream is not None:
+            self._copy_stream.synchronize()
+            torch.cuda.current_stream(self._target_device).synchronize()
+        else:
+            synchronize_device(self._target_device)
         self._cache.clear()
         self._events.clear()
         self._source.cleanup()

@@ -30,8 +30,14 @@ from torch.optim.lr_scheduler import (
     StepLR,
 )
 from torch.utils.data import DataLoader
-from torchvision.transforms import functional as F  # noqa: N812
+from torchvision.transforms import functional as F
 
+from ltx_core.devices import (
+    get_accelerator_rng_state,
+    get_preferred_device,
+    is_accelerator_device,
+    set_accelerator_rng_state,
+)
 from ltx_core.text_encoders.gemma import convert_to_additive_mask
 from ltx_trainer import logger
 from ltx_trainer.config import LtxTrainerConfig
@@ -394,7 +400,7 @@ class LtxvTrainer:
 
         # Load text encoder (pure Gemma LLM) on GPU — LOCAL_RANK before Accelerator exists
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-        init_device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+        init_device = get_preferred_device(local_rank=local_rank)
 
         logger.debug("Loading text encoder...")
         text_encoder = load_text_encoder(
@@ -667,8 +673,10 @@ class LtxvTrainer:
         else:
             if rng.torch_state is not None:
                 torch.random.set_rng_state(rng.torch_state)
-            if rng.cuda_state is not None and torch.cuda.is_available():
-                torch.cuda.set_rng_state(rng.cuda_state)
+            if rng.cuda_state is not None and self._accelerator.device.type == "cuda":
+                set_accelerator_rng_state(rng.cuda_state, self._accelerator.device)
+            if rng.mps_state is not None and self._accelerator.device.type == "mps":
+                set_accelerator_rng_state(rng.mps_state, self._accelerator.device)
             logger.debug("Restored RNG states")
 
         return True
@@ -703,8 +711,8 @@ class LtxvTrainer:
         self._transformer = self._accelerator.prepare(self._transformer)
 
         # Log GPU memory usage after model preparation
-        vram_usage_gb = torch.cuda.memory_allocated() / 1024**3
-        logger.debug(f"GPU memory usage after models preparation: {vram_usage_gb:.2f} GB")
+        vram_usage_gb = get_gpu_memory_gb(self._accelerator.device)
+        logger.debug(f"Accelerator memory usage after models preparation: {vram_usage_gb:.2f} GB")
 
     @staticmethod
     def _find_checkpoint(checkpoint_path: str | Path) -> Path | None:
@@ -805,7 +813,7 @@ class LtxvTrainer:
             offloaded_bytes = 0
             for state in self._optimizer.state.values():
                 for k, v in state.items():
-                    if isinstance(v, torch.Tensor) and v.is_cuda:
+                    if isinstance(v, torch.Tensor) and is_accelerator_device(v.device):
                         offloaded.append((state, k))
                         offloaded_bytes += v.nbytes
             if offloaded:
@@ -1199,7 +1207,16 @@ class LtxvTrainer:
             ),
             rng_states=RngStates(
                 torch_state=torch.random.get_rng_state(),
-                cuda_state=torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+                cuda_state=(
+                    get_accelerator_rng_state(self._accelerator.device)
+                    if self._accelerator.device.type == "cuda"
+                    else None
+                ),
+                mps_state=(
+                    get_accelerator_rng_state(self._accelerator.device)
+                    if self._accelerator.device.type == "mps"
+                    else None
+                ),
             ),
             lr_scheduler_state_dict=self._lr_scheduler.state_dict() if self._lr_scheduler is not None else None,
             optimizer_state_dict=optimizer_state,

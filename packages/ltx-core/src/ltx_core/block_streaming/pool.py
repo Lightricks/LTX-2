@@ -28,13 +28,13 @@ class WeightPool:
         buffer_layout: TensorLayout,
         capacity: int,
         device: torch.device,
-        reuse_barrier: Callable[[torch.cuda.Event], None],
+        reuse_barrier: Callable[[object], None],
         pin_memory: bool = False,
     ) -> None:
         self._buffer_layout = buffer_layout
         self._capacity = capacity
         self._free: deque[dict[str, torch.Tensor]] = deque()
-        self._events: dict[int, torch.cuda.Event] = {}
+        self._events: dict[int, object] = {}
         self._reuse_barrier = reuse_barrier
         memory_layout = {
             _make_key(slot, name): (shape, dtype)
@@ -61,7 +61,7 @@ class WeightPool:
             self._reuse_barrier(event)
         return weights
 
-    def release(self, weights: dict[str, torch.Tensor], event: torch.cuda.Event | None = None) -> None:
+    def release(self, weights: dict[str, torch.Tensor], event: object | None = None) -> None:
         """Return a buffer to the free list.
         If *event* is given it is waited on the next :meth:`acquire`
         of this buffer, ensuring the prior operation has completed.

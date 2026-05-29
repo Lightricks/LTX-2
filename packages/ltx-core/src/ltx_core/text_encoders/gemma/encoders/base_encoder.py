@@ -4,6 +4,7 @@ from pathlib import Path
 import torch
 from transformers import AutoImageProcessor, Gemma3ForConditionalGeneration, Gemma3Processor
 
+from ltx_core.devices import fork_device_rng
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
 from ltx_core.utils import find_matching_file
@@ -65,7 +66,7 @@ class GemmaTextEncoder(torch.nn.Module):
         pad_token_id = self.processor.tokenizer.pad_token_id if self.processor.tokenizer.pad_token_id is not None else 0
         model_inputs = _pad_inputs_for_attention_alignment(model_inputs, pad_token_id=pad_token_id)
 
-        with torch.inference_mode(), torch.random.fork_rng(devices=[self.model.device]):
+        with torch.inference_mode(), fork_device_rng(self.model.device):
             torch.manual_seed(seed)
             outputs = self.model.generate(
                 **model_inputs,

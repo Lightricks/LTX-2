@@ -36,6 +36,7 @@ from peft import LoraConfig, get_peft_model, set_peft_model_state_dict
 from safetensors.torch import load_file
 from torchvision import transforms
 
+from ltx_core.devices import resolve_device
 from ltx_trainer.model_loader import load_model
 from ltx_trainer.progress import StandaloneSamplingProgress
 from ltx_trainer.utils import open_image_as_srgb
@@ -274,11 +275,12 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     parser.add_argument(
         "--device",
         type=str,
-        default="cuda",
-        help="Device to run on (cuda/cpu)",
+        default="auto",
+        help="Device to run on (auto/cuda/mps/cpu)",
     )
 
     args = parser.parse_args()
+    device = resolve_device(args.device)
 
     # Validate conditioning arguments
     if args.include_reference_in_output and args.reference_video is None:
@@ -351,6 +353,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
     else:
         print("STG: disabled")
     print(f"Seed: {args.seed}")
+    print(f"Device: {device}")
     if args.lora_path:
         print(f"LoRA: {args.lora_path}")
     if condition_image is not None:
@@ -400,7 +403,7 @@ def main() -> None:  # noqa: PLR0912, PLR0915
         )
         video, audio = sampler.generate(
             config=gen_config,
-            device=args.device,
+            device=device,
         )
 
     # Save video

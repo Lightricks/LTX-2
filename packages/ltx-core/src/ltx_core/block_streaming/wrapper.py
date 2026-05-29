@@ -10,6 +10,7 @@ from torch import nn
 
 from ltx_core.block_streaming.provider import WeightsProvider
 from ltx_core.block_streaming.utils import assign_tensor_to_module
+from ltx_core.devices import synchronize_device
 
 
 class BlockStreamingWrapper(nn.Module):
@@ -55,10 +56,14 @@ class BlockStreamingWrapper(nn.Module):
             assign_tensor_to_module(block, name, gpu_weights[name])
 
     def _post_hook(self, block_idx: int) -> None:
-        """Record a compute-done event and release the block weights."""
-        compute_done = torch.cuda.Event()
-        compute_done.record(torch.cuda.current_stream(self._target_device))
-        self._provider.release(block_idx, event=compute_done)
+        """Record a compute-done event when the backend exposes CUDA streams."""
+        if self._target_device.type == "cuda":
+            compute_done = torch.cuda.Event()
+            compute_done.record(torch.cuda.current_stream(self._target_device))
+            self._provider.release(block_idx, event=compute_done)
+        else:
+            synchronize_device(self._target_device)
+            self._provider.release(block_idx)
 
     def _register_hooks(self) -> None:
         for idx, block in enumerate(self._blocks):

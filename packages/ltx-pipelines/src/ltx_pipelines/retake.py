@@ -55,7 +55,7 @@ class RetakePipeline:
     loras : list[LoraPathStrengthAndSDOps]
         Optional LoRA configs applied to the transformer.
     device : torch.device
-        Target device (default: CUDA if available).
+        Target device (default: CUDA if available, then MPS, then CPU).
     quantization : QuantizationPolicy | None
         Optional quantization policy for the transformer.
     distilled : bool

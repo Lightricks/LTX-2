@@ -343,19 +343,20 @@ audio_guider_params = MultiModalGuiderParams(
 
 **FP8 Quantization (Lower Memory Footprint):**
 
-For smaller GPU memory footprint, use the `--quantization` flag and set `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
+For smaller accelerator memory footprint, use the `--quantization` flag. On CUDA, also set
+`PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`.
 
 Two quantization policies are available:
 
 | Policy | CLI Flag | Description |
 | ------ | -------- | ----------- |
 | **FP8 Cast** | `--quantization fp8-cast` | Downcasts transformer linear weights to FP8 during loading; upcasts on the fly during inference. No extra dependencies. |
-| **FP8 Scaled MM** | `--quantization fp8-scaled-mm` | Uses FP8 scaled matrix multiplication via TensorRT-LLM (`tensorrt_llm` must be installed). Best performance on Hopper GPUs. |
+| **FP8 Scaled MM** | `--quantization fp8-scaled-mm` | Uses FP8 scaled matrix multiplication via TensorRT-LLM (`tensorrt_llm` must be installed). CUDA-only; best performance on Hopper GPUs. |
 
 **CLI:**
 
 ```bash
-# FP8 Cast (works on any GPU with FP8 support)
+# FP8 Cast (works on CUDA GPUs with FP8 support)
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python -m ltx_pipelines.ti2vid_two_stages \
     --quantization fp8-cast --checkpoint-path=...
 
@@ -384,7 +385,7 @@ pipeline = TI2VidTwoStagesPipeline(
 pipeline(...)
 ```
 
-You still need to use `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` when launching:
+On CUDA, use `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` when launching:
 
 ```bash
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python my_denoising_pipeline.py
@@ -392,7 +393,7 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python my_denoising_pipeline.py
 
 **Memory Cleanup Between Stages:**
 
-By default, pipelines clean GPU memory (especially transformer weights) between stages. If you have enough memory, you can skip this cleanup to reduce running time:
+By default, pipelines clean CUDA/MPS memory (especially transformer weights) between stages. If you have enough memory, you can skip this cleanup to reduce running time:
 
 ```python
 # In pipeline implementations, memory cleanup happens automatically

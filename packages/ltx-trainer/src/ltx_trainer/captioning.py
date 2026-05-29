@@ -17,6 +17,8 @@ from pathlib import Path
 
 import torch
 
+from ltx_core.devices import resolve_device
+
 # Instruction for audio-visual captioning (default) - includes speech transcription and sounds
 DEFAULT_CAPTION_INSTRUCTION = """\
 Analyze this media and provide a detailed caption in the following EXACT format. Fill in ALL sections:
@@ -133,11 +135,11 @@ class QwenOmniCaptioner(MediaCaptioningModel):
         """
         Initialize the Qwen2.5-Omni captioner.
         Args:
-            device: Device to use for inference (e.g., 'cuda', 'cuda:0', 'cpu')
+            device: Device to use for inference (e.g., 'auto', 'cuda', 'mps', 'cpu')
             use_8bit: Whether to use 8-bit quantization for reduced memory usage
             instruction: Custom instruction prompt. If None, uses the default instruction
         """
-        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.device = resolve_device(device)
         self.instruction = instruction
         self._load_model(use_8bit=use_8bit)
 
@@ -255,6 +257,9 @@ class QwenOmniCaptioner(MediaCaptioningModel):
             Qwen2_5OmniThinkerForConditionalGeneration,
         )
 
+        if use_8bit and self.device.type == "mps":
+            raise ValueError("8-bit Qwen-Omni captioning uses bitsandbytes and is not supported on MPS.")
+
         quantization_config = BitsAndBytesConfig(load_in_8bit=True) if use_8bit else None
 
         # Use Thinker-only model for text generation (saves memory by not loading Talker)
@@ -263,7 +268,7 @@ class QwenOmniCaptioner(MediaCaptioningModel):
             dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
             quantization_config=quantization_config,
-            device_map="auto",
+            device_map={"": self.device},
         )
 
         self.processor = Qwen2_5OmniProcessor.from_pretrained(self.MODEL_ID)

@@ -16,6 +16,7 @@ from ltx_core.block_streaming.provider import WeightsProvider
 from ltx_core.block_streaming.source import DiskWeightSource, PinnedWeightSource, WeightSource
 from ltx_core.block_streaming.utils import allocate_layout_views, derive_layout, make_block_key, resolve_attr
 from ltx_core.block_streaming.wrapper import BlockStreamingWrapper
+from ltx_core.devices import synchronize_device
 from ltx_core.loader.fuse_loras import FuseRule, bf16_fuse_rule, fuse_lora_weights
 from ltx_core.loader.helpers import create_meta_model, load_state_dict, read_model_config
 from ltx_core.loader.module_ops import ModuleOps
@@ -102,7 +103,7 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
     ) -> BlockStreamingWrapper:
         """Build and return a ready-to-use :class:`BlockStreamingWrapper`.
         Args:
-            target_device: GPU device for compute.
+            target_device: Accelerator device for compute.
             dtype: Weight dtype (e.g. ``torch.bfloat16``).
             cpu_slots_count: Number of pinned CPU buffer slots.
                 ``None`` = RAM streaming (all blocks pre-loaded with LoRA fusion).
@@ -111,6 +112,9 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         """
         if not self.blocks_prefix:
             raise ValueError("blocks_prefix must be non-empty for streaming")
+
+        target_device = torch.device(target_device)
+        use_cuda_streaming = target_device.type == "cuda"
 
         config = read_model_config(self.model_path, self.model_loader)
         meta_model: nn.Module = create_meta_model(self.model_class_configurator, config, self.module_ops)
@@ -126,20 +130,37 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
 
         if cpu_slots_count >= len(blocks):
             source, lora_sources = self._build_pinned_source(
-                meta_model, target_device, dtype, cpu_slots_count, block_key_map, non_block_keys
+                meta_model, target_device, dtype, cpu_slots_count, block_key_map, non_block_keys, use_cuda_streaming
             )
         else:
             reader = DiskTensorReader(checkpoint_paths)
             source, lora_sources = self._build_disk_source(
-                meta_model, target_device, dtype, cpu_slots_count, reader, block_key_map, non_block_keys
+                meta_model,
+                target_device,
+                dtype,
+                cpu_slots_count,
+                reader,
+                block_key_map,
+                non_block_keys,
+                use_cuda_streaming,
             )
 
-        copy_stream = torch.cuda.Stream(device=target_device)
+        copy_stream = torch.cuda.Stream(device=target_device) if use_cuda_streaming else None
+        if copy_stream is not None:
+
+            def reuse_barrier(event: object) -> None:
+                copy_stream.wait_event(event)
+
+        else:
+
+            def reuse_barrier(_event: object) -> None:
+                return None
+
         gpu_pool = WeightPool(
             source.block_layout,
             gpu_slots_count,
             target_device,
-            reuse_barrier=lambda event: copy_stream.wait_event(event),
+            reuse_barrier=reuse_barrier,
         )
         provider = WeightsProvider(
             gpu_pool,
@@ -165,6 +186,7 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         cpu_slots_count: int,
         block_key_map: dict[int, list[tuple[str, str]]],
         non_block_keys: list[tuple[str, str]],
+        pin_memory: bool,
     ) -> tuple[WeightSource, list[LoraSource]]:
         """Pre-load all blocks into pinned CPU buffers with LoRA fusion."""
         model_sd = load_state_dict(
@@ -194,7 +216,7 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
                 key = make_block_key(self.blocks_prefix, block_idx, param_name)
                 block_tensors[key] = block_params[param_name]
         blocks_layout = derive_layout(block_tensors, dtype)
-        pinned_blocks = allocate_layout_views(blocks_layout, pin_memory=True)
+        pinned_blocks = allocate_layout_views(blocks_layout, pin_memory=pin_memory)
 
         should_sync = False
         for key, fused in fuse_lora_weights(
@@ -207,7 +229,7 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
             else:
                 model_sd.sd[key] = fused
         if should_sync:
-            torch.cuda.synchronize()
+            synchronize_device(target_device)
 
         # Fill remaining pinned keys from the source state dict.
         for key in blocks_layout:
@@ -242,13 +264,14 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         reader: DiskTensorReader,
         block_key_map: dict[int, list[tuple[str, str]]],
         non_block_keys: list[tuple[str, str]],
+        pin_memory: bool,
     ) -> tuple[WeightSource, list[LoraSource]]:
         """Create a DiskWeightSource backed by a DiskBlockReader for lazy loading.
         Derives the shared pool layout from the meta model's block 0 - this
         relies on module_ops (e.g. fp8_cast) leaving the meta param dtype in
         sync with the post-sd_ops checkpoint dtype.
         """
-        lora_sources = [LoraSource(lora.path, lora.sd_ops, lora.strength) for lora in self.loras]
+        lora_sources = [LoraSource(lora.path, lora.sd_ops, lora.strength, pin_memory=pin_memory) for lora in self.loras]
 
         self._load_non_block_weights(
             reader,
@@ -269,7 +292,7 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
             cpu_slots_count,
             torch.device("cpu"),
             reuse_barrier=lambda event: event.synchronize(),
-            pin_memory=True,
+            pin_memory=pin_memory,
         )
         block_reader = DiskBlockReader(
             reader=reader,

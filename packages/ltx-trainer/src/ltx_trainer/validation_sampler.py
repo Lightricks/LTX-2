@@ -19,6 +19,7 @@ from ltx_core.components.patchifiers import (
     get_pixel_coords,
 )
 from ltx_core.components.schedulers import LTX2Scheduler
+from ltx_core.devices import resolve_device
 from ltx_core.guidance.perturbations import (
     BatchedPerturbationConfig,
     Perturbation,
@@ -160,7 +161,7 @@ class ValidationSampler:
     def generate(
         self,
         config: GenerationConfig,
-        device: torch.device | str = "cuda",
+        device: torch.device | str = "auto",
     ) -> tuple[Tensor, Tensor | None]:
         """Generate a video (and optionally audio) sample.
         Args:
@@ -171,7 +172,7 @@ class ValidationSampler:
                 - video: Video tensor [C, F, H, W] in [0, 1] (float32)
                 - audio: Audio waveform tensor [C, samples] or None
         """
-        device = torch.device(device) if isinstance(device, str) else device
+        device = resolve_device(device)
         self._validate_config(config)
 
         # Route to appropriate generation method

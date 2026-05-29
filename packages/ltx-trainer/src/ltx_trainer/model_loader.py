@@ -6,9 +6,9 @@ This module provides a unified interface for loading LTX-2 model components
 for training, using SingleGPUModelBuilder from ltx-core.
 Example usage:
     # Load individual components
-    vae_encoder = load_video_vae_encoder("/path/to/checkpoint.safetensors", device="cuda")
-    vae_decoder = load_video_vae_decoder("/path/to/checkpoint.safetensors", device="cuda")
-    text_encoder = load_text_encoder("/path/to/gemma", device="cuda")
+    vae_encoder = load_video_vae_encoder("/path/to/checkpoint.safetensors", device="auto")
+    vae_decoder = load_video_vae_decoder("/path/to/checkpoint.safetensors", device="auto")
+    text_encoder = load_text_encoder("/path/to/gemma", device="auto")
     # Load all components at once
     components = load_model("/path/to/checkpoint.safetensors", text_encoder_path="/path/to/gemma")
 """
@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ltx_core.devices import resolve_device
 from ltx_trainer import logger
 
 # Type alias for device specification
@@ -38,7 +39,7 @@ if TYPE_CHECKING:
 
 def _to_torch_device(device: Device) -> torch.device:
     """Convert device specification to torch.device."""
-    return torch.device(device) if isinstance(device, str) else device
+    return resolve_device(device)
 
 
 # =============================================================================
@@ -306,7 +307,7 @@ def load_model(
     Args:
         checkpoint_path: Path to the safetensors checkpoint file
         text_encoder_path: Path to Gemma model directory (required if with_text_encoder=True)
-        device: Device to load models on ("cuda", "cpu", etc.)
+        device: Device to load models on ("auto", "cuda", "mps", "cpu", etc.)
         dtype: Data type for model weights
         with_video_vae_encoder: Whether to load the video VAE encoder (for preprocessing)
         with_video_vae_decoder: Whether to load the video VAE decoder (for inference/validation)

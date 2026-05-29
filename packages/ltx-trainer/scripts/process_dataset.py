@@ -216,8 +216,8 @@ def main(  # noqa: PLR0913
         help="Batch size for preprocessing",
     ),
     device: str = typer.Option(
-        default="cuda",
-        help="Device to use for computation",
+        default="auto",
+        help="Device to use for computation ('auto', 'cuda', 'mps', or 'cpu')",
     ),
     vae_tiling: bool = typer.Option(
         default=False,

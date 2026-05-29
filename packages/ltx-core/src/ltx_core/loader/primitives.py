@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import torch
 
+from ltx_core.devices import DeviceSpec
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.sd_ops import SDOps
 from ltx_core.model.model_protocol import ModelType
@@ -60,9 +61,7 @@ class StateDictLoader(Protocol):
 class BuilderProtocol(Protocol[ModelType]):
     """Protocol for model builders that produce a model via ``build()``."""
 
-    def build(
-        self, device: torch.device | None = None, dtype: torch.dtype | None = None, **kwargs: object
-    ) -> ModelType: ...
+    def build(self, device: DeviceSpec = None, dtype: torch.dtype | None = None, **kwargs: object) -> ModelType: ...
 
 
 class ModelBuilderProtocol(BuilderProtocol[ModelType], Protocol[ModelType]):
@@ -107,7 +106,7 @@ class ModelBuilderProtocol(BuilderProtocol[ModelType], Protocol[ModelType]):
         """Return a copy of this builder using the given weight registry for allocation."""
         ...
 
-    def with_lora_load_device(self, device: torch.device) -> "ModelBuilderProtocol[ModelType]":
+    def with_lora_load_device(self, device: DeviceSpec) -> "ModelBuilderProtocol[ModelType]":
         """Return a copy of this builder that loads LoRA weights onto the given device."""
         ...
 
@@ -115,9 +114,7 @@ class ModelBuilderProtocol(BuilderProtocol[ModelType], Protocol[ModelType]):
         """Return a copy of this builder with the given LoRA fuse rule (e.g. from a quantization policy)."""
         ...
 
-    def build(
-        self, device: torch.device | None = None, dtype: torch.dtype | None = None, **kwargs: object
-    ) -> ModelType:
+    def build(self, device: DeviceSpec = None, dtype: torch.dtype | None = None, **kwargs: object) -> ModelType:
         """
         Build the model
         Args:

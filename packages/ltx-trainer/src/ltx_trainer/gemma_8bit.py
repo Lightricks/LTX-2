@@ -19,6 +19,7 @@ from pathlib import Path
 
 import torch
 
+from ltx_core.devices import is_mps_available, resolve_device
 from ltx_core.text_encoders.gemma.encoders.base_encoder import GemmaTextEncoder
 from ltx_core.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
 
@@ -35,7 +36,8 @@ def load_8bit_gemma(
     Args:
         gemma_model_path: Path to Gemma model directory
         dtype: Data type for non-quantized model weights
-        device: Device to place the quantized model on. When ``None`` (default),
+        device: Device to place the quantized model on. MPS is not supported
+            because this path depends on bitsandbytes. When ``None`` (default),
             the device is inferred from ``LOCAL_RANK`` if CUDA is available, so
             multi-process launches put each rank's encoder on its own GPU
             instead of all colliding on ``cuda:0``.
@@ -59,9 +61,13 @@ def load_8bit_gemma(
     # in multi-process launches because every rank picks the same default device.
     device_map: str | dict[str, int | str | torch.device]
     if device is not None:
+        if resolve_device(device).type == "mps":
+            raise ValueError("8-bit Gemma loading uses bitsandbytes and is not supported on MPS.")
         device_map = {"": device}
     elif torch.cuda.is_available():
         device_map = {"": int(os.environ.get("LOCAL_RANK", "0"))}
+    elif is_mps_available():
+        raise ValueError("8-bit Gemma loading uses bitsandbytes and is not supported on MPS.")
     else:
         device_map = "auto"
 

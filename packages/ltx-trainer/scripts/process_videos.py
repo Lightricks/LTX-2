@@ -43,6 +43,7 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms.functional import crop, resize, to_tensor
 from transformers.utils.logging import disable_progress_bar
 
+from ltx_core.devices import resolve_device
 from ltx_core.model.audio_vae import AudioProcessor
 from ltx_core.types import Audio
 from ltx_trainer import logger
@@ -443,7 +444,7 @@ def compute_latents(  # noqa: PLR0913, PLR0915
     main_media_column: str | None = None,
     reshape_mode: str = "center",
     batch_size: int = 1,
-    device: str = "cuda",
+    device: str = "auto",
     vae_tiling: bool = False,
     with_audio: bool = False,
     audio_output_dir: str | None = None,
@@ -475,7 +476,7 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         raise ValueError("audio_output_dir must be provided when with_audio=True")
 
     console = Console()
-    torch_device = torch.device(device)
+    torch_device = resolve_device(device)
 
     dataset = MediaDataset(
         dataset_file=dataset_file,
@@ -1015,8 +1016,8 @@ def main(  # noqa: PLR0913
         help="Batch size for processing",
     ),
     device: str = typer.Option(
-        default="cuda",
-        help="Device to use for computation",
+        default="auto",
+        help="Device to use for computation ('auto', 'cuda', 'mps', or 'cpu')",
     ),
     vae_tiling: bool = typer.Option(
         default=False,

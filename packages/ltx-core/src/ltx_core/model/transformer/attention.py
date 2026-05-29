@@ -117,6 +117,8 @@ class XFormersAttention(AttentionCallable):
     ) -> torch.Tensor:
         if memory_efficient_attention is None:
             raise RuntimeError("XFormersAttention was selected but `xformers` is not installed.")
+        if q.device.type != "cuda":
+            raise RuntimeError("XFormersAttention requires CUDA. Use PyTorch SDPA on CPU or MPS.")
 
         b, _, dim_head = q.shape
         dim_head //= heads
@@ -163,6 +165,8 @@ class FlashAttention3(AttentionCallable):
     ) -> torch.Tensor:
         if flash_attn_interface is None:
             raise RuntimeError("FlashAttention3 was selected but `FlashAttention3` is not installed.")
+        if q.device.type != "cuda":
+            raise RuntimeError("FlashAttention3 requires CUDA. Use PyTorch SDPA on CPU or MPS.")
 
         b, _, dim_head = q.shape
         dim_head //= heads
@@ -186,6 +190,8 @@ class FlashAttention4(AttentionCallable):
     ) -> torch.Tensor:
         if flash_attn_4_func is None:
             raise RuntimeError("FlashAttention4 was selected but `flash-attn-4` is not installed.")
+        if q.device.type != "cuda":
+            raise RuntimeError("FlashAttention4 requires CUDA. Use PyTorch SDPA on CPU or MPS.")
 
         b, _, dim_head = q.shape
         dim_head //= heads
@@ -282,7 +288,7 @@ def _select_masked_attention() -> MaskedAttentionCallable:
     """Pick a mask-aware attention. Prefers xFormers when installed; else SDPA with
     the full priority list (the dispatcher rejects FLASH automatically when a
     mask is present and walks past it)."""
-    if memory_efficient_attention is not None:
+    if torch.cuda.is_available() and memory_efficient_attention is not None:
         return XFormersAttention()
     return _sdpa_full_priority()
 
@@ -335,7 +341,7 @@ class AttentionFunction(Enum):
     # :func:`automatic_attention`. Default for :class:`AttentionOps`.
     AUTOMATIC = "automatic"
 
-    def to_callable(self) -> AttentionCallable:  # noqa: PLR0911
+    def to_callable(self) -> AttentionCallable:  # noqa: PLR0911, PLR0912
         """Resolve to a concrete callable. Use this at module init time so that
         torch.compile can trace through the attention call without graph breaks.
         Every non-AUTOMATIC variant raises :class:`RuntimeError` when the backend
@@ -353,17 +359,27 @@ class AttentionFunction(Enum):
             case AttentionFunction.XFORMERS:
                 if memory_efficient_attention is None:
                     raise RuntimeError("AttentionFunction.XFORMERS selected but `xformers` is not installed.")
+                if not torch.cuda.is_available():
+                    raise RuntimeError("AttentionFunction.XFORMERS requires CUDA. Use PyTorch SDPA on CPU or MPS.")
                 return XFormersAttention()
             case AttentionFunction.FLASH_ATTENTION_3:
                 if flash_attn_interface is None:
                     raise RuntimeError(
                         "AttentionFunction.FLASH_ATTENTION_3 selected but `flash-attn-3` is not installed."
                     )
+                if not torch.cuda.is_available():
+                    raise RuntimeError(
+                        "AttentionFunction.FLASH_ATTENTION_3 requires CUDA. Use PyTorch SDPA on CPU or MPS."
+                    )
                 return FlashAttention3()
             case AttentionFunction.FLASH_ATTENTION_4:
                 if flash_attn_4_func is None:
                     raise RuntimeError(
                         "AttentionFunction.FLASH_ATTENTION_4 selected but `flash-attn-4` is not installed."
+                    )
+                if not torch.cuda.is_available():
+                    raise RuntimeError(
+                        "AttentionFunction.FLASH_ATTENTION_4 requires CUDA. Use PyTorch SDPA on CPU or MPS."
                     )
                 return FlashAttention4()
             case AttentionFunction.SDPA_MATH:
@@ -415,6 +431,10 @@ class MaskedAttentionFunction(Enum):
             case MaskedAttentionFunction.XFORMERS:
                 if memory_efficient_attention is None:
                     raise RuntimeError("MaskedAttentionFunction.XFORMERS selected but `xformers` is not installed.")
+                if not torch.cuda.is_available():
+                    raise RuntimeError(
+                        "MaskedAttentionFunction.XFORMERS requires CUDA. Use PyTorch SDPA on CPU or MPS."
+                    )
                 return XFormersAttention()
             case MaskedAttentionFunction.SDPA_MATH:
                 return PytorchAttention(priority=[SDPBackend.MATH])

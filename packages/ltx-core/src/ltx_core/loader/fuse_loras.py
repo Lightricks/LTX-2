@@ -4,6 +4,7 @@ from typing import NamedTuple
 
 import torch
 
+from ltx_core.devices import get_preferred_device
 from ltx_core.loader.primitives import LoraStateDictWithStrength, StateDict
 
 
@@ -72,9 +73,7 @@ bf16_fuse_rule = FuseRule(aggregation_dtype=torch.bfloat16, fuse_fn=_bf16_fuse)
 
 
 def _get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda", torch.cuda.current_device())
-    return torch.device("cpu")
+    return get_preferred_device()
 
 
 def aggregate_lora_products(

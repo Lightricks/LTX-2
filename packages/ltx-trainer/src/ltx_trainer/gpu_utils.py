@@ -7,23 +7,30 @@ from typing import Callable, TypeVar
 
 import torch
 
+from ltx_core.devices import (
+    cleanup_accelerator_memory,
+    device_memory_allocated,
+    device_memory_allocated_gb,
+    device_memory_reserved,
+    get_preferred_device,
+)
 from ltx_trainer import logger
 
 F = TypeVar("F", bound=Callable)
 
 
 def free_gpu_memory(log: bool = False) -> None:
-    """Free GPU memory by running garbage collection and emptying CUDA cache.
+    """Free accelerator memory by running garbage collection and emptying CUDA/MPS caches.
     Args:
         log: If True, log memory stats after clearing
     """
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        if log:
-            allocated = torch.cuda.memory_allocated() / 1024**3
-            reserved = torch.cuda.memory_reserved() / 1024**3
-            logger.debug(f"GPU memory freed. Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
+    cleanup_accelerator_memory()
+    if log:
+        device = get_preferred_device()
+        allocated = device_memory_allocated(device) / 1024**3
+        reserved = device_memory_reserved(device) / 1024**3
+        logger.debug(f"Accelerator memory freed. Allocated: {allocated:.2f}GB, Reserved: {reserved:.2f}GB")
 
 
 class free_gpu_memory_context:  # noqa: N801
@@ -65,12 +72,15 @@ class free_gpu_memory_context:  # noqa: N801
 
 
 def get_gpu_memory_gb(device: torch.device) -> float:
-    """Get current GPU memory usage in GB using nvidia-smi.
+    """Get current accelerator memory usage in GB.
     Args:
         device: torch.device to get memory usage for
     Returns:
         Current GPU memory usage in GB
     """
+    if device.type != "cuda":
+        return device_memory_allocated_gb(device)
+
     try:
         device_id = device.index if device.index is not None else 0
         result = subprocess.check_output(
@@ -85,6 +95,6 @@ def get_gpu_memory_gb(device: torch.device) -> float:
         )
         return float(result.strip()) / 1024  # Convert MB to GB
     except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
-        logger.error(f"Failed to get GPU memory from nvidia-smi: {e}")
+        logger.debug(f"Failed to get GPU memory from nvidia-smi: {e}")
         # Fallback to torch
-        return torch.cuda.memory_allocated(device) / 1024**3
+        return device_memory_allocated(device) / 1024**3

@@ -28,6 +28,7 @@ from rich.progress import (
 )
 from transformers.utils.logging import disable_progress_bar
 
+from ltx_core.devices import resolve_device
 from ltx_core.model.video_vae import SpatialTilingConfig, TemporalTilingConfig, TilingConfig
 from ltx_trainer import logger
 from ltx_trainer.model_loader import load_audio_vae_decoder, load_video_vae_decoder, load_vocoder
@@ -51,7 +52,7 @@ class LatentsDecoder:
     def __init__(
         self,
         model_path: str,
-        device: str = "cuda",
+        device: str = "auto",
         vae_tiling: bool = False,
         with_audio: bool = False,
     ):
@@ -62,7 +63,7 @@ class LatentsDecoder:
             vae_tiling: Whether to enable VAE tiling for larger video resolutions
             with_audio: Whether to load audio VAE for audio decoding
         """
-        self.device = torch.device(device)
+        self.device = resolve_device(device)
         self.model_path = model_path
         self.vae = None
         self.audio_vae = None
@@ -306,8 +307,8 @@ def main(
         help="Path to LTX-2 checkpoint (.safetensors file)",
     ),
     device: str = typer.Option(
-        default="cuda",
-        help="Device to use for computation",
+        default="auto",
+        help="Device to use for computation ('auto', 'cuda', 'mps', or 'cpu')",
     ),
     vae_tiling: bool = typer.Option(
         default=False,
