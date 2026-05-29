@@ -61,6 +61,10 @@ def print_config(config: LtxTrainerConfig) -> None:
         strategy_items.append(("Audio", fmt(cfg.training_strategy.with_audio)))
     if hasattr(cfg.training_strategy, "first_frame_conditioning_p"):
         strategy_items.append(("First Frame Cond P", str(cfg.training_strategy.first_frame_conditioning_p)))
+    if hasattr(cfg.training_strategy, "last_frame_conditioning_p"):
+        strategy_items.append(("Last Frame Cond P", str(cfg.training_strategy.last_frame_conditioning_p)))
+    if hasattr(cfg.training_strategy, "max_random_keyframes"):
+        strategy_items.append(("Max Random Keyframes", str(cfg.training_strategy.max_random_keyframes)))
 
     sections.append(("🎯 Strategy", strategy_items))
 

@@ -2,6 +2,7 @@
 This package implements the Strategy Pattern to handle different training modes:
 - Text-to-video training (standard generation, optionally with audio)
 - Video-to-video training (IC-LoRA mode with reference videos)
+- Keyframe-to-video training (first/last keyframe interpolation)
 Each strategy encapsulates the specific logic for preparing model inputs and computing loss.
 """
 
@@ -13,16 +14,19 @@ from ltx_trainer.training_strategies.base_strategy import (
     TrainingStrategy,
     TrainingStrategyConfigBase,
 )
+from ltx_trainer.training_strategies.keyframe_to_video import KeyframeToVideoConfig, KeyframeToVideoStrategy
 from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig, TextToVideoStrategy
 from ltx_trainer.training_strategies.video_to_video import VideoToVideoConfig, VideoToVideoStrategy
 
 # Type alias for all strategy config types
-TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig
+TrainingStrategyConfig = TextToVideoConfig | VideoToVideoConfig | KeyframeToVideoConfig
 
 __all__ = [
     "DEFAULT_FPS",
     "VIDEO_SCALE_FACTORS",
     "ModelInputs",
+    "KeyframeToVideoConfig",
+    "KeyframeToVideoStrategy",
     "TextToVideoConfig",
     "TextToVideoStrategy",
     "TrainingStrategy",
@@ -50,6 +54,8 @@ def get_training_strategy(config: TrainingStrategyConfig) -> TrainingStrategy:
             strategy = TextToVideoStrategy(config)
         case VideoToVideoConfig():
             strategy = VideoToVideoStrategy(config)
+        case KeyframeToVideoConfig():
+            strategy = KeyframeToVideoStrategy(config)
         case _:
             raise ValueError(f"Unknown training strategy config type: {type(config).__name__}")
 

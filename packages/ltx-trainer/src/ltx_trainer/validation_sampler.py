@@ -19,6 +19,7 @@ from ltx_core.components.patchifiers import (
     get_pixel_coords,
 )
 from ltx_core.components.schedulers import LTX2Scheduler
+from ltx_core.conditioning import VideoConditionByKeyframeIndex
 from ltx_core.guidance.perturbations import (
     BatchedPerturbationConfig,
     Perturbation,
@@ -85,6 +86,7 @@ class GenerationConfig:
     guidance_scale: float = 4.0  # CFG guidance scale
     seed: int = 42  # Random seed for reproducibility
     condition_image: Tensor | None = None  # Optional first frame image for image-to-video
+    keyframe_images: list[tuple[Tensor, int, float]] | None = None  # Optional keyframe images for interpolation
     reference_video: Tensor | None = None  # For IC-LoRA: [F, C, H, W] in [0, 1]
     reference_downscale_factor: int = 1  # For IC-LoRA: downscale factor (1 = same resolution, 2 = half resolution)
     generate_audio: bool = True  # Whether to generate audio alongside video
@@ -201,6 +203,15 @@ class ValidationSampler:
         if config.condition_image is not None:
             video_clean_state = self._apply_image_conditioning(
                 video_clean_state, config.condition_image, config, device
+            )
+
+        if config.keyframe_images is not None:
+            video_clean_state = self._apply_keyframe_conditioning(
+                video_clean_state,
+                config.keyframe_images,
+                config,
+                video_tools,
+                device,
             )
 
         # Add noise
@@ -384,6 +395,27 @@ class ValidationSampler:
             positions=video_state.positions,
             clean_latent=new_clean_latent,
         )
+
+    def _apply_keyframe_conditioning(
+        self,
+        video_state: LatentState,
+        keyframe_images: list[tuple[Tensor, int, float]],
+        config: GenerationConfig,
+        video_tools: VideoLatentTools,
+        device: torch.device,
+    ) -> LatentState:
+        """Append keyframe image latents using the same guiding-token path as keyframe interpolation."""
+        for image, frame_idx, strength in keyframe_images:
+            encoded_image = self._encode_conditioning_image(image, config.height, config.width, device)
+            keyframe_cond = VideoConditionByKeyframeIndex(
+                keyframes=encoded_image,
+                frame_idx=frame_idx,
+                strength=strength,
+                num_pixel_frames=1,
+            )
+            video_state = keyframe_cond.apply_to(video_state, video_tools)
+
+        return video_state
 
     @staticmethod
     def _preprocess_reference_video(config: GenerationConfig) -> Tensor:
@@ -675,6 +707,8 @@ class ValidationSampler:
             raise ValueError("Audio generation requires audio_decoder and vocoder")
         if config.condition_image is not None and self._vae_encoder is None:
             raise ValueError("Image conditioning requires vae_encoder")
+        if config.keyframe_images is not None and self._vae_encoder is None:
+            raise ValueError("Keyframe image conditioning requires vae_encoder")
         if config.reference_video is not None and self._vae_encoder is None:
             raise ValueError("Reference video conditioning requires vae_encoder")
 

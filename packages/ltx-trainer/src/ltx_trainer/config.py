@@ -5,6 +5,7 @@ from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, Validatio
 
 from ltx_trainer.quantization import QuantizationOptions
 from ltx_trainer.training_strategies.base_strategy import TrainingStrategyConfigBase
+from ltx_trainer.training_strategies.keyframe_to_video import KeyframeToVideoConfig
 from ltx_trainer.training_strategies.text_to_video import TextToVideoConfig
 from ltx_trainer.training_strategies.video_to_video import VideoToVideoConfig
 
@@ -89,7 +90,9 @@ def _get_strategy_discriminator(v: dict | TrainingStrategyConfigBase) -> str:
 
 # Union type for all strategy configs with discriminator
 TrainingStrategyConfig = Annotated[
-    Annotated[TextToVideoConfig, Tag("text_to_video")] | Annotated[VideoToVideoConfig, Tag("video_to_video")],
+    Annotated[TextToVideoConfig, Tag("text_to_video")]
+    | Annotated[VideoToVideoConfig, Tag("video_to_video")]
+    | Annotated[KeyframeToVideoConfig, Tag("keyframe_to_video")],
     Discriminator(_get_strategy_discriminator),
 ]
 
@@ -211,6 +214,18 @@ class ValidationConfig(ConfigBaseModel):
         "One image path must be provided for each validation prompt",
     )
 
+    keyframe_images: list[list[str]] | None = Field(
+        default=None,
+        description="Per-prompt keyframe image paths for keyframe-to-video validation. "
+        "Each inner list contains the images for one validation prompt.",
+    )
+
+    keyframe_frame_indices: list[list[int]] | None = Field(
+        default=None,
+        description="Per-prompt pixel frame indices for keyframe_images. "
+        "Each inner list must match the corresponding keyframe_images entry.",
+    )
+
     reference_videos: list[str] | None = Field(
         default=None,
         description="List of reference video paths to use for validation. "
@@ -328,6 +343,59 @@ class ValidationConfig(ConfigBaseModel):
                 raise ValueError(f"Image path '{image_path}' does not exist")
 
         return v
+
+    @field_validator("keyframe_images")
+    @classmethod
+    def validate_keyframe_images(cls, v: list[list[str]] | None, info: ValidationInfo) -> list[list[str]] | None:
+        """Validate that keyframe image groups match prompts and point to existing files."""
+        if v is None:
+            return None
+
+        num_prompts = len(info.data.get("prompts", []))
+        if len(v) != num_prompts:
+            raise ValueError(f"Number of keyframe image groups ({len(v)}) must match number of prompts ({num_prompts})")
+
+        for prompt_idx, keyframe_paths in enumerate(v):
+            if not keyframe_paths:
+                raise ValueError(f"Keyframe image group {prompt_idx} must contain at least one image")
+            for image_path in keyframe_paths:
+                if not Path(image_path).exists():
+                    raise ValueError(f"Keyframe image path '{image_path}' does not exist")
+
+        return v
+
+    @model_validator(mode="after")
+    def validate_keyframe_validation(self) -> "ValidationConfig":
+        """Validate keyframe image/index groups for keyframe-to-video validation."""
+        if self.keyframe_images is None and self.keyframe_frame_indices is None:
+            return self
+
+        if self.keyframe_images is None or self.keyframe_frame_indices is None:
+            raise ValueError("keyframe_images and keyframe_frame_indices must be provided together")
+
+        if len(self.keyframe_images) != len(self.keyframe_frame_indices):
+            raise ValueError(
+                f"Number of keyframe image groups ({len(self.keyframe_images)}) must match "
+                f"number of keyframe index groups ({len(self.keyframe_frame_indices)})"
+            )
+
+        _width, _height, frames = self.video_dims
+        for prompt_idx, (keyframe_paths, frame_indices) in enumerate(
+            zip(self.keyframe_images, self.keyframe_frame_indices, strict=True)
+        ):
+            if len(keyframe_paths) != len(frame_indices):
+                raise ValueError(
+                    f"Prompt {prompt_idx} has {len(keyframe_paths)} keyframe images but "
+                    f"{len(frame_indices)} keyframe indices"
+                )
+            for frame_idx in frame_indices:
+                if frame_idx < 0 or frame_idx >= frames:
+                    raise ValueError(
+                        f"Keyframe frame index {frame_idx} for prompt {prompt_idx} is outside "
+                        f"the validation range [0, {frames - 1}]"
+                    )
+
+        return self
 
     @field_validator("reference_videos")
     @classmethod
