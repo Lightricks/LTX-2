@@ -30,13 +30,19 @@ from ltx_pipelines.utils.media_io import (
 def get_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda", torch.cuda.current_device())
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
     return torch.device("cpu")
 
 
 def cleanup_memory() -> None:
     gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    elif hasattr(torch, "mps") and torch.mps.is_available():
+        torch.mps.empty_cache()
+        torch.mps.synchronize()
     try:
         if hasattr(torch._C, "_host_emptyCache"):
             torch._C._host_emptyCache()

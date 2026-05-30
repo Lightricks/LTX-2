@@ -720,8 +720,10 @@ def _process_single_video(  # noqa: PLR0913
         exr_futures.append(exr_executor.submit(save_exr_tensor, frame_cpu, str(path), exr_half))
 
     del hdr_video
-    gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    elif hasattr(torch, "mps") and torch.mps.is_available():
+        torch.mps.empty_cache()
 
     if not skip_mp4:
         # Wait for EXR saves to finish before encoding.
