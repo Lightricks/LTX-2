@@ -126,6 +126,10 @@ class ShiftedLogitNormalTimestepSampler(TimestepSampler):
         min_shift: float = 0.95,
         max_shift: float = 2.05,
     ) -> float:
+        # Without this cap, very large seq_length drives mu up, both percentile bounds
+        # saturate near 1.0, and zero_terminal_raw divides by ~0 → NaN.
+        if seq_length > max_tokens:
+            seq_length = max_tokens
         # Calculate the shift value for a given sequence length using linear interpolation
         # between min_shift and max_shift based on sequence length.
         m = (max_shift - min_shift) / (max_tokens - min_tokens)  # Calculate slope
