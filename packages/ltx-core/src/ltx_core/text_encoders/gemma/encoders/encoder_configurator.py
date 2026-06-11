@@ -1,4 +1,5 @@
 import torch
+import transformers
 from transformers import Gemma3Config
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 from transformers.models.gemma3 import Gemma3ForConditionalGeneration
@@ -18,6 +19,8 @@ from ltx_core.text_encoders.gemma.feature_extractor import (
     FeatureExtractorV1,
     FeatureExtractorV2,
 )
+
+_TRANSFORMERS_V5: bool = int(transformers.__version__.split(".", 1)[0]) >= 5
 
 
 class GemmaTextEncoderConfigurator(ModelConfigurator[GemmaTextEncoder]):
@@ -100,26 +103,45 @@ def _create_feature_extractor(transformer_config: dict) -> torch.nn.Module:
 
 # --- Split SDOps: Gemma LLM keys vs Embeddings Processor keys ---
 
-GEMMA_LLM_KEY_OPS = (
-    SDOps("GEMMA_LLM_KEY_OPS")
-    # 1. Map language model layers (note the double .model prefix)
-    .with_matching(prefix="language_model.model.")
-    .with_replacement("language_model.model.", "model.model.language_model.")
-    # 2. Map the Vision Tower
-    .with_matching(prefix="vision_tower.")
-    .with_replacement("vision_tower.", "model.model.vision_tower.")
-    # 3. Map the Multi-Modal Projector
-    .with_matching(prefix="multi_modal_projector.")
-    .with_replacement("multi_modal_projector.", "model.model.multi_modal_projector.")
-    # 4. Duplicate embed_tokens to lm_head (needed for prompt enhancement via generate())
-    .with_kv_operation(
-        operation=lambda key, value: [
-            KeyValueOperationResult(key, value),
-            KeyValueOperationResult("model.lm_head.weight", value),
-        ],
-        key_prefix="model.model.language_model.embed_tokens.weight",
+
+def _build_gemma_llm_key_ops(*, transformers_v5: bool) -> SDOps:
+    """Build the checkpoint-key remapping for the Gemma multimodal encoder.
+    The vision-tower mapping differs between transformers <5 and >=5 because
+    upstream PR https://github.com/huggingface/transformers/pull/39847 flattened
+    ``Gemma3ForConditionalGeneration.model.vision_tower.vision_model`` into
+    ``model.vision_tower``. Checkpoints continue to ship the legacy
+    ``vision_tower.vision_model.*`` prefix, so we strip the inner ``vision_model.``
+    when targeting v5 and pass it through unchanged for v4.
+    """
+    base = (
+        SDOps("GEMMA_LLM_KEY_OPS")
+        # 1. Map language model layers (note the double .model prefix)
+        .with_matching(prefix="language_model.model.")
+        .with_replacement("language_model.model.", "model.model.language_model.")
+        # 2. Map the Vision Tower (version-dependent — see docstring)
+        .with_matching(prefix="vision_tower.")
     )
-)
+    if transformers_v5:
+        base = base.with_replacement("vision_tower.vision_model.", "model.model.vision_tower.")
+    else:
+        base = base.with_replacement("vision_tower.", "model.model.vision_tower.")
+    return (
+        base
+        # 3. Map the Multi-Modal Projector
+        .with_matching(prefix="multi_modal_projector.")
+        .with_replacement("multi_modal_projector.", "model.model.multi_modal_projector.")
+        # 4. Duplicate embed_tokens to lm_head (needed for prompt enhancement via generate())
+        .with_kv_operation(
+            operation=lambda key, value: [
+                KeyValueOperationResult(key, value),
+                KeyValueOperationResult("model.lm_head.weight", value),
+            ],
+            key_prefix="model.model.language_model.embed_tokens.weight",
+        )
+    )
+
+
+GEMMA_LLM_KEY_OPS = _build_gemma_llm_key_ops(transformers_v5=_TRANSFORMERS_V5)
 
 EMBEDDINGS_PROCESSOR_KEY_OPS = (
     SDOps("EMBEDDINGS_PROCESSOR_KEY_OPS")
@@ -152,24 +174,85 @@ VIDEO_ONLY_EMBEDDINGS_PROCESSOR_KEY_OPS = (
 )
 
 
+def _resolve_local_base_freq(config: object) -> float:
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if isinstance(rope_parameters, dict) and "sliding_attention" in rope_parameters:
+        sliding = rope_parameters["sliding_attention"]
+        if isinstance(sliding, dict) and "rope_theta" in sliding:
+            return float(sliding["rope_theta"])
+    if hasattr(config, "rope_local_base_freq"):
+        return float(config.rope_local_base_freq)
+    raise AttributeError(
+        "Gemma text_config exposes neither rope_local_base_freq nor rope_parameters['sliding_attention']['rope_theta']"
+    )
+
+
+def _resolve_full_rope_type(config: object) -> str:
+    rope_parameters = getattr(config, "rope_parameters", None)
+    if isinstance(rope_parameters, dict) and "full_attention" in rope_parameters:
+        full = rope_parameters["full_attention"]
+        if isinstance(full, dict) and "rope_type" in full:
+            return str(full["rope_type"])
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if rope_scaling is not None:
+        if isinstance(rope_scaling, dict):
+            if "rope_type" in rope_scaling:
+                return str(rope_scaling["rope_type"])
+        elif hasattr(rope_scaling, "rope_type"):
+            return str(rope_scaling.rope_type)
+    raise AttributeError(
+        "Gemma text_config exposes neither rope_scaling.rope_type nor rope_parameters['full_attention']['rope_type']"
+    )
+
+
+def _populate_rotary_v4(l_model: torch.nn.Module, config: object) -> None:
+    """transformers <5 layout: separate ``rotary_emb_local`` + ``rotary_emb``."""
+    dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    base = _resolve_local_base_freq(config)
+    local_inv = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(dtype=torch.float) / dim))
+    full_inv, _ = ROPE_INIT_FUNCTIONS[_resolve_full_rope_type(config)](config)
+    l_model.rotary_emb_local.register_buffer("inv_freq", local_inv)
+    l_model.rotary_emb.register_buffer("inv_freq", full_inv)
+
+
+def _populate_rotary_v5(l_model: torch.nn.Module, config: object) -> None:
+    """transformers >=5 layout: single ``rotary_emb`` with per-layer-type buffers.
+    Mirrors ``Gemma3PreTrainedModel._init_weights`` for ``Gemma3RotaryEmbedding``
+    so meta-built models reach the same numerical state as a from_pretrained load.
+    """
+    rope_emb = l_model.rotary_emb
+    for layer_type in dict.fromkeys(config.layer_types):
+        rope_params = config.rope_parameters[layer_type]
+        if rope_params is None:
+            continue
+        rope_type = rope_params["rope_type"]
+        if rope_type == "default":
+            inv_freq, attn_scaling = rope_emb.compute_default_rope_parameters(config, layer_type=layer_type)
+        else:
+            inv_freq, attn_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, layer_type=layer_type)
+        rope_emb.register_buffer(f"{layer_type}_inv_freq", inv_freq, persistent=False)
+        rope_emb.register_buffer(f"{layer_type}_original_inv_freq", inv_freq.clone(), persistent=False)
+        setattr(rope_emb, f"{layer_type}_attention_scaling", attn_scaling)
+
+
 def create_and_populate(module: GemmaTextEncoder) -> GemmaTextEncoder:
     model = module.model
-    v_model = model.model.vision_tower.vision_model
+    v_tower = model.model.vision_tower
+    v_model = v_tower.vision_model if hasattr(v_tower, "vision_model") else v_tower
     l_model = model.model.language_model
 
     config = model.config.text_config
-    dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-    base = config.rope_local_base_freq
-    local_rope_freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(dtype=torch.float) / dim))
-    inv_freqs, _ = ROPE_INIT_FUNCTIONS[config.rope_scaling["rope_type"]](config)
+
+    if hasattr(l_model, "rotary_emb_local"):
+        _populate_rotary_v4(l_model, config)
+    else:
+        _populate_rotary_v5(l_model, config)
 
     positions_length = len(v_model.embeddings.position_ids[0])
     position_ids = torch.arange(positions_length, dtype=torch.long, device="cpu").unsqueeze(0)
     v_model.embeddings.register_buffer("position_ids", position_ids)
-    embed_scale = torch.tensor(model.config.text_config.hidden_size**0.5, device="cpu")
+    embed_scale = torch.tensor(config.hidden_size**0.5, device="cpu")
     l_model.embed_tokens.register_buffer("embed_scale", embed_scale)
-    l_model.rotary_emb_local.register_buffer("inv_freq", local_rope_freqs)
-    l_model.rotary_emb.register_buffer("inv_freq", inv_freqs)
 
     return module
 

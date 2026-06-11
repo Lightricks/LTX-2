@@ -2,10 +2,22 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 import safetensors
 import torch
 
+from ltx_core.block_streaming.utils import allocate_layout_views, make_block_key
+from ltx_core.loader.fuse_loras import LoraProduct
+from ltx_core.loader.primitives import LoraStateDictWithStrength, StateDict
 from ltx_core.loader.sd_ops import SDOps
+
+_SAFETENSORS_DTYPE_TO_TORCH: dict[str, torch.dtype] = {
+    "F64": torch.float64,
+    "F32": torch.float32,
+    "F16": torch.float16,
+    "BF16": torch.bfloat16,
+}
 
 
 class DiskTensorReader:
@@ -21,9 +33,6 @@ class DiskTensorReader:
             for sft_key in handle.keys():  # noqa: SIM118
                 self._key_to_handle_idx[sft_key] = handle_idx
 
-    def keys(self) -> list[str]:
-        return list(self._key_to_handle_idx.keys())
-
     def get_tensor(self, key: str) -> torch.Tensor:
         return self._handles[self._key_to_handle_idx[key]].get_tensor(key)
 
@@ -31,49 +40,58 @@ class DiskTensorReader:
         self._handles.clear()
         self._key_to_handle_idx.clear()
 
+    def __contains__(self, key: str) -> bool:
+        return key in self._key_to_handle_idx
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._key_to_handle_idx)
+
 
 class DiskBlockReader:
-    """Reads one block at a time from safetensors into provided buffers.
-    Maps block indices to safetensors keys via a pre-computed key map.
-    """
+    """Reads one block at a time from safetensors into provided buffers."""
 
     def __init__(
         self,
         reader: DiskTensorReader,
         block_key_map: dict[int, list[tuple[str, str]]],
-        dtype: torch.dtype,
+        sd_ops: SDOps | None = None,
+        blocks_prefix: str = "",
     ) -> None:
         self._reader = reader
         self._block_key_map = block_key_map
-        self._dtype = dtype
+        self._sd_ops = sd_ops
+        self._blocks_prefix = blocks_prefix
 
     def read_into(self, target: dict[str, torch.Tensor], block_idx: int) -> None:
+        block_prefix = make_block_key(self._blocks_prefix, block_idx, "")
         for sft_key, param_name in self._block_key_map[block_idx]:
             tensor = self._reader.get_tensor(sft_key)
-            if tensor.dtype != self._dtype:
-                tensor = tensor.to(self._dtype)
-            target[param_name].copy_(tensor)
+            if self._sd_ops is None:
+                target[param_name].copy_(tensor)
+                continue
+            full_key = make_block_key(self._blocks_prefix, block_idx, param_name)
+            for result in self._sd_ops.apply_to_key_value(full_key, tensor):
+                if not result.new_key.startswith(block_prefix):
+                    raise ValueError(
+                        f"SDOps output key '{result.new_key}' is outside block {block_idx} "
+                        f"(expected prefix '{block_prefix}'); cannot route to a per-block buffer."
+                    )
+                target[result.new_key[len(block_prefix) :]].copy_(result.new_value)
 
     def cleanup(self) -> None:
         self._reader.close()
 
 
 class LoraSource:
-    """Pinned-memory cache of LoRA A/B matrices for on-the-fly fusion.
-    At init, loads all matched A/B pairs into pinned CPU memory.
-    :meth:`get_delta` computes ``(B * strength) @ A`` on the given device.
-    """
+    """Pinned-memory cache of matched LoRA A/B factors backed by a single buffer."""
 
     def __init__(self, path: str, sd_ops: SDOps | None, strength: float) -> None:
         self.strength = strength
-
-        # param_prefix -> (pinned_a, pinned_b)
         self._pinned_ab: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
         a_keys: dict[str, str] = {}
         b_keys: dict[str, str] = {}
         with safetensors.safe_open(path, framework="pt", device="cpu") as handle:
-            # First pass: build key map.
             for sft_key in handle.keys():  # noqa: SIM118
                 model_key = sd_ops.apply_to_key(sft_key) if sd_ops is not None else sft_key
                 if model_key is None:
@@ -83,24 +101,65 @@ class LoraSource:
                 elif model_key.endswith(".lora_B.weight"):
                     b_keys[model_key[: -len(".lora_B.weight")]] = sft_key
 
-            # Second pass: load and pin matched A+B pairs (orphans silently skipped).
-            for prefix in a_keys.keys() & b_keys.keys():
-                self._pinned_ab[prefix] = (
-                    handle.get_tensor(a_keys[prefix]).pin_memory(),
-                    handle.get_tensor(b_keys[prefix]).pin_memory(),
+            matched_prefixes = list(a_keys.keys() & b_keys.keys())
+
+            # Build the layout from safetensors header metadata only — no tensor data is read.
+            layout: dict[str, tuple[torch.Size, torch.dtype]] = {}
+            for prefix in matched_prefixes:
+                a_slice_view = handle.get_slice(a_keys[prefix])
+                b_slice_view = handle.get_slice(b_keys[prefix])
+                layout[f"{prefix}.A"] = (
+                    torch.Size(a_slice_view.get_shape()),
+                    _SAFETENSORS_DTYPE_TO_TORCH[a_slice_view.get_dtype()],
+                )
+                layout[f"{prefix}.B"] = (
+                    torch.Size(b_slice_view.get_shape()),
+                    _SAFETENSORS_DTYPE_TO_TORCH[b_slice_view.get_dtype()],
                 )
 
-    def get_delta(self, param_prefix: str, device: torch.device | None = None) -> torch.Tensor | None:
-        """Return ``(B * strength) @ A`` for *param_prefix*, or ``None``."""
+            all_views = allocate_layout_views(layout, pin_memory=True)
+
+            for prefix in matched_prefixes:
+                a_view = all_views[f"{prefix}.A"]
+                b_view = all_views[f"{prefix}.B"]
+                a_view.copy_(handle.get_tensor(a_keys[prefix]))
+                b_view.copy_(handle.get_tensor(b_keys[prefix]))
+                self._pinned_ab[prefix] = (a_view, b_view)
+
+    def as_state_dict_with_strength(self) -> LoraStateDictWithStrength:
+        """Return a :class:`LoraStateDictWithStrength` view of the pinned A/B factors.
+        Lets :func:`fuse_lora_weights` consume disk-streaming LoRAs without
+        re-reading the safetensors file or re-applying ``sd_ops``.
+        """
+        sd: dict[str, torch.Tensor] = {}
+        for prefix, (a, b) in self._pinned_ab.items():
+            sd[f"{prefix}.lora_A.weight"] = a
+            sd[f"{prefix}.lora_B.weight"] = b
+        size = sum(t.numel() * t.element_size() for t in sd.values())
+        dtypes = {t.dtype for t in sd.values()}
+        return LoraStateDictWithStrength(
+            StateDict(sd=sd, device=torch.device("cpu"), size=size, dtype=dtypes),
+            self.strength,
+        )
+
+    def get_ab(
+        self,
+        param_prefix: str,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> LoraProduct | None:
+        """Return the :class:`LoraProduct` for *param_prefix*, or ``None``."""
         pair = self._pinned_ab.get(param_prefix)
         if pair is None:
             return None
         a, b = pair
         if device is not None and device.type == "cuda":
-            a = a.to(device=device)
-            b = b.to(device=device)
-        delta = torch.matmul(b * self.strength, a)
-        return delta
+            a = a.to(device=device, non_blocking=True)
+            b = b.to(device=device, non_blocking=True)
+        if dtype is not None:
+            a = a.to(dtype=dtype)
+            b = b.to(dtype=dtype)
+        return LoraProduct(a, b, self.strength)
 
     def cleanup(self) -> None:
         self._pinned_ab.clear()

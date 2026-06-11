@@ -50,17 +50,20 @@ This will create a `dataset.json` file containing video paths and their captions
 
 **Captioning options:**
 
-| Option | Description |
-|--------|-------------|
-| `--captioner-type` | `qwen_omni` (default, local) or `gemini_flash` (API) |
-| `--use-8bit` | Enable 8-bit quantization for lower VRAM usage |
-| `--no-audio` | Disable audio processing (video-only captions) |
-| `--override` | Re-caption files that already have captions |
-| `--api-key` | API key for Gemini Flash (or set `GOOGLE_API_KEY` env var) |
+
+| Option             | Description                                                |
+| ------------------ | ---------------------------------------------------------- |
+| `--captioner-type` | `qwen_omni` (default, local) or `gemini_flash` (API)       |
+| `--use-8bit`       | Enable 8-bit quantization for lower VRAM usage             |
+| `--no-audio`       | Disable audio processing (video-only captions)             |
+| `--override`       | Re-caption files that already have captions                |
+| `--api-key`        | API key for Gemini Flash (or set `GOOGLE_API_KEY` env var) |
+
 
 **Caption format:**
 
 The captioner produces structured captions with sections for:
+
 - **Visual content**: People, objects, actions, settings, colors, movements
 - **Speech transcription**: Word-for-word transcription of spoken content
 - **Sounds**: Music, ambient sounds, sound effects
@@ -106,14 +109,56 @@ uv run python scripts/process_dataset.py dataset.json \
     --with-audio
 ```
 
+### 🚀 Multi-GPU Preprocessing
+
+Preprocessing large datasets can take a while. To run it across multiple GPUs in parallel, wrap the command with
+`accelerate launch` (for example `--num_processes 4`). Each process handles an interleaved slice of the dataset.
+The same approach applies to `process_videos.py` and `process_captions.py` when you run them standalone.
+
+```bash
+uv run accelerate launch --num_processes 4 scripts/process_dataset.py dataset.json \
+    --resolution-buckets "960x544x49" \
+    --model-path /path/to/ltx-2-model.safetensors \
+    --text-encoder-path /path/to/gemma-model
+```
+
+Outputs are written atomically (via a per-process temporary file, then renamed), so an interrupted run leaves no
+corrupt files. By default a rerun **resumes** — items whose output `.pt` already exists are skipped.
+
+> [!IMPORTANT]
+> Pass `**--overwrite`** when rerunning with changed parameters (different model checkpoint, resolution buckets,
+> text encoder, `--lora-trigger`, etc.). Without it the script keeps the stale outputs from the previous run.
+>
+> ```bash
+> uv run accelerate launch --num_processes 4 scripts/process_dataset.py dataset.json \
+>     --resolution-buckets "960x544x49" \
+>     --model-path /path/to/ltx-2.3-model.safetensors \
+>     --text-encoder-path /path/to/gemma-model \
+>     --overwrite
+> ```
+
 ### 📊 Dataset Format
 
-The trainer supports either videos or single images.
-Note that your dataset must be homogeneous - either all videos or all images, mixing is not supported.
+The trainer supports videos, single images, or a mix of both in the same dataset.
 
 > [!TIP]
 > **Image Datasets:** When using images, follow the same preprocessing steps and format requirements as with videos,
 > but use `1` for the frame count in the resolution bucket (e.g., `960x544x1`).
+
+> [!NOTE]
+> **Mixed image + video datasets:** Mixing stills and videos in a single dataset is supported, but requires some care:
+>
+> - Preprocess with **multiple resolution buckets** covering both frame counts — e.g.
+> `--resolution-buckets "960x544x1;960x544x49"`. Images are automatically assigned to the `F=1` bucket and
+> videos to an `F>1` bucket.
+> - You **must** set `optimization.batch_size: 1` in your training config (see the warning under
+> [Resolution Buckets](#-resolution-buckets)), since samples with different shapes cannot be collated into a
+> single batch. Use `gradient_accumulation_steps` if you need a larger effective batch.
+> - Per-step cost differs substantially between a single-frame sample and a many-frame sample, which can lead to
+> uneven gradient magnitudes across steps. Consider weighting the two subsets or tuning the learning rate if
+> you observe instability.
+> - If you prefer a fully officially-supported path, train two separate LoRAs (one on stills, one on video) and
+> stack them at inference.
 
 The dataset must be a CSV, JSON, or JSONL metadata file with columns for captions and video paths:
 
@@ -197,6 +242,7 @@ uv run python scripts/process_dataset.py dataset.json \
 > ```
 >
 > Where:
+>
 > - H = Height of video
 > - W = Width of video
 > - F = Number of frames
@@ -204,6 +250,7 @@ uv run python scripts/process_dataset.py dataset.json \
 > - 8 = VAE's temporal downsampling factor
 >
 > For example, a 768×448×89 video would have sequence length:
+>
 > ```
 > (768/32) * (448/32) * ((89-1)/8 + 1) = 24 * 14 * 12 = 4,032
 > ```
@@ -268,7 +315,6 @@ uv run python scripts/process_dataset.py dataset.json \
 
 This will create an additional `reference_latents/` directory containing the preprocessed reference video latents.
 
-
 ### Generating Reference Videos
 
 **Dataset Requirements for IC-LoRA:**
@@ -277,7 +323,7 @@ This will create an additional `reference_latents/` directory containing the pre
 - Reference and target videos must have *identical* resolution and length
 - Both reference and target videos should be preprocessed together using the same resolution buckets
 
-We provide an example script, [`scripts/compute_reference.py`](../scripts/compute_reference.py), to generate reference
+We provide an example script, `[scripts/compute_reference.py](../scripts/compute_reference.py)`, to generate reference
 videos for a given dataset. The default implementation generates Canny edge reference videos.
 
 ```bash
@@ -292,7 +338,6 @@ If you want to generate a different type of condition (depth maps, pose skeleton
 ### Example Dataset
 
 For reference, see our **[Canny Control Dataset](https://huggingface.co/datasets/Lightricks/Canny-Control-Dataset)** which demonstrates proper IC-LoRA dataset structure with paired videos and Canny edge maps.
-
 
 ## 🎯 LoRA Trigger Words
 

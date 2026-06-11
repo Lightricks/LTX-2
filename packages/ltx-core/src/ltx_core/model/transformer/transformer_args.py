@@ -2,6 +2,7 @@ from dataclasses import dataclass, replace
 
 import torch
 
+from ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
 from ltx_core.model.transformer.adaln import AdaLayerNormSingle
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.rope import (
@@ -19,8 +20,8 @@ class TransformerArgs:
     context_mask: torch.Tensor
     timesteps: torch.Tensor
     embedded_timestep: torch.Tensor
-    positional_embeddings: torch.Tensor
-    cross_positional_embeddings: torch.Tensor | None
+    positional_embeddings: tuple[torch.Tensor, torch.Tensor]
+    cross_positional_embeddings: tuple[torch.Tensor, torch.Tensor] | None
     cross_scale_shift_timestep: torch.Tensor | None
     cross_gate_timestep: torch.Tensor | None
     enabled: bool
@@ -28,6 +29,59 @@ class TransformerArgs:
     self_attention_mask: torch.Tensor | None = (
         None  # Additive log-space self-attention bias (B, 1, T, T), None = full attention
     )
+    # Per-block perturbation state, precomputed by `LTXModel._process_transformer_blocks`
+    # so the block forward needs no per-block identity. The bool shortcuts
+    # (`*_all_perturbed`, `cross_attn_skip_all`) are Python bools that Dynamo specialises
+    # on — fine because they're stable across denoising steps for a fixed perturbation
+    # config.
+    self_attn_perturbation_mask: torch.Tensor | None = None
+    self_attn_all_perturbed: bool = False
+    cross_attn_perturbation_mask: torch.Tensor | None = None
+    cross_attn_skip_all: bool = False
+
+
+class BlockPerturbationsProcessor:
+    """Per-block preparation of ``TransformerArgs``.
+    The base implementation returns a copy of ``args`` with this block's
+    precomputed perturbation flags and masks attached. Subclasses can layer in
+    operations that must run on each block's inputs but stay outside the
+    compile boundary -- e.g. ``torch._dynamo.mark_dynamic`` for
+    shape-polymorphic block compilation (see ``compiling.py``). Swapping the
+    processor on an ``LTXModel`` instance is how compile transforms opt in to
+    such behaviour without baking it into the model's forward.
+    ``self_attn_perturbation_mask`` is None when all or none of the batch is
+    perturbed (the attention call can take the shortcut path). ``cross_attn_*``
+    is None when every sample skips the cross-attention entirely.
+    """
+
+    def __call__(
+        self,
+        args: "TransformerArgs",
+        perturbations: BatchedPerturbationConfig,
+        block_idx: int,
+        self_attn_type: PerturbationType,
+        cross_attn_type: PerturbationType,
+    ) -> "TransformerArgs":
+        device, dtype = args.x.device, args.x.dtype
+
+        all_self = perturbations.all_in_batch(self_attn_type, block_idx)
+        any_self = perturbations.any_in_batch(self_attn_type, block_idx)
+        self_mask: torch.Tensor | None = None
+        if any_self and not all_self:
+            self_mask = perturbations.mask(self_attn_type, block_idx, device, dtype).view(-1, 1, 1)
+
+        all_cross = perturbations.all_in_batch(cross_attn_type, block_idx)
+        cross_mask: torch.Tensor | None = None
+        if not all_cross:
+            cross_mask = perturbations.mask(cross_attn_type, block_idx, device, dtype).view(-1, 1, 1)
+
+        return replace(
+            args,
+            self_attn_perturbation_mask=self_mask,
+            self_attn_all_perturbed=all_self,
+            cross_attn_perturbation_mask=cross_mask,
+            cross_attn_skip_all=all_cross,
+        )
 
 
 class TransformerArgsPreprocessor:
@@ -98,9 +152,12 @@ class TransformerArgsPreprocessor:
         self, attention_mask: torch.Tensor | None, x_dtype: torch.dtype
     ) -> torch.Tensor | None:
         """Prepare self-attention mask by converting [0,1] values to additive log-space bias.
-        Input shape: (B, T, T) with values in [0, 1].
-        Output shape: (B, 1, T, T) with 0.0 for full attention and a large negative value
-        for masked positions.
+        Input shape: 3D ``(B, T_q, T_k)`` with values in [0, 1]. The dense form
+        is ``(B, T, T)``; broadcastable forms like ``(1, 1, T)`` (key-only
+        padding) or ``(B, 1, T)`` are also valid and yield a correspondingly
+        broadcastable output.
+        Output shape: ``(B, 1, T_q, T_k)`` (heads dim inserted) with 0.0 for
+        full attention and a large negative value for masked positions.
         Positions with attention_mask <= 0 are fully masked (mapped to the dtype's minimum
         representable value). Strictly positive entries are converted via log-space for
         smooth attenuation, with small values clamped for numerical stability.
@@ -120,7 +177,7 @@ class TransformerArgsPreprocessor:
         if positive.any():
             bias[positive] = torch.log(attention_mask[positive].clamp(min=eps)).to(x_dtype)
 
-        return bias.unsqueeze(1)  # (B, 1, T, T) for head broadcast
+        return bias.unsqueeze(1)  # (B, 1, T_q, T_k) for head broadcast
 
     def _prepare_positional_embeddings(
         self,
@@ -244,10 +301,6 @@ class MultiModalTransformerArgsPreprocessor:
             if cross_modality.sigma.ndim != 1:
                 raise ValueError("Cross modality sigma must be a 1D tensor")
 
-        cross_timestep = cross_modality.sigma.view(
-            modality.timesteps.shape[0], 1, *[1] * len(modality.timesteps.shape[2:])
-        )
-
         cross_pe = self.simple_preprocessor._prepare_positional_embeddings(
             positions=modality.positions[:, 0:1, :],
             inner_dim=self.audio_cross_attention_dim,
@@ -258,7 +311,8 @@ class MultiModalTransformerArgsPreprocessor:
         )
 
         cross_scale_shift_timestep, cross_gate_timestep = self._prepare_cross_attention_timestep(
-            timestep=cross_timestep,
+            modality_timesteps=modality.timesteps,
+            cross_modality_sigma=cross_modality.sigma,
             timestep_scale_multiplier=self.simple_preprocessor.timestep_scale_multiplier,
             batch_size=transformer_args.x.shape[0],
             hidden_dtype=modality.latent.dtype,
@@ -273,23 +327,23 @@ class MultiModalTransformerArgsPreprocessor:
 
     def _prepare_cross_attention_timestep(
         self,
-        timestep: torch.Tensor | None,
+        modality_timesteps: torch.Tensor,
+        cross_modality_sigma: torch.Tensor,
         timestep_scale_multiplier: int,
         batch_size: int,
         hidden_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Prepare cross attention timestep embeddings."""
-        timestep = timestep * timestep_scale_multiplier
-
+        """Prepare A-V cross-attention AdaLN inputs."""
         av_ca_factor = self.av_ca_timestep_scale_multiplier / timestep_scale_multiplier
 
         scale_shift_timestep, _ = self.cross_scale_shift_adaln(
-            timestep.flatten(),
+            (modality_timesteps * timestep_scale_multiplier).flatten(),
             hidden_dtype=hidden_dtype,
         )
         scale_shift_timestep = scale_shift_timestep.view(batch_size, -1, scale_shift_timestep.shape[-1])
+
         gate_noise_timestep, _ = self.cross_gate_adaln(
-            timestep.flatten() * av_ca_factor,
+            (cross_modality_sigma * timestep_scale_multiplier * av_ca_factor).flatten(),
             hidden_dtype=hidden_dtype,
         )
         gate_noise_timestep = gate_noise_timestep.view(batch_size, -1, gate_noise_timestep.shape[-1])

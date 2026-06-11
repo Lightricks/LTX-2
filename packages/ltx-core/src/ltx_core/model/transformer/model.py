@@ -2,13 +2,18 @@ from enum import Enum
 
 import torch
 
-from ltx_core.guidance.perturbations import BatchedPerturbationConfig
+from ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
 from ltx_core.model.transformer.adaln import AdaLayerNormSingle, adaln_embedding_coefficient
-from ltx_core.model.transformer.attention import AttentionCallable, AttentionFunction
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.rope import LTXRopeType
-from ltx_core.model.transformer.transformer import BasicAVTransformerBlock, TransformerConfig
+from ltx_core.model.transformer.transformer import (
+    DEFAULT_TRANSFORMER_OPS,
+    BasicAVTransformerBlock,
+    TransformerConfig,
+    TransformerOpsConfig,
+)
 from ltx_core.model.transformer.transformer_args import (
+    BlockPerturbationsProcessor,
     MultiModalTransformerArgsPreprocessor,
     TransformerArgs,
     TransformerArgsPreprocessor,
@@ -45,7 +50,7 @@ class LTXModel(torch.nn.Module):
         num_layers: int = 48,
         cross_attention_dim: int = 4096,
         norm_eps: float = 1e-06,
-        attention_type: AttentionFunction | AttentionCallable = AttentionFunction.DEFAULT,
+        ops: TransformerOpsConfig = DEFAULT_TRANSFORMER_OPS,
         positional_embedding_theta: float = 10000.0,
         positional_embedding_max_pos: list[int] | None = None,
         timestep_scale_multiplier: int = 1000,
@@ -57,7 +62,7 @@ class LTXModel(torch.nn.Module):
         audio_cross_attention_dim: int = 2048,
         audio_positional_embedding_max_pos: list[int] | None = None,
         av_ca_timestep_scale_multiplier: int = 1,
-        rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+        rope_type: LTXRopeType = LTXRopeType.SPLIT,
         double_precision_rope: bool = False,
         apply_gated_attention: bool = False,
         caption_projection: torch.nn.Module | None = None,
@@ -115,9 +120,13 @@ class LTXModel(torch.nn.Module):
             audio_attention_head_dim=audio_attention_head_dim if model_type.is_audio_enabled() else 0,
             audio_cross_attention_dim=audio_cross_attention_dim,
             norm_eps=norm_eps,
-            attention_type=attention_type,
+            ops=ops,
             apply_gated_attention=apply_gated_attention,
         )
+        # Hook for per-block input prep. Compile transforms in `compiling.py`
+        # wrap (not replace) this with a processor that also marks the seq dim
+        # dynamic, so any caller customisation here is preserved as the inner.
+        self.block_input_processor = BlockPerturbationsProcessor()
 
     @property
     def _adaln_embedding_coefficient(self) -> int:
@@ -284,7 +293,7 @@ class LTXModel(torch.nn.Module):
         audio_attention_head_dim: int,
         audio_cross_attention_dim: int,
         norm_eps: float,
-        attention_type: AttentionFunction | AttentionCallable,
+        ops: TransformerOpsConfig,
         apply_gated_attention: bool,
     ) -> None:
         """Initialize transformer blocks for LTX."""
@@ -315,14 +324,13 @@ class LTXModel(torch.nn.Module):
         self.transformer_blocks = torch.nn.ModuleList(
             [
                 BasicAVTransformerBlock(
-                    idx=idx,
                     video=video_config,
                     audio=audio_config,
                     rope_type=self.rope_type,
                     norm_eps=norm_eps,
-                    attention_function=attention_type,
+                    ops=ops,
                 )
-                for idx in range(num_layers)
+                for _ in range(num_layers)
             ]
         )
 
@@ -340,29 +348,44 @@ class LTXModel(torch.nn.Module):
         self,
         video: TransformerArgs | None,
         audio: TransformerArgs | None,
-        perturbations: BatchedPerturbationConfig,
-    ) -> tuple[TransformerArgs, TransformerArgs]:
-        """Process transformer blocks for LTXAV."""
+        perturbations: BatchedPerturbationConfig | None,
+    ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
+        """Process transformer blocks for LTXAV.
+        Per-block perturbation masks are precomputed here and attached to each
+        modality's ``TransformerArgs`` so the block forward has no per-block
+        identity to specialise on — all blocks share a single Dynamo cache slot.
+        """
+        if perturbations is None:
+            batch_size = (video or audio).x.shape[0]
+            perturbations = BatchedPerturbationConfig.empty(batch_size)
 
-        # Process transformer blocks
-        for block in self.transformer_blocks:
+        for block_idx, block in enumerate(self.transformer_blocks):
+            if video is not None:
+                video = self.block_input_processor(
+                    video,
+                    perturbations,
+                    block_idx,
+                    self_attn_type=PerturbationType.SKIP_VIDEO_SELF_ATTN,
+                    cross_attn_type=PerturbationType.SKIP_A2V_CROSS_ATTN,
+                )
+            if audio is not None:
+                audio = self.block_input_processor(
+                    audio,
+                    perturbations,
+                    block_idx,
+                    self_attn_type=PerturbationType.SKIP_AUDIO_SELF_ATTN,
+                    cross_attn_type=PerturbationType.SKIP_V2A_CROSS_ATTN,
+                )
+
             if self._enable_gradient_checkpointing and self.training:
-                # Use gradient checkpointing to save memory during training.
-                # With use_reentrant=False, we can pass dataclasses directly -
-                # PyTorch will track all tensor leaves in the computation graph.
                 video, audio = torch.utils.checkpoint.checkpoint(
                     block,
                     video,
                     audio,
-                    perturbations,
                     use_reentrant=False,
                 )
             else:
-                video, audio = block(
-                    video=video,
-                    audio=audio,
-                    perturbations=perturbations,
-                )
+                video, audio = block(video=video, audio=audio)
 
         return video, audio
 

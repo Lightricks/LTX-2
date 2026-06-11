@@ -3,26 +3,27 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Generic
 
+import safetensors
 import torch
 from torch import nn
 
 from ltx_core.block_streaming.disk import DiskBlockReader, DiskTensorReader, LoraSource
-from ltx_core.block_streaming.pool import BlockLayout, WeightPool
+from ltx_core.block_streaming.pool import WeightPool
 from ltx_core.block_streaming.provider import WeightsProvider
 from ltx_core.block_streaming.source import DiskWeightSource, PinnedWeightSource, WeightSource
-from ltx_core.block_streaming.utils import build_pool_layout, resolve_attr
+from ltx_core.block_streaming.utils import allocate_layout_views, derive_layout, make_block_key, resolve_attr
 from ltx_core.block_streaming.wrapper import BlockStreamingWrapper
-from ltx_core.loader.fuse_loras import apply_loras
+from ltx_core.loader.fuse_loras import FuseRule, bf16_fuse_rule, fuse_lora_weights
 from ltx_core.loader.helpers import create_meta_model, load_state_dict, read_model_config
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.primitives import (
     LoraPathStrengthAndSDOps,
     LoraStateDictWithStrength,
     ModelBuilderProtocol,
+    StateDict,
     StateDictLoader,
 )
 from ltx_core.loader.registry import DummyRegistry, Registry
@@ -49,14 +50,13 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         loras: LoRA adapters fused into weights at load time.
         model_loader: Strategy for reading checkpoint metadata.
         registry: Shared cache for loaded state dicts.
+        fuse_rule: Per-policy LoRA merge rule. Defaults to ``bf16_fuse_rule``;
+            use ``fp8_cast_fuse_rule`` for fp8_cast streaming so the pinned
+            buffers receive correctly-quantized weights.
         blocks_attr: Dotted path to the ``nn.ModuleList`` (e.g.
-            ``"velocity_model.transformer_blocks"``).
+            ``"transformer_blocks"``).
         blocks_prefix: State-dict key prefix for block weights
             (e.g. ``"transformer_blocks"``).
-        state_dict_prefix: Key prefix for non-block weights
-            (e.g. ``"velocity_model."``).
-        model_wrapper: Optional callable wrapping the model
-            (e.g. ``X0Model``).
     """
 
     model_class_configurator: type[ModelConfigurator[ModelType]]
@@ -66,12 +66,11 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
     loras: tuple[LoraPathStrengthAndSDOps, ...] = field(default_factory=tuple)
     model_loader: StateDictLoader = field(default_factory=SafetensorsModelStateDictLoader)
     registry: Registry = field(default_factory=DummyRegistry)
+    fuse_rule: FuseRule = bf16_fuse_rule
 
     # Streaming-specific
     blocks_attr: str = ""
     blocks_prefix: str = ""
-    state_dict_prefix: str = ""
-    model_wrapper: Callable[[ModelType], nn.Module] | None = None
 
     def with_sd_ops(self, sd_ops: SDOps | None) -> StreamingModelBuilder:
         return replace(self, model_sd_ops=sd_ops)
@@ -81,6 +80,9 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
 
     def with_loras(self, loras: tuple[LoraPathStrengthAndSDOps, ...]) -> StreamingModelBuilder:
         return replace(self, loras=loras)
+
+    def with_fuse_rule(self, fuse_rule: FuseRule) -> StreamingModelBuilder:
+        return replace(self, fuse_rule=fuse_rule)
 
     def model_config(self) -> dict:
         """Read model configuration from the checkpoint metadata."""
@@ -110,32 +112,44 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         if not self.blocks_prefix:
             raise ValueError("blocks_prefix must be non-empty for streaming")
 
-        # 1. Create meta model (no weights allocated).
         config = read_model_config(self.model_path, self.model_loader)
         meta_model: nn.Module = create_meta_model(self.model_class_configurator, config, self.module_ops)
-        if self.model_wrapper is not None:
-            meta_model = self.model_wrapper(meta_model)
         meta_model.eval()
 
         blocks = resolve_attr(meta_model, self.blocks_attr)
-        layout = build_pool_layout(blocks[0], dtype)
 
-        # 2. Determine slot counts.
+        checkpoint_paths = list(self.model_path) if isinstance(self.model_path, tuple) else [self.model_path]
+        block_key_map, non_block_keys = _scan_checkpoint_keys(checkpoint_paths, self.model_sd_ops, self.blocks_prefix)
+
         cpu_slots_count = cpu_slots_count if cpu_slots_count is not None else len(blocks)
         gpu_slots_count = gpu_slots_count if gpu_slots_count is not None else _DEFAULT_GPU_SLOTS
 
-        # 3. Build source and load non-block weights.
         if cpu_slots_count >= len(blocks):
-            source, lora_sources = self._build_pinned_source(meta_model, target_device, dtype, cpu_slots_count)
+            source, lora_sources = self._build_pinned_source(
+                meta_model, target_device, dtype, cpu_slots_count, block_key_map, non_block_keys
+            )
         else:
-            source, lora_sources = self._build_disk_source(meta_model, layout, target_device, dtype, cpu_slots_count)
+            reader = DiskTensorReader(checkpoint_paths)
+            source, lora_sources = self._build_disk_source(
+                meta_model, target_device, dtype, cpu_slots_count, reader, block_key_map, non_block_keys
+            )
 
-        # 4. Create provider and wrapper.
         copy_stream = torch.cuda.Stream(device=target_device)
         gpu_pool = WeightPool(
-            layout, gpu_slots_count, target_device, reuse_barrier=lambda event: copy_stream.wait_event(event)
+            source.block_layout,
+            gpu_slots_count,
+            target_device,
+            reuse_barrier=lambda event: copy_stream.wait_event(event),
         )
-        provider = WeightsProvider(gpu_pool, copy_stream, target_device, source, lora_sources, self.blocks_prefix)
+        provider = WeightsProvider(
+            gpu_pool,
+            copy_stream,
+            target_device,
+            source,
+            lora_sources,
+            self.blocks_prefix,
+            fuse_rule=self.fuse_rule,
+        )
         return BlockStreamingWrapper(
             model=meta_model,
             blocks=blocks,
@@ -149,89 +163,92 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         target_device: torch.device,
         dtype: torch.dtype,
         cpu_slots_count: int,
+        block_key_map: dict[int, list[tuple[str, str]]],
+        non_block_keys: list[tuple[str, str]],
     ) -> tuple[WeightSource, list[LoraSource]]:
         """Pre-load all blocks into pinned CPU buffers with LoRA fusion."""
         model_sd = load_state_dict(
             self.model_path, self.model_loader, self.registry, torch.device("cpu"), self.model_sd_ops
         )
 
-        if self.loras:
-            lora_sds = [
-                load_state_dict([lora.path], self.model_loader, self.registry, torch.device("cpu"), lora.sd_ops)
-                for lora in self.loras
-            ]
-            lora_sd_and_strengths = [
-                LoraStateDictWithStrength(sd, lora.strength) for sd, lora in zip(lora_sds, self.loras, strict=True)
-            ]
-            model_sd = apply_loras(
-                model_sd=model_sd,
-                lora_sd_and_strengths=lora_sd_and_strengths,
-                dtype=dtype,
-                destination_sd=model_sd if isinstance(self.registry, DummyRegistry) else None,
+        lora_sd_and_strengths = [
+            LoraStateDictWithStrength(
+                load_state_dict([lora.path], self.model_loader, self.registry, torch.device("cpu"), lora.sd_ops),
+                lora.strength,
             )
+            for lora in self.loras
+        ]
 
-        # Partition: non-block weights go to GPU, block weights go directly
-        # to pinned buffers.  This avoids holding the full state dict and
-        # pinned copies simultaneously.
-        non_block_sd: dict[str, torch.Tensor] = {}
-        block_tensors: dict[int, dict[str, torch.Tensor]] = {}
-        prefix_dot = self.blocks_prefix + "."
+        for block_idx in block_key_map:
+            if block_idx >= cpu_slots_count:
+                raise ValueError(
+                    f"Pinned source requires one CPU slot per block; "
+                    f"got block index {block_idx} with only {cpu_slots_count} slots."
+                )
 
-        for key, tensor in model_sd.sd.items():
-            if key.startswith(prefix_dot):
-                rest = key[len(prefix_dot) :]
-                idx_str, _, param_name = rest.partition(".")
-                try:
-                    block_idx = int(idx_str)
-                except ValueError:
-                    non_block_sd[self.state_dict_prefix + key] = tensor.to(device=target_device, dtype=dtype)
-                    continue
-                block_tensors.setdefault(block_idx, {})[param_name] = tensor
+        blocks = resolve_attr(meta_model, self.blocks_attr)
+        block_tensors: dict[str, torch.Tensor] = {}
+        for block_idx, entries in block_key_map.items():
+            block_params = dict(blocks[block_idx].named_parameters())
+            for _sft_key, param_name in entries:
+                key = make_block_key(self.blocks_prefix, block_idx, param_name)
+                block_tensors[key] = block_params[param_name]
+        blocks_layout = derive_layout(block_tensors, dtype)
+        pinned_blocks = allocate_layout_views(blocks_layout, pin_memory=True)
+
+        should_sync = False
+        for key, fused in fuse_lora_weights(
+            model_sd, lora_sd_and_strengths, fuse_rule=self.fuse_rule, preserve_input_device=False
+        ):
+            if key in pinned_blocks:
+                pinned_blocks[key].copy_(fused, non_blocking=True)
+                model_sd.sd[key] = None
+                should_sync = True
             else:
-                non_block_sd[self.state_dict_prefix + key] = tensor.to(device=target_device, dtype=dtype)
+                model_sd.sd[key] = fused
+        if should_sync:
+            torch.cuda.synchronize()
+
+        # Fill remaining pinned keys from the source state dict.
+        for key in blocks_layout:
+            if model_sd.sd[key] is None:
+                continue
+            pinned_blocks[key].copy_(model_sd.sd[key])
+            model_sd.sd[key] = None
+
+        pinned: dict[int, dict[str, torch.Tensor]] = {
+            block_idx: {
+                param_name: pinned_blocks[make_block_key(self.blocks_prefix, block_idx, param_name)]
+                for _sft_key, param_name in entries
+            }
+            for block_idx, entries in block_key_map.items()
+        }
+
+        non_block_sd: dict[str, torch.Tensor] = {
+            model_key: model_sd.sd[model_key].to(device=target_device, dtype=dtype)
+            for _sft_key, model_key in non_block_keys
+        }
 
         meta_model.load_state_dict(non_block_sd, strict=False, assign=True)
-        del model_sd, non_block_sd
-
-        # Pin block weights one block at a time, freeing the source tensors as we go.
-        pinned: dict[int, dict[str, torch.Tensor]] = {}
-        for idx in range(cpu_slots_count):
-            src = block_tensors.pop(idx)
-            pinned[idx] = {name: tensor.to(dtype=dtype).pin_memory() for name, tensor in src.items()}
 
         return PinnedWeightSource(pinned), []
 
     def _build_disk_source(
         self,
         meta_model: nn.Module,
-        layout: BlockLayout,
         target_device: torch.device,
         dtype: torch.dtype,
         cpu_slots_count: int,
+        reader: DiskTensorReader,
+        block_key_map: dict[int, list[tuple[str, str]]],
+        non_block_keys: list[tuple[str, str]],
     ) -> tuple[WeightSource, list[LoraSource]]:
-        """Create a DiskWeightSource backed by a DiskBlockReader for lazy loading."""
+        """Create a DiskWeightSource backed by a DiskBlockReader for lazy loading.
+        Derives the shared pool layout from the meta model's block 0 - this
+        relies on module_ops (e.g. fp8_cast) leaving the meta param dtype in
+        sync with the post-sd_ops checkpoint dtype.
+        """
         lora_sources = [LoraSource(lora.path, lora.sd_ops, lora.strength) for lora in self.loras]
-        checkpoint_paths = list(self.model_path) if isinstance(self.model_path, tuple) else [self.model_path]
-        reader = DiskTensorReader(checkpoint_paths)
-
-        block_key_map: dict[int, list[tuple[str, str]]] = {}
-        non_block_keys: list[tuple[str, str]] = []
-
-        for sft_key in reader.keys():  # noqa: SIM118
-            model_key = self.model_sd_ops.apply_to_key(sft_key) if self.model_sd_ops else sft_key
-            if model_key is None:
-                continue
-            if model_key.startswith(self.blocks_prefix + "."):
-                rest = model_key[len(self.blocks_prefix) + 1 :]
-                idx_str, _, param_name = rest.partition(".")
-                try:
-                    block_idx = int(idx_str)
-                except ValueError:
-                    non_block_keys.append((sft_key, model_key))
-                    continue
-                block_key_map.setdefault(block_idx, []).append((sft_key, param_name))
-            else:
-                non_block_keys.append((sft_key, model_key))
 
         self._load_non_block_weights(
             reader,
@@ -240,10 +257,12 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
             target_device,
             dtype,
             sd_ops=self.model_sd_ops,
-            key_prefix=self.state_dict_prefix,
             lora_sources=lora_sources,
-            matmul_device=target_device,
+            fuse_rule=self.fuse_rule,
         )
+
+        blocks = resolve_attr(meta_model, self.blocks_attr)
+        layout = derive_layout(dict(blocks[0].named_parameters()), dtype)
 
         cpu_pool = WeightPool(
             layout,
@@ -252,31 +271,14 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
             reuse_barrier=lambda event: event.synchronize(),
             pin_memory=True,
         )
-        block_reader = DiskBlockReader(reader=reader, block_key_map=block_key_map, dtype=dtype)
+        block_reader = DiskBlockReader(
+            reader=reader,
+            block_key_map=block_key_map,
+            sd_ops=self.model_sd_ops,
+            blocks_prefix=self.blocks_prefix,
+        )
         source = DiskWeightSource(cpu_pool, block_reader)
         return source, lora_sources
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _fuse_lora_delta(
-        model_key: str,
-        tensor: torch.Tensor,
-        lora_sources: list[LoraSource],
-        matmul_device: torch.device | None = None,
-    ) -> torch.Tensor:
-        """Add all matching LoRA deltas to *tensor* in-place."""
-        if not lora_sources or not model_key.endswith(".weight"):
-            return tensor
-        prefix = model_key[: -len(".weight")]
-        device = tensor.device if tensor.device.type == "cuda" else matmul_device
-        for source in lora_sources:
-            delta = source.get_delta(prefix, device=device)
-            if delta is not None:
-                tensor = tensor.add_(delta.to(device=tensor.device, dtype=tensor.dtype))
-        return tensor
 
     @staticmethod
     @torch.inference_mode()
@@ -287,19 +289,65 @@ class StreamingModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType])
         device: torch.device,
         dtype: torch.dtype,
         sd_ops: SDOps | None = None,
-        key_prefix: str = "",
         lora_sources: list[LoraSource] | None = None,
-        matmul_device: torch.device | None = None,
+        fuse_rule: FuseRule = bf16_fuse_rule,
     ) -> None:
-        """Load non-block weights into *model* on *device*."""
-        state_dict: dict[str, torch.Tensor] = {}
-        sources = lora_sources or []
+        """Load non-block weights into *model* on *device*, applying ``sd_ops`` and fusing LoRAs.
+        Fusion goes through :func:`fuse_lora_weights` under *fuse_rule* so the
+        bf16 rounding pattern matches the non-streaming and block-streaming
+        paths, and any quantization-specific fuse rule the builder configures
+        is honored here as well.
+        """
+        non_block_sd: dict[str, torch.Tensor] = {}
         for sft_key, model_key in non_block_keys:
             tensor = reader.get_tensor(sft_key).to(device=device, dtype=dtype)
-            tensor = StreamingModelBuilder._fuse_lora_delta(model_key, tensor, sources, matmul_device)
             if sd_ops is not None:
                 for kv in sd_ops.apply_to_key_value(model_key, tensor):
-                    state_dict[key_prefix + kv.new_key] = kv.new_value
-                continue
-            state_dict[key_prefix + model_key] = tensor
-        model.load_state_dict(state_dict, strict=False, assign=True)
+                    non_block_sd[kv.new_key] = kv.new_value
+            else:
+                non_block_sd[model_key] = tensor
+
+        if lora_sources:
+            lora_sd_and_strengths = [src.as_state_dict_with_strength() for src in lora_sources]
+            non_block_state = StateDict(sd=non_block_sd, device=device, size=0, dtype={dtype})
+            for key, fused in fuse_lora_weights(
+                non_block_state,
+                lora_sd_and_strengths,
+                fuse_rule=fuse_rule,
+                preserve_input_device=True,
+            ):
+                non_block_sd[key] = fused
+
+        model.load_state_dict(non_block_sd, strict=False, assign=True)
+
+
+def _scan_checkpoint_keys(
+    checkpoint_paths: list[str],
+    sd_ops: SDOps | None,
+    blocks_prefix: str,
+) -> tuple[dict[int, list[tuple[str, str]]], list[tuple[str, str]]]:
+    """Partition checkpoint keys into per-block and non-block lists.
+    Opens the safetensors files for header-only key enumeration; no tensor data
+    is read.
+    """
+    block_key_map: dict[int, list[tuple[str, str]]] = {}
+    non_block_keys: list[tuple[str, str]] = []
+    prefix_dot = blocks_prefix + "."
+    for path in checkpoint_paths:
+        with safetensors.safe_open(path, framework="pt", device="cpu") as handle:
+            for sft_key in handle.keys():  # noqa: SIM118
+                model_key = sd_ops.apply_to_key(sft_key) if sd_ops else sft_key
+                if model_key is None:
+                    continue
+                if model_key.startswith(prefix_dot):
+                    rest = model_key[len(prefix_dot) :]
+                    idx_str, _, param_name = rest.partition(".")
+                    try:
+                        block_idx = int(idx_str)
+                    except ValueError:
+                        non_block_keys.append((sft_key, model_key))
+                        continue
+                    block_key_map.setdefault(block_idx, []).append((sft_key, param_name))
+                else:
+                    non_block_keys.append((sft_key, model_key))
+    return block_key_map, non_block_keys

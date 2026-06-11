@@ -143,6 +143,27 @@ uv run python scripts/process_dataset.py dataset.json \
 > [!NOTE]
 > When training with multiple resolution buckets, set `optimization.batch_size: 1`.
 
+**Multi-GPU preprocessing.** Launch with `accelerate launch` to shard the dataset across processes. Reruns resume
+by default (existing `.pt` outputs are skipped); writes are atomic so interrupted runs are safe. Pass `--overwrite`
+when rerunning with changed parameters (different model, resolution buckets, text encoder, `--lora-trigger`, etc.)
+so stale outputs are replaced. Use the same `accelerate launch` pattern (and `--overwrite` when needed) with
+`process_videos.py` or `process_captions.py` when you run those scripts standalone.
+
+```bash
+# Multi-GPU preprocessing
+uv run accelerate launch --num_processes 4 scripts/process_dataset.py dataset.json \
+    --resolution-buckets "960x544x49" \
+    --model-path /path/to/ltx-2-model.safetensors \
+    --text-encoder-path /path/to/gemma-model
+
+# Force re-encoding of all items (e.g. after switching model or resolution)
+uv run accelerate launch --num_processes 4 scripts/process_dataset.py dataset.json \
+    --resolution-buckets "960x544x49" \
+    --model-path /path/to/ltx-2.3-model.safetensors \
+    --text-encoder-path /path/to/gemma-model \
+    --overwrite
+```
+
 For detailed usage, see the [Dataset Preparation Guide](dataset-preparation.md).
 
 ### Reference Video Generation

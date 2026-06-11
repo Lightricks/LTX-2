@@ -183,7 +183,7 @@ def module_ops_from_gemma_root(gemma_root: str) -> tuple[ModuleOps, ...]:
         return module
 
     def load_processor(module: GemmaTextEncoder) -> GemmaTextEncoder:
-        image_processor = AutoImageProcessor.from_pretrained(processor_root, local_files_only=True)
+        image_processor = AutoImageProcessor.from_pretrained(processor_root, local_files_only=True, use_fast=False)
         if not module.tokenizer:
             raise ValueError("Tokenizer model operation must be performed before processor model operation")
         module.processor = Gemma3Processor(image_processor=image_processor, tokenizer=module.tokenizer.tokenizer)

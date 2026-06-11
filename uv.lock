@@ -2063,7 +2063,7 @@ wheels = [
 
 [[package]]
 name = "ltx-core"
-version = "1.1.2"
+version = "1.1.5"
 source = { editable = "packages/ltx-core" }
 dependencies = [
     { name = "accelerate" },
@@ -2121,7 +2121,7 @@ dev = [{ name = "scikit-image", specifier = ">=0.25.2" }]
 
 [[package]]
 name = "ltx-pipelines"
-version = "1.1.2"
+version = "1.1.5"
 source = { editable = "packages/ltx-pipelines" }
 dependencies = [
     { name = "av" },
@@ -2144,7 +2144,7 @@ requires-dist = [
 
 [[package]]
 name = "ltx-trainer"
-version = "1.1.2"
+version = "1.1.5"
 source = { editable = "packages/ltx-trainer" }
 dependencies = [
     { name = "accelerate" },
@@ -7105,7 +7105,7 @@ dependencies = [
     { name = "torch", version = "2.9.1", source = { registry = "https://pypi.org/simple" } },
 ]
 wheels = [
-    { url = "https://download.pytorch.org/whl/cu129/xformers-0.0.33%2B5d4b92a5.d20251029-cp39-abi3-linux_x86_64.whl", upload-time = "2025-10-30T00:15:46Z" },
+    { url = "https://download.pytorch.org/whl/cu129/xformers-0.0.33%2B5d4b92a5.d20251029-cp39-abi3-linux_x86_64.whl", hash = "sha256:4e4f2dea153b60ca4f21cc44b82c072b97b096a16f1920c7539c91ec8ffd7ba4", upload-time = "2026-04-27T19:01:32Z" },
 ]
 
 [[package]]

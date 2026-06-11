@@ -11,6 +11,7 @@ from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.conditioning.types.noise_mask_cond import TemporalRegionMask
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
+from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import (
@@ -73,7 +74,7 @@ class RetakePipeline:
         quantization: QuantizationPolicy | None = None,
         registry: Registry | None = None,
         distilled: bool = True,
-        torch_compile: bool = False,
+        compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
     ):
         self.device = device or get_device()
@@ -108,7 +109,7 @@ class RetakePipeline:
             loras=tuple(loras),
             quantization=quantization,
             registry=registry,
-            torch_compile=torch_compile,
+            compilation_config=compilation_config,
             offload_mode=offload_mode,
         )
         self.video_decoder = VideoDecoder(
@@ -283,7 +284,7 @@ class RetakePipeline:
 @torch.inference_mode()
 def main() -> None:
     """CLI entry point for retake (regenerate a time region)."""
-    logging.getLogger().setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO)
     parser = video_editing_arg_parser(distilled=True)
     parser.description = "Retake: regenerate a time region of a video with LTX-2."
     args = parser.parse_args()
@@ -307,8 +308,8 @@ def main() -> None:
         gemma_root=args.gemma_root,
         loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
-        distilled=args.distilled,
-        torch_compile=args.compile,
+        distilled=True,
+        compilation_config=args.compile,
         offload_mode=args.offload_mode,
     )
     params = detect_params(args.distilled_checkpoint_path)

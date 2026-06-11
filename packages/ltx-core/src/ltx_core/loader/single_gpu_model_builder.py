@@ -5,7 +5,7 @@ from typing import Generic
 import torch
 from torch import nn
 
-from ltx_core.loader.fuse_loras import apply_loras
+from ltx_core.loader.fuse_loras import FuseRule, apply_loras, bf16_fuse_rule
 from ltx_core.loader.helpers import create_meta_model, load_state_dict, read_model_config
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.primitives import (
@@ -46,6 +46,7 @@ def _load_model_weights(
     dtype: torch.dtype | None,
     model_sd_ops: SDOps | None = None,
     lora_load_device: torch.device | None = None,
+    fuse_rule: FuseRule = bf16_fuse_rule,
 ) -> None:
     """Load base weights and fuse LoRAs into *meta_model* in-place."""
     if lora_load_device is None:
@@ -57,7 +58,7 @@ def _load_model_weights(
     if not lora_strengths or (min(lora_strengths) == 0 and max(lora_strengths) == 0):
         sd = model_sd.sd
         if dtype is not None:
-            sd = {key: value.to(dtype=dtype) for key, value in model_sd.sd.items()}
+            sd = {key: value.to(dtype=dtype) for key, value in sd.items()}
         meta_model.load_state_dict(sd, strict=False, assign=True)
         return
 
@@ -68,10 +69,13 @@ def _load_model_weights(
     final_sd = apply_loras(
         model_sd=model_sd,
         lora_sd_and_strengths=lora_sd_and_strengths,
-        dtype=dtype,
+        fuse_rule=fuse_rule,
         destination_sd=model_sd if isinstance(registry, DummyRegistry) else None,
     )
-    meta_model.load_state_dict(final_sd.sd, strict=False, assign=True)
+    fused_sd = final_sd.sd
+    if dtype is not None:
+        fused_sd = {key: value.to(dtype=dtype) for key, value in fused_sd.items()}
+    meta_model.load_state_dict(fused_sd, strict=False, assign=True)
 
 
 @dataclass(frozen=True)
@@ -91,6 +95,7 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
             ``torch.device("cpu")``, which keeps LoRA weights in CPU memory and transfers them to
             the target GPU sequentially during fusion, reducing peak GPU memory usage compared to
             loading all LoRA weights directly onto the GPU at once.
+        fuse_rule: Per-policy LoRA merge rule. Defaults to ``bf16_fuse_rule``;
     """
 
     model_class_configurator: type[ModelConfigurator[ModelType]]
@@ -101,8 +106,9 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
     model_loader: StateDictLoader = field(default_factory=SafetensorsModelStateDictLoader)
     registry: Registry = field(default_factory=DummyRegistry)
     lora_load_device: torch.device = field(default_factory=lambda: torch.device("cpu"))
+    fuse_rule: FuseRule = bf16_fuse_rule
 
-    def lora(self, lora_path: str, strength: float = 1.0, sd_ops: SDOps | None = None) -> "SingleGPUModelBuilder":
+    def lora(self, lora_path: str, strength: float, sd_ops: SDOps) -> "SingleGPUModelBuilder":
         return replace(self, loras=(*self.loras, LoraPathStrengthAndSDOps(lora_path, strength, sd_ops)))
 
     def with_sd_ops(self, sd_ops: SDOps | None) -> "SingleGPUModelBuilder":
@@ -119,6 +125,9 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
 
     def with_lora_load_device(self, device: torch.device) -> "SingleGPUModelBuilder":
         return replace(self, lora_load_device=device)
+
+    def with_fuse_rule(self, fuse_rule: FuseRule) -> "SingleGPUModelBuilder":
+        return replace(self, fuse_rule=fuse_rule)
 
     def model_config(self) -> dict:
         return read_model_config(self.model_path, self.model_loader)
@@ -158,5 +167,6 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
             dtype=dtype,
             model_sd_ops=self.model_sd_ops,
             lora_load_device=self.lora_load_device,
+            fuse_rule=self.fuse_rule,
         )
         return self._return_model(meta_model, device)

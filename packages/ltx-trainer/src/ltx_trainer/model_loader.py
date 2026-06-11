@@ -199,8 +199,6 @@ def load_text_encoder(
         device: Device to load model on
         dtype: Data type for model weights
         load_in_8bit: Whether to load the Gemma model in 8-bit precision using bitsandbytes.
-            When True, the model is loaded with device_map="auto" and the device argument
-            is ignored for the Gemma backbone.
     Returns:
         Loaded GemmaTextEncoder
     """
@@ -211,7 +209,7 @@ def load_text_encoder(
     if load_in_8bit:
         from ltx_trainer.gemma_8bit import load_8bit_gemma
 
-        return load_8bit_gemma(gemma_model_path, dtype)
+        return load_8bit_gemma(gemma_model_path, dtype, device=device)
 
     # Standard loading path
     from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder

@@ -10,7 +10,12 @@ from ltx_core.loader.sd_ops import SDOps
 from ltx_core.model.model_protocol import ModelType
 
 if TYPE_CHECKING:
+    from ltx_core.loader.fuse_loras import FuseRule
     from ltx_core.loader.registry import Registry
+
+
+# Per-key shape and dtype description for a flat collection of tensors.
+TensorLayout = dict[str, tuple[torch.Size, torch.dtype]]
 
 
 @dataclass(frozen=True)
@@ -52,7 +57,15 @@ class StateDictLoader(Protocol):
         """
 
 
-class ModelBuilderProtocol(Protocol[ModelType]):
+class BuilderProtocol(Protocol[ModelType]):
+    """Protocol for model builders that produce a model via ``build()``."""
+
+    def build(
+        self, device: torch.device | None = None, dtype: torch.dtype | None = None, **kwargs: object
+    ) -> ModelType: ...
+
+
+class ModelBuilderProtocol(BuilderProtocol[ModelType], Protocol[ModelType]):
     """
     Protocol for building PyTorch models from configuration dictionaries.
     Implementations must provide:
@@ -96,6 +109,10 @@ class ModelBuilderProtocol(Protocol[ModelType]):
 
     def with_lora_load_device(self, device: torch.device) -> "ModelBuilderProtocol[ModelType]":
         """Return a copy of this builder that loads LoRA weights onto the given device."""
+        ...
+
+    def with_fuse_rule(self, fuse_rule: "FuseRule") -> "ModelBuilderProtocol[ModelType]":
+        """Return a copy of this builder with the given LoRA fuse rule (e.g. from a quantization policy)."""
         ...
 
     def build(

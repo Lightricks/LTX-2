@@ -50,6 +50,7 @@ def preprocess_dataset(  # noqa: PLR0913
     reference_downscale_factor: int = 1,
     with_audio: bool = False,
     load_text_encoder_in_8bit: bool = False,
+    overwrite: bool = False,
 ) -> None:
     """Run the preprocessing pipeline with the given arguments."""
     # Validate dataset file
@@ -77,6 +78,7 @@ def preprocess_dataset(  # noqa: PLR0913
             batch_size=batch_size,
             device=device,
             load_in_8bit=load_text_encoder_in_8bit,
+            overwrite=overwrite,
         )
 
     # Process videos using the dedicated function
@@ -97,6 +99,7 @@ def preprocess_dataset(  # noqa: PLR0913
             vae_tiling=vae_tiling,
             with_audio=with_audio,
             audio_output_dir=str(audio_latents_dir) if audio_latents_dir else None,
+            overwrite=overwrite,
         )
 
         # Process reference videos if reference_column is provided
@@ -133,6 +136,7 @@ def preprocess_dataset(  # noqa: PLR0913
                 batch_size=batch_size,
                 device=device,
                 vae_tiling=vae_tiling,
+                overwrite=overwrite,
             )
 
     # Handle decoding if requested (for verification)
@@ -252,8 +256,15 @@ def main(  # noqa: PLR0913
         help="Downscale factor for reference video resolution. When > 1, reference videos are processed at "
         "1/n resolution (e.g., 2 means half resolution). Used for efficient IC-LoRA training.",
     ),
+    overwrite: bool = typer.Option(
+        default=False,
+        help="Re-compute every item even if its output exists. Use when rerunning with "
+        "changed parameters (different model, resolution, etc.) so stale outputs are replaced.",
+    ),
 ) -> None:
     """Preprocess a video dataset by computing and saving latents and text embeddings.
+    For multi-GPU preprocessing, invoke under ``accelerate launch`` - each process
+    will handle an interleaved shard of the dataset.
     The dataset must be a CSV, JSON, or JSONL file with columns for captions and video paths.
     This script is designed for LTX-2 models which use the Gemma text encoder.
     Examples:
@@ -310,6 +321,7 @@ def main(  # noqa: PLR0913
         reference_downscale_factor=reference_downscale_factor,
         with_audio=with_audio,
         load_text_encoder_in_8bit=load_text_encoder_in_8bit,
+        overwrite=overwrite,
     )
 
 

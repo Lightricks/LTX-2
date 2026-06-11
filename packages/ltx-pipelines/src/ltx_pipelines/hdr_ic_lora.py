@@ -48,7 +48,7 @@ from ltx_core.model.video_vae import TilingConfig, VideoEncoder
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.tiling import DimensionTilingConfig, TileCountConfig
 from ltx_core.tools import VideoLatentTools
-from ltx_core.types import VideoLatentShape
+from ltx_core.types import VideoLatentShape, VideoPixelShape
 from ltx_pipelines.utils.blocks import (
     DiffusionStage,
     ImageConditioner,
@@ -59,6 +59,7 @@ from ltx_pipelines.utils.constants import DISTILLED_SIGMA_VALUES, STAGE_2_DISTIL
 from ltx_pipelines.utils.denoisers import SimpleDenoiser
 from ltx_pipelines.utils.helpers import get_device, modality_from_latent_state
 from ltx_pipelines.utils.media_io import ResizeMode, align_resolution, load_video_conditioning_hdr
+from ltx_pipelines.utils.quantization_factory import QuantizationKind
 from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
 
 logger = logging.getLogger(__name__)
@@ -77,7 +78,7 @@ ALIGNMENT_DIVISOR = 64
 # to the pipeline constructor.
 TILED_VAE_ENCODE_PIXEL_THRESHOLD = 512 * 768
 
-_DEFAULT_QUANTIZATION = QuantizationPolicy.fp8_cast()
+_DEFAULT_QUANTIZATION = QuantizationKind.FP8_CAST
 
 # Default stage-2 configuration: one refinement phase with modest 2-way tiling
 # in every dimension and a short 2-step distilled sigma schedule.
@@ -205,7 +206,7 @@ class HDRICLoraPipeline:
         hdr_lora: str | Path,
         text_embeddings_path: str | Path,
         device: torch.device | None = None,
-        quantization: QuantizationPolicy = _DEFAULT_QUANTIZATION,
+        quantization: QuantizationPolicy | QuantizationKind | None = _DEFAULT_QUANTIZATION,
         registry: Registry | None = None,
         hdr_lora_config: HdrLoraConfig | None = None,
         tiled_vae_encode_pixel_threshold: int = TILED_VAE_ENCODE_PIXEL_THRESHOLD,
@@ -232,6 +233,8 @@ class HDRICLoraPipeline:
         """
         self.device = device or get_device()
         self._tiled_vae_encode_threshold = tiled_vae_encode_pixel_threshold
+        if isinstance(quantization, QuantizationKind):
+            quantization = quantization.to_policy(checkpoint_path=distilled_checkpoint_path)
         if offload_mode != OffloadMode.NONE and quantization is not None:
             logger.info("Offload mode enabled — disabling quantization (not supported with layer streaming).")
             quantization = None
@@ -412,7 +415,22 @@ class HDRICLoraPipeline:
                 high_quality_hdr=high_quality_hdr,
             )
         )
-        with self.stage_2.model_context() as transformer:
+        # video_tools is required by TiledDataParallelBuilder when stage_2 is
+        # wrapped for multi-GPU
+        stage2_video_tools = VideoLatentTools(
+            VideoLatentPatchifier(patch_size=1),
+            VideoLatentShape.from_pixel_shape(
+                VideoPixelShape(
+                    batch=1,
+                    frames=gen_num_frames,
+                    height=gen_h,
+                    width=gen_w,
+                    fps=frame_rate,
+                )
+            ),
+            frame_rate,
+        )
+        with self.stage_2.model_context(video_tools=stage2_video_tools) as transformer:
             phase_latent = upscaled_video_latent
             for phase_idx, (tiling, sigmas_list, use_ic) in enumerate(
                 zip(stage2_tilings, stage2_sigmas, stage2_use_ic_lora, strict=True)
@@ -542,10 +560,10 @@ class HDRICLoraPipeline:
         """
         # Cast to float32 so tiled-decode accumulation buffers and blending
         # masks run in full precision, avoiding bfloat16 seam artifacts.
-        # Request float32 [0, 1] output — apply_hdr_decode_postprocess expects it.
+        # apply_hdr_decode_postprocess expects float32 [0, 1].
         latent = latent.float()
         decoded = torch.cat(
-            list(self.video_decoder(latent, tiling_config, generator, output_dtype=torch.float32)),
+            [chunk.float() for chunk in self.video_decoder(latent, tiling_config, generator)],
             dim=0,
         )
         decoded = rearrange(decoded, "f h w c -> 1 c f h w")

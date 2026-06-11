@@ -1,10 +1,12 @@
 import enum
 import logging
 import math
+import threading
 from collections.abc import Generator, Iterator
 from fractions import Fraction
 from io import BytesIO
 from pathlib import Path
+from queue import Queue
 
 import av
 import numpy as np
@@ -17,6 +19,7 @@ from tqdm import tqdm
 
 from ltx_core.hdr import LogC3
 from ltx_core.types import Audio, VideoPixelShape
+from ltx_pipelines.utils.color_conversion import FrameConverter, PixelFormat, yuv420p_bt709_converter_
 from ltx_pipelines.utils.constants import DEFAULT_IMAGE_CRF
 
 logger = logging.getLogger(__name__)
@@ -86,8 +89,8 @@ def resize_and_center_crop(tensor: torch.Tensor, height: int, width: int) -> tor
     return tensor
 
 
-def normalize_latent(latent: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    return (latent / 127.5 - 1.0).to(device=device, dtype=dtype)
+def normalize_images(images: torch.Tensor, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    return (images / 127.5 - 1.0).to(device=device, dtype=dtype)
 
 
 def to_vae_range(x: torch.Tensor) -> torch.Tensor:
@@ -116,7 +119,7 @@ def load_image_and_preprocess(
     image = preprocess(image=image, crf=crf)
     image = torch.tensor(image, dtype=torch.float32, device=device)
     image = resize_and_center_crop(image, height, width)
-    image = normalize_latent(image, device, dtype)
+    image = normalize_images(image, device, dtype)
     return image
 
 
@@ -137,11 +140,13 @@ def video_preprocess(
     Returns:
         Tensor of shape (1, C, F, height, width) with values in [-1, 1].
     """
-    result = None
+    result: torch.Tensor | None = None
     for f in frames:
         frame = resize_and_center_crop(f.to(torch.float32), height, width)
-        frame = normalize_latent(frame, device, dtype)
+        frame = normalize_images(frame, device, dtype)
         result = frame if result is None else torch.cat([result, frame], dim=2)
+    if result is None:
+        raise ValueError("video_preprocess received an empty frame generator; no frames were decoded from the source.")
     return result
 
 
@@ -325,45 +330,118 @@ def encode_video(
     audio: Audio | None,
     output_path: str,
     video_chunks_number: int,
+    frame_converter: FrameConverter = yuv420p_bt709_converter_,
+    crf: int = 19,
+    preset: str = "veryfast",
+    thread_count: int = 0,
 ) -> None:
     if isinstance(video, torch.Tensor):
         video = iter([video])
 
-    first_chunk = next(video)
+    def convert(chunk: torch.Tensor) -> torch.Tensor:
+        return frame_converter(chunk.movedim(-1, -3))
 
-    _, height, width, _ = first_chunk.shape
+    first_chunk = convert(next(video))
+
+    if frame_converter.pixel_format == PixelFormat.RGB24:
+        height, width = first_chunk.shape[-3], first_chunk.shape[-2]
+    else:
+        height = first_chunk.shape[-2] * 2 // 3
+        width = first_chunk.shape[-1]
 
     container = av.open(output_path, mode="w")
-    stream = container.add_stream("libx264", rate=int(fps))
-    stream.width = width
-    stream.height = height
-    stream.pix_fmt = "yuv420p"
+    success = False
+    try:
+        stream = container.add_stream("libx264", rate=int(fps), options={"crf": str(crf), "preset": preset})
+        stream.width = width
+        stream.height = height
+        stream.pix_fmt = "yuv420p"
+        stream.codec_context.thread_count = thread_count
+        stream.codec_context.thread_type = "FRAME"
+        if frame_converter.color_space is not None:
+            stream.codec_context.colorspace = frame_converter.color_space.av_colorspace
+        if frame_converter.color_range is not None:
+            stream.codec_context.color_range = frame_converter.color_range.av_color_range
 
-    if audio is not None:
-        audio_stream = _prepare_audio_stream(container, audio.sampling_rate)
+        if audio is not None:
+            audio_stream = _prepare_audio_stream(container, audio.sampling_rate)
 
-    def all_tiles(
-        first_chunk: torch.Tensor, tiles_generator: Generator[tuple[torch.Tensor, int], None, None]
-    ) -> Generator[tuple[torch.Tensor, int], None, None]:
-        yield first_chunk
-        yield from tiles_generator
+        av_format = frame_converter.pixel_format.av_format
 
-    for video_chunk in tqdm(all_tiles(first_chunk, video), total=video_chunks_number):
-        video_chunk_cpu = video_chunk.to("cpu").numpy()
-        for frame_array in video_chunk_cpu:
-            frame = av.VideoFrame.from_ndarray(frame_array, format="rgb24")
-            for packet in stream.encode(frame):
-                container.mux(packet)
+        def cpu_chunks() -> Generator[np.ndarray, None, None]:
+            yield first_chunk.to("cpu").numpy()
+            for chunk in video:
+                yield convert(chunk).to("cpu").numpy()
 
-    # Flush encoder
-    for packet in stream.encode():
-        container.mux(packet)
+        _encode_chunks_threaded(
+            container=container,
+            stream=stream,
+            av_format=av_format,
+            chunks=cpu_chunks(),
+            progress_total=video_chunks_number,
+        )
 
-    if audio is not None:
-        _write_audio(container, audio_stream, audio)
-
-    container.close()
+        if audio is not None:
+            _write_audio(container, audio_stream, audio)
+        success = True
+    finally:
+        container.close()
+        if not success:
+            Path(output_path).unlink(missing_ok=True)
     logger.info(f"Video saved to {output_path}")
+
+
+def _encode_chunks_threaded(
+    container: av.container.Container,
+    stream: av.video.stream.VideoStream,
+    av_format: str,
+    chunks: Iterator[np.ndarray],
+    progress_total: int,
+) -> None:
+    """Run libx264 frame.encode + container.mux on a background thread while
+    the caller produces numpy chunks on the current thread. The 1-slot queue
+    lets the producer get one chunk ahead (so the next VAE/gather chunk
+    overlaps with libx264 encoding the previous chunk) without buffering more
+    than one chunk in CPU memory.
+    """
+    chunk_queue: Queue[np.ndarray | None] = Queue(maxsize=1)
+    encoder_error: list[BaseException] = []
+
+    def encoder_worker() -> None:
+        error: BaseException | None = None
+        while True:
+            arr = chunk_queue.get()
+            if arr is None:
+                break
+            if error is not None:
+                continue
+            try:
+                for frame_array in arr:
+                    frame = av.VideoFrame.from_ndarray(frame_array, format=av_format)
+                    for packet in stream.encode(frame):
+                        container.mux(packet)
+            except Exception as e:
+                error = e
+        if error is None:
+            try:
+                for packet in stream.encode():
+                    container.mux(packet)
+            except Exception as e:
+                error = e
+        if error is not None:
+            encoder_error.append(error)
+
+    encoder_thread = threading.Thread(target=encoder_worker, name="h264-encoder")
+    encoder_thread.start()
+    try:
+        for arr in tqdm(chunks, total=progress_total):
+            chunk_queue.put(arr)
+    finally:
+        chunk_queue.put(None)
+        encoder_thread.join()
+
+    if encoder_error:
+        raise encoder_error[0]
 
 
 _INT_FORMAT_MAX: dict[str, float] = {

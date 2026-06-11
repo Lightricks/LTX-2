@@ -20,15 +20,17 @@ class SpatioTemporalScaleFactors(NamedTuple):
     """
     Describes the spatiotemporal downscaling between decoded video space and
     the corresponding VAE latent grid.
+    Field order matches the (frame/time, height, width) axis layout used by
+    latent tensors and meshgrid coordinates elsewhere in the codebase.
     """
 
     time: int
-    width: int
     height: int
+    width: int
 
     @classmethod
     def default(cls) -> "SpatioTemporalScaleFactors":
-        return cls(time=8, width=32, height=32)
+        return cls(time=8, height=32, width=32)
 
 
 VIDEO_SCALE_FACTORS = SpatioTemporalScaleFactors.default()
@@ -74,9 +76,9 @@ class VideoLatentShape(NamedTuple):
         latent_channels: int = 128,
         scale_factors: SpatioTemporalScaleFactors = VIDEO_SCALE_FACTORS,
     ) -> "VideoLatentShape":
-        frames = (shape.frames - 1) // scale_factors[0] + 1
-        height = shape.height // scale_factors[1]
-        width = shape.width // scale_factors[2]
+        frames = (shape.frames - 1) // scale_factors.time + 1
+        height = shape.height // scale_factors.height
+        width = shape.width // scale_factors.width
 
         return VideoLatentShape(
             batch=shape.batch,

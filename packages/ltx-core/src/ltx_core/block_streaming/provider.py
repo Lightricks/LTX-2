@@ -9,6 +9,31 @@ import torch
 from ltx_core.block_streaming.disk import LoraSource
 from ltx_core.block_streaming.pool import WeightPool
 from ltx_core.block_streaming.source import WeightSource
+from ltx_core.loader.fuse_loras import FuseRule, aggregate_lora_products, bf16_fuse_rule
+from ltx_core.loader.primitives import StateDict
+
+_EMPTY_STATE_DICT = StateDict(sd={}, device=torch.device("cpu"), size=0, dtype=set())
+
+
+def _contiguous_byte_view(weights: dict[str, torch.Tensor]) -> torch.Tensor | None:
+    """Return a ``uint8`` view spanning every tensor in *weights*, or ``None`` if
+    they don't share one contiguous storage region."""
+    tensors = list(weights.values())
+    if not tensors:
+        return None
+    storage = tensors[0].untyped_storage()
+    storage_ptr = storage.data_ptr()
+    start = end = tensors[0].storage_offset() * tensors[0].element_size()
+    for t in tensors:
+        if t.untyped_storage().data_ptr() != storage_ptr or not t.is_contiguous():
+            return None
+        offset = t.storage_offset() * t.element_size()
+        nbytes = t.numel() * t.element_size()
+        start = min(start, offset)
+        end = max(end, offset + nbytes)
+    view = torch.empty(0, dtype=torch.uint8, device=tensors[0].device)
+    view.set_(storage, start, (end - start,), (1,))
+    return view
 
 
 class WeightsProvider:
@@ -20,6 +45,8 @@ class WeightsProvider:
         source: Pinned CPU weight source.
         lora_sources: LoRA adapters fused on H2D copy.
         blocks_prefix: State-dict prefix for LoRA key matching.
+        fuse_rule: Per-policy LoRA merge rule (must be streaming-compatible:
+            no companion-key emission). Defaults to ``bf16_fuse_rule``.
     """
 
     def __init__(
@@ -30,6 +57,7 @@ class WeightsProvider:
         source: WeightSource,
         lora_sources: list[LoraSource] | None = None,
         blocks_prefix: str = "",
+        fuse_rule: FuseRule = bf16_fuse_rule,
     ) -> None:
         self._copy_stream = copy_stream
         self._pool = pool
@@ -39,6 +67,7 @@ class WeightsProvider:
         self._source = source
         self._lora_sources = lora_sources or []
         self._blocks_prefix = blocks_prefix
+        self._fuse_rule = fuse_rule
 
     def get(self, idx: int) -> dict[str, torch.Tensor]:
         """Return GPU weights for block *idx*. Does H2D copy on miss."""
@@ -70,8 +99,13 @@ class WeightsProvider:
         instrumentation regions wrapping it -- observe the full transfer time.
         """
         with torch.cuda.stream(self._copy_stream):
-            for name, gpu_tensor in gpu_weights.items():
-                gpu_tensor.copy_(cpu_weights[name], non_blocking=True)
+            gpu_view = _contiguous_byte_view(gpu_weights)
+            cpu_view = _contiguous_byte_view(cpu_weights)
+            if gpu_view is not None and cpu_view is not None and gpu_view.numel() == cpu_view.numel():
+                gpu_view.copy_(cpu_view, non_blocking=True)
+            else:
+                for name, gpu_tensor in gpu_weights.items():
+                    gpu_tensor.copy_(cpu_weights[name], non_blocking=True)
             if self._lora_sources:
                 self._fuse_block_loras(idx, gpu_weights)
             h2d_event = torch.cuda.Event()
@@ -98,13 +132,19 @@ class WeightsProvider:
         return len(self._cache)
 
     def _fuse_block_loras(self, idx: int, weights: dict[str, torch.Tensor]) -> None:
-        """Fuse LoRA deltas directly into GPU block weights."""
+        """Fuse LoRA deltas directly into GPU block weights via ``fuse_rule``."""
+        agg_dtype = self._fuse_rule.aggregation_dtype
         for name, tensor in weights.items():
             if not name.endswith(".weight"):
                 continue
-            full_key = f"{self._blocks_prefix}.{idx}.{name}"
-            prefix = full_key[: -len(".weight")]
-            for source in self._lora_sources:
-                delta = source.get_delta(prefix, device=self._target_device)
-                if delta is not None:
-                    tensor.add_(delta.to(dtype=tensor.dtype))
+            prefix = f"{self._blocks_prefix}.{idx}.{name}".removesuffix(".weight")
+            products = (
+                ab
+                for ab in (s.get_ab(prefix, device=self._target_device, dtype=agg_dtype) for s in self._lora_sources)
+                if ab is not None
+            )
+            deltas = aggregate_lora_products(products, agg_dtype)
+            if deltas is None:
+                continue
+            fused = self._fuse_rule(name, tensor, deltas, _EMPTY_STATE_DICT)
+            tensor.copy_(fused[name])

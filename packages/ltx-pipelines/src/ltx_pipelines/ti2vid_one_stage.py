@@ -12,6 +12,7 @@ from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
+from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae.tiling import TilingConfig
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import Audio
@@ -55,7 +56,7 @@ class TI2VidOneStagePipeline:
         device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
         registry: Registry | None = None,
-        torch_compile: bool = False,
+        compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
     ):
         self.dtype = torch.bfloat16
@@ -82,7 +83,7 @@ class TI2VidOneStagePipeline:
             loras=tuple(loras),
             quantization=quantization,
             registry=registry,
-            torch_compile=torch_compile,
+            compilation_config=compilation_config,
             offload_mode=offload_mode,
         )
         self.video_decoder = VideoDecoder(
@@ -185,7 +186,7 @@ class TI2VidOneStagePipeline:
 
 @torch.inference_mode()
 def main() -> None:
-    logging.getLogger().setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO)
     checkpoint_path = detect_checkpoint_path()
     params = detect_params(checkpoint_path)
     parser = default_1_stage_arg_parser(params=params)
@@ -195,7 +196,7 @@ def main() -> None:
         gemma_root=args.gemma_root,
         loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
-        torch_compile=args.compile,
+        compilation_config=args.compile,
         offload_mode=args.offload_mode,
     )
     video, audio = pipeline(

@@ -16,15 +16,17 @@ from ltx_pipelines.utils.helpers import (
     image_conditionings_by_adding_guiding_latent,
 )
 from ltx_pipelines.utils.samplers import (
+    euler_cfg_pp_denoising_loop,
     euler_denoising_loop,
     gradient_estimating_euler_denoising_loop,
     res2s_audio_video_denoising_loop,
 )
-from ltx_pipelines.utils.types import Denoiser, ModalitySpec
+from ltx_pipelines.utils.types import DenoisedLatentResult, Denoiser, ModalitySpec
 
 __all__ = [
     "AudioConditioner",
     "AudioDecoder",
+    "DenoisedLatentResult",
     "Denoiser",
     "DiffusionStage",
     "FactoryGuidedDenoiser",
@@ -38,6 +40,7 @@ __all__ = [
     "assert_resolution",
     "cleanup_memory",
     "combined_image_conditionings",
+    "euler_cfg_pp_denoising_loop",
     "euler_denoising_loop",
     "get_device",
     "gradient_estimating_euler_denoising_loop",

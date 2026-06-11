@@ -181,6 +181,15 @@ class AccelerationConfig(ConfigBaseModel):
         description="Whether to load the text encoder in 8-bit precision to save memory",
     )
 
+    offload_optimizer_during_validation: bool = Field(
+        default=False,
+        description="Offload optimizer state to CPU before validation video sampling and reload "
+        "it afterwards, to free VRAM for inference. Useful when optimizer state is large "
+        "(e.g. AdamW for full fine-tuning or high-rank LoRA) and validation OOMs because the "
+        "VAE decoder + transformer + optimizer state cannot coexist on the GPU. Has no effect "
+        "for FSDP (sharded state). Disabled by default.",
+    )
+
 
 class DataConfig(ConfigBaseModel):
     """Configuration for data loading and processing"""

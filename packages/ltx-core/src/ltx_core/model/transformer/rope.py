@@ -16,9 +16,10 @@ class LTXRopeType(Enum):
 def apply_rotary_emb(
     input_tensor: torch.Tensor,
     freqs_cis: Tuple[torch.Tensor, torch.Tensor],
-    rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+    rope_type: LTXRopeType = LTXRopeType.SPLIT,
 ) -> torch.Tensor:
     if rope_type == LTXRopeType.INTERLEAVED:
+        # Note: INTERLEAVED rope is a legacy mode. Prefer SPLIT instead.
         return apply_interleaved_rotary_emb(input_tensor, *freqs_cis)
     elif rope_type == LTXRopeType.SPLIT:
         return apply_split_rotary_emb(input_tensor, *freqs_cis)
@@ -42,11 +43,26 @@ def apply_interleaved_rotary_emb(
 def apply_split_rotary_emb(
     input_tensor: torch.Tensor, cos_freqs: torch.Tensor, sin_freqs: torch.Tensor
 ) -> torch.Tensor:
-    needs_reshape = False
-    if input_tensor.ndim != 4 and cos_freqs.ndim == 4:
-        b, h, t, _ = cos_freqs.shape
-        input_tensor = input_tensor.reshape(b, t, h, -1).swapaxes(1, 2)
-        needs_reshape = True
+    if sin_freqs.shape != cos_freqs.shape:
+        raise ValueError(
+            f"apply_split_rotary_emb: sin_freqs.shape {tuple(sin_freqs.shape)} must equal "
+            f"cos_freqs.shape {tuple(cos_freqs.shape)}."
+        )
+    needs_reshape = input_tensor.ndim != 4 and cos_freqs.ndim == 4
+    if needs_reshape:
+        b_freq = cos_freqs.shape[0]
+        h = cos_freqs.shape[1]
+        b_in = input_tensor.shape[0]
+        if b_freq not in (1, b_in):
+            raise ValueError(
+                f"apply_split_rotary_emb: cos_freqs batch ({b_freq}) must be 1 "
+                f"(broadcast) or equal input_tensor batch ({b_in})."
+            )
+        # `unflatten` only touches the last dim, keeping the batch and seq dims as
+        # the input tensor's own symbolic ints under torch.compile. `reshape(b_in,
+        # t, h, -1)` would have forced Dynamo to specialise those dims because it
+        # cannot prove `b_in == cos_freqs.shape[0]` and `seq == t` across tensors.
+        input_tensor = input_tensor.unflatten(-1, (h, -1)).transpose(1, 2)
 
     split_input = rearrange(input_tensor, "... (d r) -> ... d r", d=2)
     first_half_input = split_input[..., :1, :]
@@ -61,7 +77,9 @@ def apply_split_rotary_emb(
 
     output = rearrange(output, "... d r -> ... (d r)")
     if needs_reshape:
-        output = output.swapaxes(1, 2).reshape(b, t, -1)
+        # `transpose(1, 2).flatten(-2)` keeps the batch and seq dims symbolic; using
+        # `reshape(b_in, t, -1)` would force Dynamo to specialise both axes.
+        output = output.transpose(1, 2).flatten(-2)
 
     return output
 
@@ -183,7 +201,7 @@ def precompute_freqs_cis(
     max_pos: list[int] | None = None,
     use_middle_indices_grid: bool = False,
     num_attention_heads: int = 32,
-    rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+    rope_type: LTXRopeType = LTXRopeType.SPLIT,
     freq_grid_generator: Callable[[float, int, int, torch.device], torch.Tensor] = generate_freq_grid_pytorch,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if max_pos is None:

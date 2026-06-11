@@ -151,17 +151,22 @@ def get_pixel_coords(
             that treat frame zero differently still yield non-negative timestamps.
     """
     # Broadcast the VAE scale factors so they align with the `(batch, axis, patch, bound)` layout.
+    # Axis 1 of `latent_coords` is ordered (frame/time, height, width) — match that explicitly by
+    # pulling fields from the NamedTuple rather than relying on tuple iteration order.
     broadcast_shape = [1] * latent_coords.ndim
     broadcast_shape[1] = -1  # axis dimension corresponds to (frame/time, height, width)
-    scale_tensor = torch.tensor(scale_factors, device=latent_coords.device).view(*broadcast_shape)
+    scale_tensor = torch.tensor(
+        [scale_factors.time, scale_factors.height, scale_factors.width],
+        device=latent_coords.device,
+    ).view(*broadcast_shape)
 
     # Apply per-axis scaling to convert latent bounds into pixel-space coordinates.
     pixel_coords = latent_coords * scale_tensor
 
     if causal_fix:
-        # VAE temporal stride for the very first frame is 1 instead of `scale_factors[0]`.
+        # VAE temporal stride for the very first frame is 1 instead of `scale_factors.time`.
         # Shift and clamp to keep the first-frame timestamps causal and non-negative.
-        pixel_coords[:, 0, ...] = (pixel_coords[:, 0, ...] + 1 - scale_factors[0]).clamp(min=0)
+        pixel_coords[:, 0, ...] = (pixel_coords[:, 0, ...] + 1 - scale_factors.time).clamp(min=0)
 
     return pixel_coords
 

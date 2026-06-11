@@ -9,6 +9,7 @@ from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
 from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
+from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import Audio, AudioLatentShape, VideoPixelShape
@@ -52,7 +53,7 @@ class A2VidPipelineTwoStage:
         device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
         registry: Registry | None = None,
-        torch_compile: bool = False,
+        compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
     ):
         self.device = device or get_device()
@@ -71,7 +72,7 @@ class A2VidPipelineTwoStage:
             loras=tuple(loras),
             quantization=quantization,
             registry=registry,
-            torch_compile=torch_compile,
+            compilation_config=compilation_config,
             offload_mode=offload_mode,
         )
         stage_2_loras = (*tuple(loras), *tuple(distilled_lora))
@@ -82,7 +83,7 @@ class A2VidPipelineTwoStage:
             loras=stage_2_loras,
             quantization=quantization,
             registry=registry,
-            torch_compile=torch_compile,
+            compilation_config=compilation_config,
             offload_mode=offload_mode,
         )
         self.upsampler = VideoUpsampler(
@@ -238,7 +239,7 @@ class A2VidPipelineTwoStage:
 
 @torch.inference_mode()
 def main() -> None:
-    logging.getLogger().setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO)
     parser = default_2_stage_arg_parser()
     parser.add_argument(
         "--audio-path",
@@ -266,7 +267,7 @@ def main() -> None:
         gemma_root=args.gemma_root,
         loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
-        torch_compile=args.compile,
+        compilation_config=args.compile,
         offload_mode=args.offload_mode,
     )
     tiling_config = TilingConfig.default()

@@ -178,6 +178,11 @@ acceleration:
   # Useful when GPU memory is limited
   load_text_encoder_in_8bit: true
 
+  # Offload optimizer state to CPU during validation video sampling.
+  # Helps avoid OOM when VAE decoder + transformer + optimizer state can't coexist
+  # on the GPU (full fine-tune, high-rank LoRA). No effect for FSDP.
+  offload_optimizer_during_validation: true
+
 # -----------------------------------------------------------------------------
 # Data Configuration
 # -----------------------------------------------------------------------------

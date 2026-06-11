@@ -2,15 +2,16 @@ from ltx_core.quantization.fp8_cast import (
     TRANSFORMER_LINEAR_DOWNCAST_MAP,
     UPCAST_DURING_INFERENCE,
     UpcastWithStochasticRounding,
+    fp8_cast_fuse_rule,
 )
-from ltx_core.quantization.fp8_scaled_mm import FP8_PREPARE_MODULE_OPS, FP8_TRANSPOSE_SD_OPS
+from ltx_core.quantization.fp8_scaled_mm import fp8_scaled_mm_fuse_rule
 from ltx_core.quantization.policy import QuantizationPolicy
 
 __all__ = [
-    "FP8_PREPARE_MODULE_OPS",
-    "FP8_TRANSPOSE_SD_OPS",
     "TRANSFORMER_LINEAR_DOWNCAST_MAP",
     "UPCAST_DURING_INFERENCE",
     "QuantizationPolicy",
     "UpcastWithStochasticRounding",
+    "fp8_cast_fuse_rule",
+    "fp8_scaled_mm_fuse_rule",
 ]

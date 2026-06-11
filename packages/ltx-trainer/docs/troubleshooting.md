@@ -84,6 +84,20 @@ optimization:
   optimizer_type: "adamw8bit"
 ```
 
+#### 7. Offload Optimizer State During Validation
+
+If you OOM specifically during validation video sampling — typically in
+full fine-tunes or high-rank LoRA runs where AdamW state and the VAE decoder
+can't coexist on the GPU — offload optimizer state to CPU during sampling:
+
+```yaml
+acceleration:
+  offload_optimizer_during_validation: true
+```
+
+The offload + reload happens once per validation interval, not per step.
+No effect for FSDP (sharded state).
+
 ---
 
 ## ⚠️ Common Usage Issues

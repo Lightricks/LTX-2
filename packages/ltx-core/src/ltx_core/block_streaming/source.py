@@ -9,10 +9,18 @@ import torch
 
 from ltx_core.block_streaming.disk import DiskBlockReader
 from ltx_core.block_streaming.pool import WeightPool
+from ltx_core.loader.primitives import TensorLayout
 
 
 class WeightSource(Protocol):
-    """Provides pinned CPU weights for a given block index."""
+    """Provides pinned CPU weights for a given block index.
+    Assumes all buffers share an identical layout across all block indices.
+    """
+
+    @property
+    def block_layout(self) -> TensorLayout:
+        """Shared per-block buffer layout (shape + dtype for each param)."""
+        ...
 
     def get(self, idx: int) -> dict[str, torch.Tensor]:
         """Return CPU weights for block *idx*."""
@@ -35,6 +43,10 @@ class DiskWeightSource(WeightSource):
         self._cache: OrderedDict[int, dict[str, torch.Tensor]] = OrderedDict()
         self._events: dict[int, torch.cuda.Event] = {}
         self._reader = reader
+
+    @property
+    def block_layout(self) -> TensorLayout:
+        return self._pool.buffer_layout
 
     def get(self, idx: int) -> dict[str, torch.Tensor]:
         """Return CPU weights for block *idx*. Reads from disk on miss."""
@@ -68,7 +80,14 @@ class PinnedWeightSource(WeightSource):
     """Pre-loaded pinned CPU weights."""
 
     def __init__(self, weights: dict[int, dict[str, torch.Tensor]]) -> None:
+        if not weights:
+            raise ValueError("PinnedWeightSource requires at least one block")
         self._weights = weights
+
+    @property
+    def block_layout(self) -> TensorLayout:
+        first_block = self._weights[min(self._weights)]
+        return {name: (t.shape, t.dtype) for name, t in first_block.items()}
 
     def get(self, idx: int) -> dict[str, torch.Tensor]:
         return self._weights[idx]

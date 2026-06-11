@@ -259,6 +259,7 @@ class VideoEncoder(nn.Module):
         Args:
             sample: Input video (B, C, F, H, W). F should be 1 + 8*k (e.g., 1, 9, 17, 25, 33...).
                 If not, the encoder crops the last frames to the nearest valid length.
+                Should be normalized to [-1, 1] range before encoding.
         Returns:
             Normalized latent means (B, 128, F', H', W') where F' = 1+(F-1)/8, H' = H/32, W' = W/32.
             Example: (B, 3, 33, 512, 512) -> (B, 128, 5, 16, 16).
@@ -605,8 +606,8 @@ class VideoDecoder(nn.Module):
         # many video frames and pixels correspond to a single latent cell.
         self.video_downscale_factors = SpatioTemporalScaleFactors(
             time=8,
-            width=32,
             height=32,
+            width=32,
         )
 
         self.patch_size = patch_size
@@ -905,34 +906,22 @@ class VideoDecoder(nn.Module):
         latent: torch.Tensor,
         tiling_config: TilingConfig | None = None,
         generator: torch.Generator | None = None,
-        *,
-        output_dtype: torch.dtype = torch.uint8,
     ) -> Iterator[torch.Tensor]:
-        """Decode a video latent tensor, yielding chunks ``[f, h, w, c]``.
+        """Decode a video latent tensor, yielding float chunks ``[f, h, w, c]`` in ``[0, 1]``.
         Subclasses (e.g. ``DistributedVideoDecoder``) may override this to
         control eagerness or distribution across ranks.
-        Args:
-            output_dtype: Target dtype for output tensors.  ``torch.uint8``
-                (default) maps the decoder's ``[-1, 1]`` output to
-                ``[0, 255]``.  Any floating dtype returns ``[0, 1]`` cast
-                to that dtype.
         """
 
-        def _convert(frames: torch.Tensor) -> torch.Tensor:
-            # rearrange materializes a new contiguous tensor for this permutation,
-            # so in-place ops below do not mutate the caller's data.
+        def to_rgb(frames: torch.Tensor) -> torch.Tensor:
             video = rearrange(frames[0], "c f h w -> f h w c")
-            video.add_(1.0).mul_(0.5).clamp_(0.0, 1.0)
-            if output_dtype == torch.uint8:
-                return video.mul_(255.0).to(torch.uint8)
-            return video.to(output_dtype)
+            return video.add_(1.0).mul_(0.5).clamp_(0.0, 1.0)
 
         if tiling_config is not None:
             for frames in self.tiled_decode(latent, tiling_config, generator=generator):
-                yield _convert(frames)
+                yield to_rgb(frames)
         else:
             decoded = self(latent, generator=generator)
-            yield _convert(decoded)
+            yield to_rgb(decoded)
 
     def _group_tiles_by_temporal_slice(self, tiles: List[Tile]) -> List[List[Tile]]:
         """Group tiles by their temporal output slice."""

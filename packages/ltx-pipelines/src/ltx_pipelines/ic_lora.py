@@ -2,20 +2,19 @@ import logging
 from collections.abc import Iterator
 
 import torch
-from einops import rearrange
-from safetensors import safe_open
 
 from ltx_core.components.noisers import GaussianNoiser
-from ltx_core.conditioning import (
-    ConditioningItem,
-    ConditioningItemAttentionStrengthWrapper,
-    VideoConditionByReferenceLatent,
-)
+from ltx_core.conditioning import ConditioningItem
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
+from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae import TilingConfig, VideoEncoder, get_video_chunks_number
 from ltx_core.quantization import QuantizationPolicy
-from ltx_core.types import Audio, VideoLatentShape, VideoPixelShape
+from ltx_core.types import Audio, VideoPixelShape
+from ltx_pipelines.iclora_utils import (
+    append_ic_lora_reference_video_conditionings,
+    read_lora_reference_downscale_factor,
+)
 from ltx_pipelines.utils.args import (
     ImageConditioningInput,
     VideoConditioningAction,
@@ -62,7 +61,7 @@ class ICLoraPipeline:
         device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
         registry: Registry | None = None,
-        torch_compile: bool = False,
+        compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
     ):
         self.device = device or get_device()
@@ -84,7 +83,7 @@ class ICLoraPipeline:
             loras=tuple(loras),
             quantization=quantization,
             registry=registry,
-            torch_compile=torch_compile,
+            compilation_config=compilation_config,
             offload_mode=offload_mode,
         )
         self.stage_2 = DiffusionStage(
@@ -94,7 +93,7 @@ class ICLoraPipeline:
             loras=(),
             quantization=quantization,
             registry=registry,
-            torch_compile=torch_compile,
+            compilation_config=compilation_config,
             offload_mode=offload_mode,
         )
         self.upsampler = VideoUpsampler(
@@ -108,7 +107,7 @@ class ICLoraPipeline:
         # so inference can resize reference videos to match training conditions.
         self.reference_downscale_factor = 1
         for lora in loras:
-            scale = _read_lora_reference_downscale_factor(lora.path)
+            scale = read_lora_reference_downscale_factor(lora.path)
             if scale != 1:
                 if self.reference_downscale_factor not in (1, scale):
                     raise ValueError(
@@ -309,108 +308,30 @@ class ICLoraPipeline:
             device=self.device,
         )
 
-        # Calculate scaled dimensions for reference video conditioning.
-        # IC-LoRAs trained with downscaled reference videos expect the same ratio at inference.
-        scale = self.reference_downscale_factor
-        if scale != 1 and (height % scale != 0 or width % scale != 0):
-            raise ValueError(
-                f"Output dimensions ({height}x{width}) must be divisible by reference_downscale_factor ({scale})"
-            )
-        ref_height = height // scale
-        ref_width = width // scale
-
-        for video_path, strength in video_conditioning:
-            # Load video at scaled-down resolution (if scale > 1)
-            frame_gen = decode_video_by_frame(path=video_path, frame_cap=num_frames, device=self.device)
-            video = video_preprocess(frame_gen, ref_height, ref_width, self.dtype, self.device)
-            encoded_video = video_encoder(video)
-            reference_video_shape = VideoLatentShape.from_torch_shape(encoded_video.shape)
-
-            # Build attention_mask for ConditioningItemAttentionStrengthWrapper
-            if conditioning_attention_mask is not None:
-                # Downsample pixel-space mask to latent space, then scale by strength
-                latent_mask = self._downsample_mask_to_latent(
-                    mask=conditioning_attention_mask,
-                    target_latent_shape=reference_video_shape,
-                )
-                attn_mask = latent_mask * conditioning_attention_strength
-            elif conditioning_attention_strength < 1.0:
-                # Use scalar strength only
-                attn_mask = conditioning_attention_strength
-            else:
-                attn_mask = None
-
-            cond = VideoConditionByReferenceLatent(
-                latent=encoded_video,
-                downscale_factor=scale,
-                strength=strength,
-            )
-            if attn_mask is not None:
-                cond = ConditioningItemAttentionStrengthWrapper(cond, attention_mask=attn_mask)
-            conditionings.append(cond)
+        append_ic_lora_reference_video_conditionings(
+            conditionings,
+            video_conditioning,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            video_encoder=video_encoder,
+            dtype=self.dtype,
+            device=self.device,
+            reference_downscale_factor=self.reference_downscale_factor,
+            conditioning_attention_strength=conditioning_attention_strength,
+            conditioning_attention_mask=conditioning_attention_mask,
+            tiling_config=None,
+        )
 
         if video_conditioning:
-            logging.info(f"[IC-LoRA] Added {len(video_conditioning)} video conditioning(s)")
+            logging.info("[IC-LoRA] Added %d video conditioning(s)", len(video_conditioning))
 
         return conditionings
-
-    @staticmethod
-    def _downsample_mask_to_latent(
-        mask: torch.Tensor,
-        target_latent_shape: VideoLatentShape,
-    ) -> torch.Tensor:
-        """
-        Downsample a pixel-space mask to latent space using VAE scale factors.
-        Handles causal temporal downsampling: the first frame is kept separately
-        (temporal scale factor = 1 for the first frame), while the remaining
-        frames are downsampled by the VAE's temporal scale factor.
-        Args:
-            mask: Pixel-space mask of shape (B, 1, F_pixel, H_pixel, W_pixel).
-                Values in [0, 1].
-            target_latent_shape: Expected latent shape after VAE encoding.
-                Used to determine the target (F_latent, H_latent, W_latent).
-        Returns:
-            Flattened latent-space mask of shape (B, F_lat * H_lat * W_lat),
-            matching the patchifier's token ordering (f, h, w).
-        """
-        b = mask.shape[0]
-        f_lat = target_latent_shape.frames
-        h_lat = target_latent_shape.height
-        w_lat = target_latent_shape.width
-
-        # Step 1: Spatial downsampling (area interpolation per frame)
-        f_pix = mask.shape[2]
-        spatial_down = torch.nn.functional.interpolate(
-            rearrange(mask, "b 1 f h w -> (b f) 1 h w"),
-            size=(h_lat, w_lat),
-            mode="area",
-        )
-        spatial_down = rearrange(spatial_down, "(b f) 1 h w -> b 1 f h w", b=b)
-
-        # Step 2: Causal temporal downsampling
-        # First frame: kept as-is (causal VAE encodes first frame independently)
-        first_frame = spatial_down[:, :, :1, :, :]  # (B, 1, 1, H_lat, W_lat)
-
-        if f_pix > 1 and f_lat > 1:
-            # Remaining frames: downsample by temporal factor via group-mean
-            t = (f_pix - 1) // (f_lat - 1)  # temporal downscale factor
-            assert (f_pix - 1) % (f_lat - 1) == 0, (
-                f"Pixel frames ({f_pix}) not compatible with latent frames ({f_lat}): "
-                f"(f_pix - 1) must be divisible by (f_lat - 1)"
-            )
-            rest = rearrange(spatial_down[:, :, 1:, :, :], "b 1 (f t) h w -> b 1 f t h w", t=t)
-            rest = rest.mean(dim=3)  # (B, 1, F_lat-1, H_lat, W_lat)
-            latent_mask = torch.cat([first_frame, rest], dim=2)  # (B, 1, F_lat, H_lat, W_lat)
-        else:
-            latent_mask = first_frame
-
-        # Flatten to (B, F_lat * H_lat * W_lat) matching patchifier token order (f, h, w)
-        return rearrange(latent_mask, "b 1 f h w -> b (f h w)")
 
 
 @torch.inference_mode()
 def main() -> None:
-    logging.getLogger().setLevel(logging.INFO)
+    logging.basicConfig(level=logging.INFO)
     checkpoint_path = detect_checkpoint_path(distilled=True)
     params = detect_params(checkpoint_path)
     parser = default_2_stage_distilled_arg_parser(params=params)
@@ -466,7 +387,7 @@ def main() -> None:
         gemma_root=args.gemma_root,
         loras=tuple(args.lora) if args.lora else (),
         quantization=args.quantization,
-        torch_compile=args.compile,
+        compilation_config=args.compile,
         offload_mode=args.offload_mode,
     )
     tiling_config = TilingConfig.default()
@@ -521,27 +442,6 @@ def _load_mask_video(
     # so undo that: values are in [-1, 1], remap to [0, 1]
     mask = (mask + 1.0) / 2.0
     return mask.clamp(0.0, 1.0)
-
-
-def _read_lora_reference_downscale_factor(lora_path: str) -> int:
-    """Read reference_downscale_factor from LoRA safetensors metadata.
-    Some IC-LoRA models are trained with reference videos at lower resolution than
-    the target output. This allows for more efficient training and can improve
-    generalization. The downscale factor indicates the ratio between target and
-    reference resolutions (e.g., factor=2 means reference is half the resolution).
-    Args:
-        lora_path: Path to the LoRA .safetensors file
-    Returns:
-        The reference downscale factor (1 if not specified in metadata, meaning
-        reference and target have the same resolution)
-    """
-    try:
-        with safe_open(lora_path, framework="pt") as f:
-            metadata = f.metadata() or {}
-            return int(metadata.get("reference_downscale_factor", 1))
-    except Exception as e:
-        logging.warning(f"Failed to read metadata from LoRA file '{lora_path}': {e}")
-        return 1
 
 
 if __name__ == "__main__":

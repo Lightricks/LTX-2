@@ -2,14 +2,24 @@
 
 from __future__ import annotations
 
-import itertools
-from typing import TYPE_CHECKING, Any
+import math
+import weakref
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 from torch import nn
 
-if TYPE_CHECKING:
-    from ltx_core.block_streaming.pool import BlockLayout
+from ltx_core.loader.primitives import TensorLayout
+
+FP8_DTYPES = frozenset({torch.float8_e4m3fn, torch.float8_e5m2})
+
+_BUFFER_ALIGN = 16
+
+
+def make_block_key(blocks_prefix: str, block_idx: int, param_name: str) -> str:
+    """Return the state-dict key for *param_name* under block *block_idx*."""
+    return f"{blocks_prefix}.{block_idx}.{param_name}"
 
 
 def resolve_attr(module: nn.Module, dotted_path: str) -> nn.ModuleList:
@@ -40,21 +50,85 @@ def assign_tensor_to_module(root: nn.Module, dotted_name: str, tensor: torch.Ten
         raise AttributeError(f"{leaf} is not a parameter or buffer of {type(parent).__name__}")
 
 
-def build_pool_layout(block: nn.Module, dtype: torch.dtype) -> BlockLayout:
-    """Derive a buffer layout from a block's parameters and buffers.
-    Works on meta-device blocks (shapes are valid regardless of device).
-    The *dtype* argument overrides each tensor's dtype so the pool matches
-    the target inference precision.
+def derive_layout(tensors: dict[str, torch.Tensor], dtype: torch.dtype | None = None) -> TensorLayout:
+    """Derive a layout from a ``{name: tensor}`` dict.
+    If ``dtype`` is given, non-FP8 dtypes are coerced to it (FP8 preserved). If
+    ``None``, the source dtype is preserved as-is.
     """
-    layout: BlockLayout = {}
-    for name, tensor in itertools.chain(block.named_parameters(), block.named_buffers()):
-        layout[name] = (tensor.shape, dtype)
-    return layout
-
-
-def allocate_buffer(layout: BlockLayout, device: torch.device, pin_memory: bool = False) -> dict[str, torch.Tensor]:
-    """Allocate a single buffer dict matching *layout*."""
     return {
-        name: torch.empty(shape, dtype=dtype, device=device, pin_memory=pin_memory)
-        for name, (shape, dtype) in layout.items()
+        name: (t.shape, t.dtype if dtype is None or t.dtype in FP8_DTYPES else dtype) for name, t in tensors.items()
     }
+
+
+def _align_up(offset: int, alignment: int) -> int:
+    return (offset + alignment - 1) & ~(alignment - 1)
+
+
+def _alloc_pinned_exact(nbytes: int) -> torch.Tensor | None:
+    """Allocate exactly ``nbytes`` of pinned host memory via ``cudaHostRegister``.
+    Bypasses PyTorch's ``CachingHostAllocator``, which rounds every
+    ``pin_memory=True`` request up to ``PowerOf2Ceil(N)`` (see
+    ``aten/src/ATen/core/CachingHostAllocator.h``). Returns ``None`` if
+    registration fails. The unregister hook is bound to the storage (not the
+    tensor) so views of the buffer keep the registration alive until the
+    memory is actually freed. Caller is responsible for ensuring CUDA is
+    available.
+    """
+    cudart = torch.cuda.cudart()
+    buf = torch.empty(nbytes, dtype=torch.uint8)
+    ptr = buf.data_ptr()
+    err = int(cudart.cudaHostRegister(ptr, nbytes, 0))
+    if err != 0:
+        return None
+    weakref.finalize(buf.untyped_storage(), lambda p=ptr: cudart.cudaHostUnregister(p))
+    return buf
+
+
+def _alloc_buffer(nbytes: int, device: torch.device | None, pin_memory: bool) -> torch.Tensor:
+    """Allocate one ``uint8`` buffer for :func:`allocate_layout_views`.
+    For pinned host buffers, prefer ``cudaHostRegister`` to dodge the caching
+    allocator's power-of-2 rounding. Falls back to the caching allocator if
+    registration fails. Raises if pinning is requested without a CUDA runtime,
+    since pinning is fundamentally a CUDA driver operation.
+    """
+    if pin_memory and (device is None or torch.device(device).type == "cpu"):
+        if not torch.cuda.is_available():
+            raise RuntimeError("pin_memory=True requires CUDA, which is not available")
+        buf = _alloc_pinned_exact(nbytes)
+        if buf is not None:
+            return buf
+    return torch.empty(nbytes, dtype=torch.uint8, device=device, pin_memory=pin_memory)
+
+
+@dataclass(frozen=True)
+class _TensorSlice:
+    """Location of a single tensor view within the buffer."""
+
+    offset: int
+    shape: torch.Size
+    dtype: torch.dtype
+
+    def size(self) -> int:
+        return math.prod(self.shape) * self.dtype.itemsize
+
+
+def allocate_layout_views(
+    layout: TensorLayout,
+    device: torch.device | None = None,
+    pin_memory: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Allocate a single ``uint8`` buffer and return per-key tensor views into it.
+    All keys in *layout* live in one contiguous allocation; each returned
+    tensor is a non-overlapping slice of that buffer reinterpreted at the
+    requested shape and dtype. The views keep the underlying storage alive
+    via PyTorch refcounting — drop them all to release the memory.
+    """
+    slices: dict[str, _TensorSlice] = {}
+    cursor = 0
+    for key, (shape, dtype) in layout.items():
+        cursor = _align_up(cursor, _BUFFER_ALIGN)
+        slices[key] = _TensorSlice(offset=cursor, shape=shape, dtype=dtype)
+        cursor += slices[key].size()
+    # Allocate at least one byte so empty layouts still produce a valid buffer.
+    buffer = _alloc_buffer(max(_align_up(cursor, _BUFFER_ALIGN), 1), device, pin_memory)
+    return {key: buffer[s.offset : s.offset + s.size()].view(s.dtype).view(s.shape) for key, s in slices.items()}

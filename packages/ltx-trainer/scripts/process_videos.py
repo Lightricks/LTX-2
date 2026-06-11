@@ -14,6 +14,8 @@ Can be used as a standalone script:
 
 import json
 import math
+import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +24,7 @@ import pandas as pd
 import torch
 import torchaudio
 import typer
+from accelerate import PartialState
 from pillow_heif import register_heif_opener
 from rich.console import Console
 from rich.progress import (
@@ -34,7 +37,7 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 from torchvision.transforms.functional import crop, resize, to_tensor
@@ -444,9 +447,14 @@ def compute_latents(  # noqa: PLR0913, PLR0915
     vae_tiling: bool = False,
     with_audio: bool = False,
     audio_output_dir: str | None = None,
+    overwrite: bool = False,
 ) -> None:
     """
     Process videos and save latent representations.
+    Under ``accelerate launch``, each process handles an interleaved shard of
+    the dataset (rank/world read from ``accelerate.PartialState``). Already-
+    computed ``.pt`` outputs are skipped unless ``overwrite=True``; writes are
+    atomic so an interrupted run is safe to resume.
     Args:
         dataset_file: Path to metadata file (CSV/JSON/JSONL) containing video paths
         video_column: Column name for video paths in the metadata file
@@ -460,15 +468,15 @@ def compute_latents(  # noqa: PLR0913, PLR0915
         vae_tiling: Whether to enable VAE tiling
         with_audio: Whether to extract and encode audio from videos
         audio_output_dir: Directory to save audio latents (required if with_audio=True)
+        overwrite: Re-process every item even if its output exists. Use when rerunning with
+            changed parameters (different model, resolution, etc.) so stale outputs are replaced.
     """
-    # Validate audio parameters
     if with_audio and audio_output_dir is None:
         raise ValueError("audio_output_dir must be provided when with_audio=True")
 
     console = Console()
     torch_device = torch.device(device)
 
-    # Create dataset
     dataset = MediaDataset(
         dataset_file=dataset_file,
         main_media_column=main_media_column or video_column,
@@ -481,12 +489,33 @@ def compute_latents(  # noqa: PLR0913, PLR0915
 
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-
-    # Set up audio output directory if needed
-    audio_output_path = None
+    audio_output_path: Path | None = None
     if with_audio:
         audio_output_path = Path(audio_output_dir)
         audio_output_path.mkdir(parents=True, exist_ok=True)
+
+    # Audio processing requires batch_size=1; must be applied before the dataloader is built.
+    if with_audio and batch_size > 1:
+        logger.warning("Audio processing requires batch_size=1. Overriding batch_size to 1.")
+        batch_size = 1
+
+    data_root = dataset.dataset_file.parent
+
+    def _is_done(idx: int) -> bool:
+        rel = dataset.main_media_paths[idx].relative_to(data_root).with_suffix(".pt")
+        if not (output_path / rel).is_file():
+            return False
+        return audio_output_path is None or (audio_output_path / rel).is_file()
+
+    dataloader = _build_sharded_dataloader(
+        dataset,
+        batch_size=batch_size,
+        num_workers=4,
+        is_done=_is_done,
+        overwrite=overwrite,
+    )
+    if dataloader is None:
+        return
 
     # Load video VAE encoder
     with console.status(f"[bold]Loading video VAE encoder from [cyan]{model_path}[/]...", spinner="dots"):
@@ -509,14 +538,6 @@ def compute_latents(  # noqa: PLR0913, PLR0915
                 mel_hop_length=audio_vae_encoder.mel_hop_length,
                 n_fft=audio_vae_encoder.n_fft,
             ).to(torch_device)
-
-    # Create dataloader
-    # Note: batch_size=1 required when with_audio because audio extraction can fail for some videos,
-    # and the default collate function can't handle mixed None/dict values across a batch.
-    if with_audio and batch_size > 1:
-        logger.warning("Audio processing requires batch_size=1. Overriding batch_size to 1.")
-        batch_size = 1
-    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=False, num_workers=4)
 
     # Track audio statistics
     audio_success_count = 0
@@ -560,7 +581,7 @@ def compute_latents(  # noqa: PLR0913, PLR0915
                     "fps": batch["video_metadata"]["fps"][i].item(),
                 }
 
-                torch.save(latent_data, output_file)
+                _atomic_save(latent_data, output_file)
 
                 # Process audio if enabled (audio is already extracted by the dataset)
                 if with_audio:
@@ -588,7 +609,7 @@ def compute_latents(  # noqa: PLR0913, PLR0915
                             "duration": audio_latents["duration"],
                         }
 
-                        torch.save(audio_save_data, audio_output_file)
+                        _atomic_save(audio_save_data, audio_output_file)
                         audio_success_count += 1
                     else:
                         # Video has no audio track
@@ -596,8 +617,7 @@ def compute_latents(  # noqa: PLR0913, PLR0915
 
             progress.advance(task)
 
-    # Log summary
-    logger.info(f"Processed {len(dataset)} videos. Latents saved to {output_path}")
+    logger.info(f"Processed {len(dataloader.dataset)} videos -> {output_path}")  # type: ignore[arg-type]
     if with_audio:
         logger.info(
             f"Audio processing: {audio_success_count} videos with audio, "
@@ -935,6 +955,39 @@ def compute_scaled_resolution_buckets(
     return scaled_buckets
 
 
+def _atomic_save(data: Any, out: Path) -> None:  # noqa: ANN401
+    """Save to ``out`` atomically via per-PID temp file + replace.
+    Crash mid-write leaves an orphan ``.tmp.<pid>`` file that the skip logic
+    ignores. The per-PID suffix makes concurrent writes from multiple ranks
+    collision-free.
+    """
+    tmp = out.with_suffix(f"{out.suffix}.tmp.{os.getpid()}")
+    torch.save(data, tmp)
+    tmp.replace(out)
+
+
+def _build_sharded_dataloader(
+    dataset: Dataset,
+    *,
+    batch_size: int,
+    num_workers: int,
+    is_done: Callable[[int], bool],
+    overwrite: bool,
+) -> DataLoader | None:
+    """Return a DataLoader over this rank's interleaved shard of ``dataset``.
+    When ``overwrite`` is False, items whose outputs already exist (per
+    ``is_done``) are filtered out. Returns ``None`` if this rank has nothing
+    to do, so the caller can early-return without loading any models.
+    """
+    state = PartialState()
+    todo = [i for i in range(state.process_index, len(dataset), state.num_processes) if overwrite or not is_done(i)]
+    if not todo:
+        logger.info(f"Rank {state.process_index}/{state.num_processes}: nothing to do")
+        return None
+    logger.info(f"Rank {state.process_index}/{state.num_processes}: processing {len(todo):,} of {len(dataset):,} items")
+    return DataLoader(Subset(dataset, todo), batch_size=batch_size, shuffle=False, num_workers=num_workers)
+
+
 @app.command()
 def main(  # noqa: PLR0913
     dataset_file: str = typer.Argument(
@@ -981,8 +1034,15 @@ def main(  # noqa: PLR0913
         default=None,
         help="Output directory for audio latents (required if --with-audio is set)",
     ),
+    overwrite: bool = typer.Option(
+        default=False,
+        help="Re-encode every item even if its output exists. Use when rerunning with "
+        "changed parameters (different model, resolution, etc.) so stale outputs are replaced.",
+    ),
 ) -> None:
     """Process videos/images and save latent representations for video generation training.
+    For multi-GPU preprocessing, invoke under ``accelerate launch`` - each process
+    will handle an interleaved shard of the dataset.
     This script processes videos and images from metadata files and saves latent representations
     that can be used for training video generation models. The output latents will maintain
     the same folder structure and naming as the corresponding media files.
@@ -1032,6 +1092,7 @@ def main(  # noqa: PLR0913
         vae_tiling=vae_tiling,
         with_audio=with_audio,
         audio_output_dir=audio_output_dir,
+        overwrite=overwrite,
     )
 
 
