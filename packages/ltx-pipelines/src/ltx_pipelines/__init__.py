@@ -22,7 +22,10 @@ from ltx_pipelines.retake import RetakePipeline
 from ltx_pipelines.t2a_one_stage import T2AOneStagePipeline
 from ltx_pipelines.ti2vid_one_stage import TI2VidOneStagePipeline
 from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
-
+from ltx_pipelines.ti2vid_two_stages_deterministic import (
+    TI2VidTwoStagesPipelineDeterministic,
+    enable_deterministic_mode,
+)
 __all__ = [
     "A2VidPipelineTwoStage",
     "DistilledPipeline",
@@ -33,4 +36,6 @@ __all__ = [
     "T2AOneStagePipeline",
     "TI2VidOneStagePipeline",
     "TI2VidTwoStagesPipeline",
+    "TI2VidTwoStagesPipelineDeterministic",
+    "enable_deterministic_mode",
 ]
