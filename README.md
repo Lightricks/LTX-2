@@ -94,7 +94,7 @@ When writing prompts, focus on detailed, chronological descriptions of actions a
 - Describe lighting and colors
 - Note any changes or sudden events
 
-For additional guidance on writing a prompt please refer to <https://ltx.video/blog/how-to-prompt-for-ltx-2>
+For additional guidance on writing a prompt please refer to <https://ltx.io/blog/prompting-guide-for-ltx-2>
 
 ### Automatic Prompt Enhancement
 
