@@ -149,6 +149,10 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
         return self._model_path
 
     @property
+    def checkpoint(self) -> str | tuple[str, ...]:
+        return self._model_path
+
+    @property
     def model_loader(self) -> StateDictLoader:
         return self._model_loader
 

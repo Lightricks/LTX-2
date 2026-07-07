@@ -39,6 +39,7 @@ from ltx_core.conditioning import (
     ConditioningItem,
     VideoConditionByReferenceLatent,
 )
+from ltx_core.devices import empty_device_cache
 from ltx_core.hdr import apply_hdr_decode_postprocess
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.loader.registry import Registry
@@ -49,6 +50,7 @@ from ltx_core.quantization import QuantizationPolicy
 from ltx_core.tiling import DimensionTilingConfig, TileCountConfig
 from ltx_core.tools import VideoLatentTools
 from ltx_core.types import VideoLatentShape, VideoPixelShape
+from ltx_pipelines.utils.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_pipelines.utils.blocks import (
     DiffusionStage,
     ImageConditioner,
@@ -199,7 +201,7 @@ class HDRICLoraPipeline:
     Tonemapping and EXR saving are the caller's responsibility.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         distilled_checkpoint_path: str,
         spatial_upsampler_path: str,
@@ -211,6 +213,7 @@ class HDRICLoraPipeline:
         hdr_lora_config: HdrLoraConfig | None = None,
         tiled_vae_encode_pixel_threshold: int = TILED_VAE_ENCODE_PIXEL_THRESHOLD,
         offload_mode: OffloadMode = OffloadMode.NONE,
+        alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
     ):
         """
         Args:
@@ -252,17 +255,14 @@ class HDRICLoraPipeline:
                 f.get_tensor("audio_context"),
             )
 
-        self.image_conditioner = ImageConditioner(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
-        self.stage_1 = DiffusionStage(
+        self.image_conditioner = ImageConditioner(
             distilled_checkpoint_path,
             self.dtype,
             self.device,
-            loras=loras,
-            quantization=quantization,
             registry=registry,
-            offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
-        self.stage_2 = DiffusionStage(
+        self.stage_1 = DiffusionStage.from_checkpoint(
             distilled_checkpoint_path,
             self.dtype,
             self.device,
@@ -270,11 +270,33 @@ class HDRICLoraPipeline:
             quantization=quantization,
             registry=registry,
             offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
+        )
+        self.stage_2 = DiffusionStage.from_checkpoint(
+            distilled_checkpoint_path,
+            self.dtype,
+            self.device,
+            loras=loras,
+            quantization=quantization,
+            registry=registry,
+            offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
         self.upsampler = VideoUpsampler(
-            distilled_checkpoint_path, spatial_upsampler_path, self.dtype, self.device, registry=registry
+            distilled_checkpoint_path,
+            spatial_upsampler_path,
+            self.dtype,
+            self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
-        self.video_decoder = VideoDecoder(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
+        self.video_decoder = VideoDecoder(
+            distilled_checkpoint_path,
+            self.dtype,
+            self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
+        )
 
         # HDR config: explicit override, or auto-detect from LoRA metadata.
         if hdr_lora_config is not None:
@@ -721,7 +743,7 @@ def _process_single_video(  # noqa: PLR0913
 
     del hdr_video
     gc.collect()
-    torch.cuda.empty_cache()
+    empty_device_cache()
 
     if not skip_mp4:
         # Wait for EXR saves to finish before encoding.

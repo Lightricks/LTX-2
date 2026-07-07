@@ -1,6 +1,6 @@
 [project]
 name = "ltx-core"
-version = "1.1.6"
+version = "v1.1.7"
 description = "Core implementation of Lightricks' LTX-2 model"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -13,37 +13,13 @@ dependencies = [
     "safetensors",
     "accelerate",
     "scipy>=1.14",
+    # Apple Silicon only: Apple's fused MPSGraph SDPA, the AUTOMATIC attention
+    # backend on MPS. The marker installs it on Apple Silicon and prunes it
+    # everywhere else (Linux/CUDA), so it is a hard requirement exactly where it
+    # is the only viable attention kernel. Requires torch>=2.11 (within the
+    # torch~=2.7 floor); the resolver forks torch to >=2.11 on macOS.
+    "mps-sdpa>=0.2.0; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
-
-[project.optional-dependencies]
-xformers = ["xformers"]
-fp8-trtllm = [
-    "tensorrt-llm==1.0.0",
-    "onnx>=1.16.0,<1.20.0",
-    "openmpi",
-]
-
-[tool.uv]
-conflicts = [
-  [
-    { extra = "xformers" },
-    { extra = "fp8-trtllm" },
-  ],
-]
-
-[tool.uv.sources]
-xformers = { index = "pytorch" }
-tensorrt-llm = { index = "nvidia" }
-
-[[tool.uv.index]]
-name = "pytorch"
-url = "https://download.pytorch.org/whl/cu129"
-explicit = true
-
-[[tool.uv.index]]
-name = "nvidia"
-url = "https://pypi.nvidia.com/"
-explicit = true
 
 [build-system]
 requires = ["uv_build>=0.9.8,<0.10.0"]

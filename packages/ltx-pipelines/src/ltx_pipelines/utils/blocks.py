@@ -1,7 +1,7 @@
 """Pipeline blocks — each block owns its model lifecycle.
 Blocks build a model on each ``__call__``, use it, then free GPU memory.
-This eliminates manual ``del model; cleanup_memory()`` in pipelines and
-removes the need for :class:`ModelLedger`.
+This eliminates manual ``del model; cleanup_memory()`` in pipelines: each
+block is self-contained, so no central model-coordinator object is needed.
 """
 
 from __future__ import annotations
@@ -77,6 +77,7 @@ from ltx_core.text_encoders.gemma.embeddings_processor import EmbeddingsProcesso
 from ltx_core.tools import AudioLatentTools, LatentTools, VideoLatentTools
 from ltx_core.types import Audio, AudioLatentShape, LatentState, VideoLatentShape, VideoPixelShape
 from ltx_core.utils import find_matching_file
+from ltx_pipelines.utils.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_pipelines.utils.gpu_model import gpu_model
 from ltx_pipelines.utils.helpers import (
     cleanup_memory,
@@ -136,23 +137,25 @@ def _apply_compile_ops(
 @contextmanager
 def _streaming_model(
     builder: StreamingModelBuilder,
-    offload_mode: OffloadMode,
     target_device: torch.device,
     dtype: torch.dtype,
+    alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
 ) -> Iterator:
-    """Build a streaming wrapper, yield it, then tear down and free memory."""
-    cpu_slots_count = DISK_CPU_SLOTS if offload_mode == OffloadMode.DISK else None
-    wrapped = builder.build(
-        device=target_device,
-        dtype=dtype,
-        cpu_slots_count=cpu_slots_count,
-    )
+    """Build a streaming wrapper, yield it, then tear down and free memory.
+    The builder's own ``cpu_slots_count`` selects RAM vs disk streaming.
+    ``teardown()`` always runs -- it releases non-memory resources (forward
+    hooks, the disk I/O worker thread, open file handles) that GC would not
+    reclaim promptly. ``alloc_trim_strategy=DEFER`` only skips the eager allocator
+    reclaim (``to("meta")`` + ``cleanup_memory()``), leaving param storage for GC.
+    """
+    wrapped = builder.build(device=target_device, dtype=dtype)
     try:
         yield wrapped
     finally:
         wrapped.teardown()
-        wrapped.to("meta")
-        cleanup_memory()
+        if alloc_trim_strategy == AllocatorTrimStrategy.TRIM:
+            wrapped.to("meta")
+            cleanup_memory()
 
 
 def _build_state(
@@ -177,9 +180,13 @@ def _build_state(
     return state
 
 
-def _cleanup_iter(it: Iterator[torch.Tensor], model: torch.nn.Module) -> Iterator[torch.Tensor]:
-    """Wrap an iterator to clean up *model* memory once it is exhausted or abandoned."""
-    with gpu_model(model):
+def _cleanup_iter(
+    it: Iterator[torch.Tensor],
+    model: torch.nn.Module,
+    alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
+) -> Iterator[torch.Tensor]:
+    """Wrap an iterator to release *model* memory (per ``alloc_trim_strategy``) once exhausted or abandoned."""
+    with gpu_model(model, alloc_trim_strategy=alloc_trim_strategy):
         yield from it
 
 
@@ -190,12 +197,41 @@ def _cleanup_iter(it: Iterator[torch.Tensor], model: torch.nn.Module) -> Iterato
 
 class DiffusionStage:
     """Owns transformer lifecycle. Builds on each call, frees on exit.
-    Replaces the manual ``model_ledger.transformer()`` / ``del transformer``
-    pattern in every pipeline.
+    Replaces the manual build-transformer / ``del transformer`` pattern that
+    every pipeline previously repeated.
     """
 
-    def __init__(  # noqa: PLR0913
+    def __init__(
         self,
+        transformer_builder: ModelBuilderProtocol[LTXModelProtocol],
+        dtype: torch.dtype,
+        device: torch.device,
+        *,
+        quantization: QuantizationPolicy | None = None,
+        compilation_config: CompilationConfig | None = None,
+        alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
+    ) -> None:
+        """Construct a stage from a single pre-built transformer ``builder``.
+        Holds only that builder plus build-time configuration (dtype, device,
+        quantization, compilation). Turning a checkpoint path + LoRA set into a
+        builder -- and choosing a :class:`StreamingModelBuilder` when offloading --
+        lives in :meth:`from_checkpoint`, which is how pipelines normally create a
+        stage. A :class:`StreamingModelBuilder` selects the block-streaming build
+        path; any other builder uses the standard (all-on-GPU) path.
+        ``quantization`` and ``compilation_config`` are applied lazily on the
+        standard path; on the streaming path they are already baked into the
+        streaming builder by :meth:`from_checkpoint` and these fields are unused.
+        """
+        self._transformer_builder = transformer_builder
+        self._dtype = dtype
+        self._device = device
+        self._quantization = quantization
+        self._compilation_config = compilation_config
+        self._alloc_trim_strategy = alloc_trim_strategy
+
+    @classmethod
+    def from_checkpoint(  # noqa: PLR0913
+        cls,
         checkpoint_path: str,
         dtype: torch.dtype,
         device: torch.device,
@@ -203,17 +239,24 @@ class DiffusionStage:
         quantization: QuantizationPolicy | None = None,
         registry: Registry | None = None,
         compilation_config: CompilationConfig | None = None,
+        alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
         offload_mode: OffloadMode = OffloadMode.NONE,
-        transformer_builder: ModelBuilderProtocol[LTXModelProtocol] | None = None,
         model_configurator: type[ModelConfigurator] = LTXModelConfigurator,
         model_sd_ops: SDOps = LTXV_MODEL_COMFY_RENAMING_MAP,
-    ) -> None:
-        self._checkpoint_path = checkpoint_path
-        self._dtype = dtype
-        self._device = device
-        self._quantization = quantization
-        self._compilation_config = compilation_config
-        self._offload_mode = offload_mode
+    ) -> "DiffusionStage":
+        """Build a stage from a checkpoint path and LoRA set.
+        Constructs a single transformer builder from ``checkpoint_path`` +
+        ``loras`` + ``quantization`` and delegates to ``__init__``. When
+        ``offload_mode != OffloadMode.NONE`` that builder is a
+        :class:`StreamingModelBuilder` (with quantization/compilation baked in and
+        its ``cpu_slots_count`` set for the requested mode); otherwise it is the
+        standard single-GPU builder. This is the high-level entry point used by
+        pipelines; ``__init__`` itself takes an already-built builder.
+        ``model_configurator`` / ``model_sd_ops`` let callers (e.g. the audio-only
+        T2A pipeline) override the model class configurator and the state-dict key
+        mapping. A quantization policy that pins its own configurator takes
+        precedence over ``model_configurator``.
+        """
         # A quantization policy may pin its own configurator; otherwise use the one
         # provided by the caller (defaults to the audio-video LTXModelConfigurator).
         configurator = (
@@ -221,50 +264,74 @@ class DiffusionStage:
             if quantization is not None and quantization.model_configurator is not None
             else model_configurator
         )
-        if transformer_builder is not None:
-            self._transformer_builder = transformer_builder
-        else:
-            self._transformer_builder = Builder(
+
+        transformer_builder: ModelBuilderProtocol[LTXModelProtocol]
+        if offload_mode == OffloadMode.NONE:
+            transformer_builder = Builder(
                 model_path=checkpoint_path,
                 model_class_configurator=configurator,
                 model_sd_ops=model_sd_ops,
                 loras=tuple(loras),
                 registry=registry or DummyRegistry(),
             )
-
-        if offload_mode != OffloadMode.NONE:
-            # WeightsProvider currently only supports plain bf16 + fp8_cast LoRA fusion
-            # (no companion-key emission). Quantization policies that emit
-            # companion keys (e.g. ``.weight_scale``) cannot be streamed yet.
-            if quantization is not None and quantization.fuse_rule is not fp8_cast_fuse_rule:
-                raise ValueError(
-                    "Block streaming is not supported with this quantization policy "
-                    "(only bf16 and fp8_cast are currently supported)."
-                )
-            streaming_sd_ops: SDOps = model_sd_ops
-            streaming_module_ops: tuple[ModuleOps, ...] = ()
-            streaming_loras = tuple(loras)
-
-            if compilation_config:
-                number_of_layers = self._transformer_builder.model_config()["transformer"]["num_layers"]
-                streaming_sd_ops, streaming_module_ops, streaming_loras = _apply_compile_ops(
-                    streaming_sd_ops, streaming_module_ops, streaming_loras, number_of_layers
-                )
-            if quantization is not None:
-                streaming_sd_ops, streaming_module_ops = _chain_quantization(
-                    streaming_sd_ops, streaming_module_ops, quantization
-                )
-            self._streaming_builder = StreamingModelBuilder(
-                model_class_configurator=configurator,
-                model_path=checkpoint_path,
-                model_sd_ops=streaming_sd_ops,
-                module_ops=streaming_module_ops,
-                loras=streaming_loras,
+        else:
+            transformer_builder = cls._build_streaming_builder(
+                checkpoint_path=checkpoint_path,
+                configurator=configurator,
+                model_sd_ops=model_sd_ops,
+                loras=tuple(loras),
+                quantization=quantization,
                 registry=registry or DummyRegistry(),
-                fuse_rule=quantization.fuse_rule if quantization is not None else bf16_fuse_rule,
-                blocks_attr="transformer_blocks",
-                blocks_prefix="transformer_blocks",
+                offload_mode=offload_mode,
             )
+
+        return cls(
+            transformer_builder,
+            dtype,
+            device,
+            quantization=quantization,
+            compilation_config=compilation_config,
+            alloc_trim_strategy=alloc_trim_strategy,
+        )
+
+    @staticmethod
+    def _build_streaming_builder(
+        *,
+        checkpoint_path: str,
+        configurator: type[ModelConfigurator],
+        model_sd_ops: SDOps,
+        loras: tuple[LoraPathStrengthAndSDOps, ...],
+        quantization: QuantizationPolicy | None,
+        registry: Registry,
+        offload_mode: OffloadMode,
+    ) -> StreamingModelBuilder:
+        """Construct the streaming transformer builder for an offloading stage.
+        Holds only raw config (``model_sd_ops`` / ``loras``); compilation and
+        quantization are applied at build time by :meth:`_prepared_builder`, exactly
+        as on the standard path -- so the builder's LoRA set stays raw and
+        :meth:`with_loras` swaps it consistently. ``cpu_slots_count`` is pinned for
+        the requested ``offload_mode`` (disk streaming uses a small slot count;
+        CPU/RAM streaming pins every block).
+        """
+        # WeightsProvider currently only supports plain bf16 + fp8_cast LoRA fusion
+        # (no companion-key emission). Quantization policies that emit
+        # companion keys (e.g. ``.weight_scale``) cannot be streamed yet.
+        if quantization is not None and quantization.fuse_rule is not fp8_cast_fuse_rule:
+            raise ValueError(
+                "Block streaming is not supported with this quantization policy "
+                "(only bf16 and fp8_cast are currently supported)."
+            )
+        return StreamingModelBuilder(
+            model_class_configurator=configurator,
+            model_path=checkpoint_path,
+            model_sd_ops=model_sd_ops,
+            loras=loras,
+            registry=registry,
+            fuse_rule=quantization.fuse_rule if quantization is not None else bf16_fuse_rule,
+            blocks_attr="transformer_blocks",
+            blocks_prefix="transformer_blocks",
+            cpu_slots_count=DISK_CPU_SLOTS if offload_mode == OffloadMode.DISK else None,
+        )
 
     def with_attention(self, attention: AttentionFunction | AttentionCallable | None) -> "DiffusionStage":
         """Return a new ``DiffusionStage`` that pins the transformer build to ``attention``.
@@ -280,41 +347,64 @@ class DiffusionStage:
         new._transformer_builder = self._transformer_builder.with_module_ops(
             (*self._transformer_builder.module_ops, op),
         )
-        if self._offload_mode != OffloadMode.NONE:
-            new._streaming_builder = self._streaming_builder.with_module_ops(
-                (*self._streaming_builder.module_ops, op),
-            )
         return new
 
-    def _build_transformer(self, *, device: torch.device | None = None, **kwargs: object) -> X0Model:
-        target = device or self._device
-        sd_ops = self._transformer_builder.model_sd_ops
-        module_ops = self._transformer_builder.module_ops
-        loras = self._transformer_builder.loras
+    def with_builder(self, builder: ModelBuilderProtocol[LTXModelProtocol]) -> "DiffusionStage":
+        """Return a new ``DiffusionStage`` that builds its transformer from ``builder``.
+        Functional: never mutates ``self``; shares all other configuration (dtype, device,
+        quantization, compilation). Affects the standard (non-offload) build path.
+        """
+        new = copy.copy(self)
+        new._transformer_builder = builder
+        return new
+
+    def with_loras(self, loras: tuple[LoraPathStrengthAndSDOps, ...]) -> "DiffusionStage":
+        """Return a new ``DiffusionStage`` built with exactly ``loras`` (replacing the current set)."""
+        return self.with_builder(self._transformer_builder.with_loras(loras))
+
+    def _prepared_builder(self) -> ModelBuilderProtocol[LTXModelProtocol]:
+        """Return the configured builder with the stage's build-time ops applied.
+        Compilation and quantization live on the stage (not on the builder) and are
+        applied here, lazily, for both the standard and streaming paths. This keeps
+        the builder holding only raw sd_ops/module_ops/LoRAs, so ``with_loras`` /
+        ``with_builder`` swap them consistently regardless of the build path. The
+        returned copy preserves the builder's concrete type (e.g. a
+        ``StreamingModelBuilder`` stays one).
+        """
+        builder = self._transformer_builder
+        sd_ops = builder.model_sd_ops
+        module_ops = builder.module_ops
+        loras = builder.loras
         if self._compilation_config is not None:
-            number_of_layers = self._transformer_builder.model_config()["transformer"]["num_layers"]
+            number_of_layers = builder.model_config()["transformer"]["num_layers"]
             sd_ops, module_ops, loras = _apply_compile_ops(
                 sd_ops, module_ops, loras, number_of_layers, self._compilation_config
             )
         if self._quantization is not None:
             sd_ops, module_ops = _chain_quantization(sd_ops, module_ops, self._quantization)
-
-        builder = self._transformer_builder.with_module_ops(module_ops).with_sd_ops(sd_ops).with_loras(loras)
-        if self._quantization is not None:
             builder = builder.with_fuse_rule(self._quantization.fuse_rule)
-        return X0Model(builder.build(device=target, **kwargs)).to(target).eval()
+        return builder.with_module_ops(module_ops).with_sd_ops(sd_ops).with_loras(loras)
+
+    def _build_transformer(self, *, device: torch.device | None = None, **kwargs: object) -> X0Model:
+        target = device or self._device
+        return X0Model(self._prepared_builder().build(device=target, **kwargs)).to(target).eval()
+
+    @property
+    def _is_streaming(self) -> bool:
+        """Whether the configured builder uses the block-streaming build path."""
+        return isinstance(self._transformer_builder, StreamingModelBuilder)
 
     @contextmanager
     def _streaming_transformer_ctx(self) -> Iterator[X0Model]:
-        with _streaming_model(
-            self._streaming_builder, self._offload_mode, self._device, self._dtype
-        ) as streaming_wrapper:
+        builder = self._prepared_builder()
+        assert isinstance(builder, StreamingModelBuilder)
+        with _streaming_model(builder, self._device, self._dtype, self._alloc_trim_strategy) as streaming_wrapper:
             yield X0Model(streaming_wrapper).eval()
 
     def _transformer_ctx(self, **kwargs: object) -> AbstractContextManager:
-        if self._offload_mode != OffloadMode.NONE:
+        if self._is_streaming:
             return self._streaming_transformer_ctx()
-        return gpu_model(self._build_transformer(**kwargs))
+        return gpu_model(self._build_transformer(**kwargs), alloc_trim_strategy=self._alloc_trim_strategy)
 
     def model_context(self, **kwargs: object) -> AbstractContextManager:
         """Build the transformer, yield it, then free its memory on exit.
@@ -419,8 +509,8 @@ class DiffusionStage:
             v_shape = VideoLatentShape.from_pixel_shape(pixel_shape)
             video_tools = VideoLatentTools(VideoLatentPatchifier(patch_size=1), v_shape, fps)
 
-        mode = "streaming" if self._offload_mode != OffloadMode.NONE else "standard"
-        logger.info("Building transformer (%s) from %s", mode, self._checkpoint_path)
+        mode = "streaming" if self._is_streaming else "standard"
+        logger.info("Building transformer (%s) from %s", mode, self._transformer_builder.checkpoint)
         with self._transformer_ctx(video_tools=video_tools) as transformer:
             logger.info(
                 "Running denoising loop (%d steps, %dx%d %d frames @ %.1f fps)",
@@ -467,12 +557,14 @@ class PromptEncoder:
         registry: Registry | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
         text_encoder_builder: BuilderProtocol | None = None,
+        alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
     ) -> None:
         self._gemma_root = gemma_root
         self._checkpoint_path = checkpoint_path
         self._dtype = dtype
         self._device = device
         self._offload_mode = offload_mode
+        self._alloc_trim_strategy = alloc_trim_strategy
 
         if text_encoder_builder is not None:
             if offload_mode != OffloadMode.NONE:
@@ -501,6 +593,7 @@ class PromptEncoder:
                 registry=registry or DummyRegistry(),
                 blocks_attr="model.model.language_model.layers",
                 blocks_prefix="model.model.language_model.layers",
+                cpu_slots_count=DISK_CPU_SLOTS if offload_mode == OffloadMode.DISK else None,
             )
         self._embeddings_processor_builder = Builder(
             model_path=checkpoint_path,
@@ -519,8 +612,10 @@ class PromptEncoder:
 
     def _text_encoder_ctx(self) -> AbstractContextManager:
         if self._offload_mode != OffloadMode.NONE:
-            return _streaming_model(self._streaming_text_encoder_builder, self._offload_mode, self._device, self._dtype)
-        return gpu_model(self._build_text_encoder())
+            return _streaming_model(
+                self._streaming_text_encoder_builder, self._device, self._dtype, self._alloc_trim_strategy
+            )
+        return gpu_model(self._build_text_encoder(), alloc_trim_strategy=self._alloc_trim_strategy)
 
     def __call__(
         self,
@@ -541,7 +636,9 @@ class PromptEncoder:
             raw_outputs = text_encoder.encode(prompts)
         logger.info("Text encoder done, building embeddings processor from %s", self._checkpoint_path)
 
-        with gpu_model(self._build_embeddings_processor()) as embeddings_processor:
+        with gpu_model(
+            self._build_embeddings_processor(), alloc_trim_strategy=self._alloc_trim_strategy
+        ) as embeddings_processor:
             result = [embeddings_processor.process_hidden_states(hs, mask) for hs, mask in raw_outputs]
         logger.info("Prompt encoding complete")
         return result
@@ -563,6 +660,7 @@ class ImageConditioner:
         dtype: torch.dtype,
         device: torch.device,
         registry: Registry | None = None,
+        alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
     ) -> None:
         self._dtype = dtype
         self._device = device
@@ -572,13 +670,14 @@ class ImageConditioner:
             model_sd_ops=VAE_ENCODER_COMFY_KEYS_FILTER,
             registry=registry or DummyRegistry(),
         )
+        self._alloc_trim_strategy = alloc_trim_strategy
 
     def _build_encoder(self) -> VideoEncoder:
         return self._encoder_builder.build(device=self._device, dtype=self._dtype).eval()
 
     def __call__(self, fn: Callable[[VideoEncoder], T]) -> T:
         """Build video encoder → call *fn(encoder)* → free encoder."""
-        with gpu_model(self._build_encoder()) as encoder:
+        with gpu_model(self._build_encoder(), alloc_trim_strategy=self._alloc_trim_strategy) as encoder:
             return fn(encoder)
 
 
@@ -597,6 +696,7 @@ class VideoUpsampler:
         dtype: torch.dtype,
         device: torch.device,
         registry: Registry | None = None,
+        alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
     ) -> None:
         self._upsampler_path = upsampler_path
         self._dtype = dtype
@@ -612,13 +712,20 @@ class VideoUpsampler:
             model_class_configurator=LatentUpsamplerConfigurator,
             registry=registry or DummyRegistry(),
         )
+        self._alloc_trim_strategy = alloc_trim_strategy
 
     def __call__(self, latent: torch.Tensor) -> torch.Tensor:
         """Upsample *latent* using video encoder + spatial upsampler, then free both."""
         logger.info("Building video encoder + spatial upsampler from %s", self._upsampler_path)
         with (
-            gpu_model(self._encoder_builder.build(device=self._device, dtype=self._dtype).eval()) as encoder,
-            gpu_model(self._upsampler_builder.build(device=self._device, dtype=self._dtype).eval()) as upsampler,
+            gpu_model(
+                self._encoder_builder.build(device=self._device, dtype=self._dtype).eval(),
+                alloc_trim_strategy=self._alloc_trim_strategy,
+            ) as encoder,
+            gpu_model(
+                self._upsampler_builder.build(device=self._device, dtype=self._dtype).eval(),
+                alloc_trim_strategy=self._alloc_trim_strategy,
+            ) as upsampler,
         ):
             return upsample_video(latent=latent, video_encoder=encoder, upsampler=upsampler)
 
@@ -641,6 +748,7 @@ class VideoDecoder:
         registry: Registry | None = None,
         memory_efficient: bool = True,
         decoder_builder: BuilderProtocol | None = None,
+        alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
     ) -> None:
         self._checkpoint_path = checkpoint_path
         self._dtype = dtype
@@ -655,6 +763,7 @@ class VideoDecoder:
                 registry=registry or DummyRegistry(),
                 module_ops=(MEMORY_EFFICIENT_DECODE,) if memory_efficient else (),
             )
+        self._alloc_trim_strategy = alloc_trim_strategy
 
     def __call__(
         self,
@@ -665,7 +774,11 @@ class VideoDecoder:
         """Decode *latent* to pixel-space video chunks. Decoder freed after exhaustion."""
         logger.info("Building video decoder from %s", self._checkpoint_path)
         decoder = self._decoder_builder.build(device=self._device, dtype=self._dtype).eval()
-        return _cleanup_iter(decoder.decode_video(latent, tiling_config, generator), decoder)
+        return _cleanup_iter(
+            decoder.decode_video(latent, tiling_config, generator),
+            decoder,
+            alloc_trim_strategy=self._alloc_trim_strategy,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -682,6 +795,7 @@ class AudioDecoder:
         dtype: torch.dtype,
         device: torch.device,
         registry: Registry | None = None,
+        alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
     ) -> None:
         self._checkpoint_path = checkpoint_path
         self._dtype = dtype
@@ -698,13 +812,25 @@ class AudioDecoder:
             model_sd_ops=VOCODER_COMFY_KEYS_FILTER,
             registry=registry or DummyRegistry(),
         )
+        self._alloc_trim_strategy = alloc_trim_strategy
 
     def __call__(self, latent: torch.Tensor) -> Audio:
         """Decode audio *latent* through VAE decoder + vocoder, then free both."""
         logger.info("Building audio decoder + vocoder from %s", self._checkpoint_path)
+        # The vocoder always runs in fp32 (bf16 accumulation degrades spectral
+        # metrics). On CUDA/CPU it is stored in bf16 and autocast upcasts per-op to
+        # save memory; MPS has no fp32 autocast, so store it in fp32 directly and
+        # avoid the per-call cast. Negligible footprint for this small model.
+        vocoder_dtype = torch.float32 if self._device.type == "mps" else self._dtype
         with (
-            gpu_model(self._decoder_builder.build(device=self._device, dtype=self._dtype).eval()) as decoder,
-            gpu_model(self._vocoder_builder.build(device=self._device, dtype=self._dtype).eval()) as vocoder,
+            gpu_model(
+                self._decoder_builder.build(device=self._device, dtype=self._dtype).eval(),
+                alloc_trim_strategy=self._alloc_trim_strategy,
+            ) as decoder,
+            gpu_model(
+                self._vocoder_builder.build(device=self._device, dtype=vocoder_dtype).eval(),
+                alloc_trim_strategy=self._alloc_trim_strategy,
+            ) as vocoder,
         ):
             return vae_decode_audio(latent, decoder, vocoder)
 
@@ -726,9 +852,11 @@ class AudioConditioner:
         dtype: torch.dtype,
         device: torch.device,
         registry: Registry | None = None,
+        alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
     ) -> None:
         self._dtype = dtype
         self._device = device
+        self._alloc_trim_strategy = alloc_trim_strategy
         self._encoder_builder = Builder(
             model_path=checkpoint_path,
             model_class_configurator=AudioEncoderConfigurator,
@@ -738,5 +866,8 @@ class AudioConditioner:
 
     def __call__(self, fn: Callable[[torch.nn.Module], T]) -> T:
         """Build audio encoder → call *fn(encoder)* → free encoder."""
-        with gpu_model(self._encoder_builder.build(device=self._device, dtype=self._dtype).eval()) as encoder:
+        with gpu_model(
+            self._encoder_builder.build(device=self._device, dtype=self._dtype).eval(),
+            alloc_trim_strategy=self._alloc_trim_strategy,
+        ) as encoder:
             return fn(encoder)

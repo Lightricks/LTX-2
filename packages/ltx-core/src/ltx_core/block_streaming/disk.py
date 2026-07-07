@@ -153,9 +153,11 @@ class LoraSource:
         if pair is None:
             return None
         a, b = pair
-        if device is not None and device.type == "cuda":
-            a = a.to(device=device, non_blocking=True)
-            b = b.to(device=device, non_blocking=True)
+        # Move A/B to a GPU-class target (CUDA/MPS) so the B@A aggregation runs on
+        # the device; on a CPU target they stay put. non_blocking only helps CUDA.
+        if device is not None and device.type in ("cuda", "mps"):
+            a = a.to(device=device, non_blocking=device.type == "cuda")
+            b = b.to(device=device, non_blocking=device.type == "cuda")
         if dtype is not None:
             a = a.to(dtype=dtype)
             b = b.to(dtype=dtype)

@@ -1,4 +1,6 @@
+import contextlib
 import math
+from collections.abc import Iterator
 from typing import List
 
 import einops
@@ -11,6 +13,25 @@ from ltx_core.model.audio_vae.resnet import LRELU_SLOPE, ResBlock1
 
 def get_padding(kernel_size: int, dilation: int = 1) -> int:
     return int((kernel_size * dilation - dilation) / 2)
+
+
+@contextlib.contextmanager
+def _module_in_fp32(module: nn.Module, *, enabled: bool) -> Iterator[None]:
+    """Temporarily cast *module* to float32, restoring its original dtype on exit.
+    Used for the MPS vocoder path where fp32 autocast is unavailable, so the
+    weights must be materialized in float32 for the forward pass. Restores to the
+    module's original weight dtype (captured here), not the input dtype. When
+    *enabled* is False this is a no-op, so callers can wrap unconditionally.
+    """
+    if not enabled:
+        yield
+        return
+    module_dtype = next(module.parameters()).dtype
+    module.float()
+    try:
+        yield
+    finally:
+        module.to(module_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -564,15 +585,29 @@ class VocoderWithBWE(nn.Module):
         # compound through 108 sequential convolutions and degrade spectral
         # metrics (mel_l1, MRSTFT) by 40-90% while perceptual quality (CDPAM)
         # is unaffected.  fp32 eliminates this degradation.
-        # We use autocast(dtype=float32) rather than self.float() because it
-        # upcasts bf16 weights per-op at kernel level, avoiding the temporary
-        # memory spike of self.float() / self.to(original_dtype).
+        # On CUDA/CPU we use autocast(dtype=float32) rather than self.float()
+        # because it upcasts bf16 weights per-op at kernel level, avoiding the
+        # temporary memory spike of self.float() / self.to(original_dtype).
         # Benchmarked on H100 (128.5M-param model):
         #   autocast fp32: +70 MB peak VRAM, 123 ms  (vs 482 MB / 95 ms for bf16)
         #   model.float(): +324 MB peak VRAM, 149 ms
         # Tested: both approaches produce bit-identical output.
+        # MPS autocast does not upcast conv weights to fp32 (it only supports
+        # lower-precision autocast dtypes), which would leave the float32 input
+        # running against bf16 conv weights and raise a dtype mismatch. There we
+        # fall back to materializing the weights in fp32 for the pass (bit-identical
+        # per the note above; the memory spike is negligible for this small model).
+        # The vocoder is normally built in fp32 on MPS, so this fallback is then a
+        # no-op -- it only triggers if a bf16 module is run on MPS directly.
+        device_type = mel_spec.device.type
+        module_dtype = next(self.parameters()).dtype
+        fp32_ctx = (
+            _module_in_fp32(self, enabled=module_dtype != torch.float32)
+            if device_type == "mps"
+            else torch.autocast(device_type=device_type, dtype=torch.float32)
+        )
 
-        with torch.autocast(device_type=mel_spec.device.type, dtype=torch.float32):
+        with fp32_ctx:
             x = self.vocoder(mel_spec.float())
             _, _, length_low_rate = x.shape
             output_length = length_low_rate * self.output_sampling_rate // self.input_sampling_rate

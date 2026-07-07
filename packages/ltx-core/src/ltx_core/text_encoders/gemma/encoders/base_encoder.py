@@ -75,7 +75,9 @@ class GemmaTextEncoder(torch.nn.Module):
         pad_token_id = self.processor.tokenizer.pad_token_id if self.processor.tokenizer.pad_token_id is not None else 0
         model_inputs = _pad_inputs_for_attention_alignment(model_inputs, pad_token_id=pad_token_id)
 
-        with torch.inference_mode(), torch.random.fork_rng(devices=[self.model.device]):
+        # fork_rng device pinning is only supported for CUDA; MPS/CPU fork CPU RNG only.
+        fork_devices = [self.model.device] if self.model.device.type == "cuda" else []
+        with torch.inference_mode(), torch.random.fork_rng(devices=fork_devices):
             torch.manual_seed(seed)
             outputs = self.model.generate(
                 **model_inputs,

@@ -774,7 +774,11 @@ class ValidationRunner:
         stg_guider = STGGuider(cfg.stg_scale)
 
         stg_perturbation_config = (
-            self._build_stg_perturbation_config(cfg.stg_blocks, cfg.stg_mode) if stg_guider.enabled() else None
+            self._build_stg_perturbation_config(
+                cfg.stg_blocks, cfg.stg_mode, transformer.num_blocks, device, next(transformer.parameters()).dtype
+            )
+            if stg_guider.enabled()
+            else None
         )
 
         x0_model = X0Model(transformer)
@@ -1072,7 +1076,11 @@ class ValidationRunner:
 
     @staticmethod
     def _build_stg_perturbation_config(
-        stg_blocks: list[int] | None, stg_mode: Literal["stg_av", "stg_v"]
+        stg_blocks: list[int] | None,
+        stg_mode: Literal["stg_av", "stg_v"],
+        num_blocks: int,
+        device: torch.device,
+        dtype: torch.dtype,
     ) -> BatchedPerturbationConfig:
         """Build STG perturbation config that skips self-attention in the specified blocks."""
         perturbations: list[Perturbation] = [
@@ -1080,7 +1088,7 @@ class ValidationRunner:
         ]
         if stg_mode == "stg_av":
             perturbations.append(Perturbation(type=PerturbationType.SKIP_AUDIO_SELF_ATTN, blocks=stg_blocks))
-        return BatchedPerturbationConfig(perturbations=[PerturbationConfig(perturbations=perturbations)])
+        return BatchedPerturbationConfig([PerturbationConfig(perturbations=perturbations)], num_blocks, device, dtype)
 
     @staticmethod
     def _load_first_frame(media_path: Path) -> Tensor:

@@ -42,6 +42,10 @@ class BlockStreamingWrapper(nn.Module):
         self._hooks: list[torch.utils.hooks.RemovableHandle] = []
         self._register_hooks()
 
+    @property
+    def num_blocks(self) -> int:
+        return self._model.num_blocks
+
     # ------------------------------------------------------------------
     # Hook registration
     # ------------------------------------------------------------------
@@ -55,10 +59,10 @@ class BlockStreamingWrapper(nn.Module):
             assign_tensor_to_module(block, name, gpu_weights[name])
 
     def _post_hook(self, block_idx: int) -> None:
-        """Record a compute-done event and release the block weights."""
-        compute_done = torch.cuda.Event()
-        compute_done.record(torch.cuda.current_stream(self._target_device))
-        self._provider.release(block_idx, event=compute_done)
+        """Release the block weights once its forward pass has been enqueued.
+        The provider guards the buffer against reuse until this block's compute
+        completes."""
+        self._provider.mark_block_done(block_idx)
 
     def _register_hooks(self) -> None:
         for idx, block in enumerate(self._blocks):

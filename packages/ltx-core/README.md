@@ -11,7 +11,7 @@ The foundational library for the LTX-2 Audio-Video generation model. This packag
 - **`block_streaming/`**: Memory-efficient inference that streams transformer blocks through the GPU one at a time (from pinned CPU buffers or directly from disk)
 - **`model/`**: PyTorch implementations of the LTX-2 Transformer, Video VAE, Audio VAE, Vocoder and Upscaler
 - **`text_encoders/gemma`**: Gemma text encoder implementation with tokenizers, feature extractors, and separate encoders for audio-video and video-only generation
-- **`quantization/`**: FP8 quantization backends (FP8-TensorRT-LLM scaled MM, FP8 cast) for reduced memory footprint.
+- **`quantization/`**: FP8 quantization backends (FP8 scaled MM, FP8 cast) for reduced memory footprint.
 
 ## 🚀 Quick Start
 
@@ -118,11 +118,9 @@ model = builder.build(device=torch.device("cuda"))
 
 The `quantization/` module provides FP8 quantization support for the LTX-2 transformer, significantly reducing memory usage while maintaining quality. Two backends are available:
 
-#### FP8 Scaled MM (TensorRT-LLM)
+#### FP8 Scaled MM
 
-Uses NVIDIA TensorRT-LLM's `cublas_scaled_mm` for efficient FP8 matrix multiplication. Weights are stored in FP8 format with per-tensor scaling, and inputs are quantized dynamically (or statically with calibration data).
-
-**Requirements**: `uv sync --frozen --extra fp8-trtllm`
+Uses PyTorch's `torch._scaled_mm` for efficient FP8 matrix multiplication. Weights are stored in FP8 format with per-tensor scaling, and inputs are quantized dynamically.
 
 **Usage with QuantizationPolicy:**
 

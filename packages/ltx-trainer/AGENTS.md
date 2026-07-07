@@ -94,10 +94,28 @@ packages/ltx-trainer/
 │   ├── audio_inpainting_lora.yaml # Audio inpainting
 │   ├── a2a_ic_lora.yaml          # Audio-to-audio IC-LoRA
 │   ├── av2av_ic_lora.yaml        # AV2AV IC-LoRA
+│   ├── README.md                 # Configs index + training-modes table (see note below)
 │   └── accelerate/               # FSDP, DDP configs
 ├── tests/                        # Pytest tests
 └── docs/                         # Documentation
 ```
+
+### Configs Directory Documentation
+
+The `configs/` directory is documented in two places that both contain a training-modes table linking to the
+`.yaml` files:
+
+- **[`configs/README.md`](configs/README.md)** — a short index with a training-modes table linking to each config
+  file in the directory (relative links like `./t2v_lora.yaml`).
+- **[`docs/training-modes.md`](docs/training-modes.md)** — the full training-modes guide, whose "Quick Reference"
+  table and per-mode sections link to the configs (relative links like `../configs/t2v_lora.yaml`).
+
+> **⚠️ When changing the contents of `configs/`:**
+>
+> - If you **rename, move, or delete** a `.yaml` config, update the links in **both** `configs/README.md` and
+>   `docs/training-modes.md` so no link is broken.
+> - If you **add** a new `.yaml` config, add a corresponding row (or config link) to the tables in **both**
+>   `configs/README.md` and `docs/training-modes.md`, and add it to the directory tree above.
 
 ### Key Architectural Patterns
 

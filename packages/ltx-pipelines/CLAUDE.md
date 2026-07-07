@@ -49,7 +49,7 @@ Inference pipelines for LTX-2 audio-video generation. Depends on `ltx-core` for 
 
 ## Shared building blocks (`utils/blocks.py`)
 
-- `DiffusionStage` -- owns transformer lifecycle; builds model on call, frees on exit via `gpu_model()` context manager (moves params to meta device to release GPU/CPU memory). Accepts optional `stepper` and `loop` overrides.
+- `DiffusionStage` -- owns transformer lifecycle; builds model on call, frees on exit via `gpu_model()` context manager (moves params to meta device to release GPU/CPU memory). Accepts optional `stepper` and `loop` overrides. `__init__` takes a pre-built transformer builder; pipelines construct it via the `DiffusionStage.from_checkpoint(checkpoint_path, ..., loras=...)` classmethod, which builds the standard (and, when offloading, streaming) builders. `with_builder` / `with_loras` return a new stage with a swapped builder / LoRA set without re-specifying config.
 - `PromptEncoder` -- Gemma text encoder + embeddings processor (video 4096-dim, audio 2048-dim).
 - `ImageConditioner` / `AudioConditioner` -- temporary encoder scope; builds encoder, passes to callable, frees.
 - `VideoUpsampler` -- 2x spatial upsampling via encoder + upsampler.

@@ -1,4 +1,5 @@
 import functools
+import sys
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
@@ -27,28 +28,26 @@ def _torch_default_sdpa_priority() -> list[SDPBackend]:
     return [SDPBackend(p) for p in torch._C._get_sdp_priority_order()]
 
 
-memory_efficient_attention = None
 flash_attn_interface = None
 flash_attn_4_func = None
 try:
-    from xformers.ops import memory_efficient_attention
-except ImportError:
-    memory_efficient_attention = None
-try:
-    # FlashAttention3 and XFormersAttention cannot be used together
-    if memory_efficient_attention is None:
-        import flash_attn_interface
+    import flash_attn_interface
 except ImportError:
     flash_attn_interface = None
 try:
     from flash_attn.cute import flash_attn_func as flash_attn_4_func
 except ImportError:
     flash_attn_4_func = None
+try:
+    # macOS only: routes SDPA to Apple's prebuilt MPSGraph attention kernel.
+    from mps_sdpa import sdpa_opt as _mps_sdpa_opt
+except ImportError:
+    _mps_sdpa_opt = None
 
 
 class AttentionCallable(Protocol):
     """Unmasked attention. Backends without a mask kernel (FA3/FA4) implement only
-    this protocol; backends that support masks too (Pytorch/SDPA, xFormers) are
+    this protocol; backends that support masks too (Pytorch/SDPA) are
     structurally usable here and as :class:`MaskedAttentionCallable`."""
 
     def __call__(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int) -> torch.Tensor: ...
@@ -73,9 +72,8 @@ class PytorchAttention(AttentionCallable):
 
     @property
     def label(self) -> str:
-        """Human-readable identifier for this backend. Encodes the SDPA priority
-        list so a single-backend pin reads differently from the full-priority
-        dispatcher walk."""
+        """Human-readable identifier. Encodes the SDPA priority list so a
+        single-backend pin reads differently from the full-priority dispatcher walk."""
         return f"SDPA[{'>'.join(b.name for b in self._priority)}]"
 
     def __call__(
@@ -101,50 +99,48 @@ class PytorchAttention(AttentionCallable):
         return out
 
 
-class XFormersAttention(AttentionCallable):
-    label = "xFormers"
+class MPSSdpaAttention(AttentionCallable):
+    """Apple-fused scaled-dot-product attention on MPS.
+    Routes to ``mps_sdpa.sdpa_opt``, which calls Apple's prebuilt
+    ``MPSGraph.scaledDotProductAttention`` kernel (via a zero-copy bridge)
+    instead of torch's ``sdpa_general_mps`` graph. The Apple kernel does not
+    materialize the ``[B, H, Nq, Nk]`` score matrix, so it avoids the
+    long-sequence memory wall that makes torch's materializing MPS SDPA
+    unusable on video latents (~32x faster at a 14k-token latent on an M4 Pro).
+    It is a hard dependency on Apple Silicon (the ``mps-sdpa`` platform-marked
+    requirement), so AUTOMATIC always has it on MPS. Unlike a JIT-compiled Metal
+    flash kernel it needs no runtime shader compilation, so it is robust
+    across macOS / Metal revisions.
+    Accepts an optional additive-float or boolean ``mask`` broadcastable to
+    ``[B, H, Nq, Nk]``, so it serves both the unmasked and masked protocols.
+    """
+
+    @property
+    def label(self) -> str:
+        return "MPS-SDPA"
 
     def __call__(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        heads: int,
-        mask: torch.Tensor | None = None,
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, heads: int, mask: torch.Tensor | None = None
     ) -> torch.Tensor:
-        if memory_efficient_attention is None:
-            raise RuntimeError("XFormersAttention was selected but `xformers` is not installed.")
+        if _mps_sdpa_opt is None:
+            raise RuntimeError("MPSSdpaAttention was selected but `mps-sdpa` is not installed.")
+        if q.device.type != "mps":
+            raise RuntimeError("MPSSdpaAttention requires MPS. Use PyTorch SDPA on CPU or CUDA.")
 
         b, _, dim_head = q.shape
         dim_head //= heads
-
-        # xformers expects [B, M, H, K]
-        q, k, v = (t.view(b, -1, heads, dim_head) for t in (q, k, v))
+        q, k, v = (t.view(b, -1, heads, dim_head).transpose(1, 2) for t in (q, k, v))
 
         if mask is not None:
-            # add a singleton batch dimension
+            # add a batch dimension if there isn't already one
             if mask.ndim == 2:
                 mask = mask.unsqueeze(0)
-            # add a singleton heads dimension
+            # add a heads dimension if there isn't already one
             if mask.ndim == 3:
                 mask = mask.unsqueeze(1)
-            # pad to a multiple of 8
-            pad = 8 - mask.shape[-1] % 8
-            # the xformers docs says that it's allowed to have a mask of shape (1, Nq, Nk)
-            # but when using separated heads, the shape has to be (B, H, Nq, Nk)
-            # in flux, this matrix ends up being over 1GB
-            # here, we create a mask with the same batch/head size as the input mask (potentially singleton or full)
-            mask_out = torch.empty(
-                [mask.shape[0], mask.shape[1], q.shape[1], mask.shape[-1] + pad], dtype=q.dtype, device=q.device
-            )
 
-            mask_out[..., : mask.shape[-1]] = mask
-            # doesn't this remove the padding again??
-            mask = mask_out[..., : mask.shape[-1]]
-            mask = mask.expand(b, heads, -1, -1)
-
-        out = memory_efficient_attention(q.to(v.dtype), k.to(v.dtype), v, attn_bias=mask, p=0.0)
-        out = out.reshape(b, -1, heads * dim_head)
+        out = _mps_sdpa_opt(q, k, v, attn_mask=mask)
+        out = out.transpose(1, 2).reshape(b, -1, heads * dim_head)
         return out
 
 
@@ -160,6 +156,8 @@ class FlashAttention3(AttentionCallable):
     ) -> torch.Tensor:
         if flash_attn_interface is None:
             raise RuntimeError("FlashAttention3 was selected but `FlashAttention3` is not installed.")
+        if q.device.type != "cuda":
+            raise RuntimeError("FlashAttention3 requires CUDA. Use PyTorch SDPA on CPU or MPS.")
 
         b, _, dim_head = q.shape
         dim_head //= heads
@@ -183,6 +181,8 @@ class FlashAttention4(AttentionCallable):
     ) -> torch.Tensor:
         if flash_attn_4_func is None:
             raise RuntimeError("FlashAttention4 was selected but `flash-attn-4` is not installed.")
+        if q.device.type != "cuda":
+            raise RuntimeError("FlashAttention4 requires CUDA. Use PyTorch SDPA on CPU or MPS.")
 
         b, _, dim_head = q.shape
         dim_head //= heads
@@ -198,7 +198,7 @@ class FlashAttention4(AttentionCallable):
 # AUTOMATIC inspects installed extras and the GPU arch and returns the fastest
 # usable callable for each path. The selection runs once per process (cached).
 # The unmasked and masked picks are independent: each calls its own helper and
-# may end up on different backends (e.g. FA3 unmasked + xFormers masked on H100).
+# may end up on different backends (e.g. FA3 unmasked + SDPA masked on H100).
 
 
 def _sdpa_can_use(backend: SDPBackend, *, with_mask: bool) -> bool:
@@ -236,6 +236,20 @@ _SDPA_FULL_PRIORITY: tuple[SDPBackend, ...] = (
 )
 
 
+def _on_macos() -> bool:
+    """True on macOS, where torch's native SDPA materializes the score matrix and
+    AUTOMATIC routes to Apple's fused ``mps-sdpa`` kernel instead."""
+    return sys.platform == "darwin"
+
+
+def _mps_sdpa_available() -> bool:
+    """True when the ``mps-sdpa`` package is importable. It is a platform-marked
+    hard dependency on Apple Silicon, so this is always True there; it is only
+    False on non-Apple-Silicon macs (e.g. Intel/CPU), where AUTOMATIC falls back
+    to torch's SDPA (acceptable on CPU, which has no MPS memory wall)."""
+    return _mps_sdpa_opt is not None
+
+
 def _sdpa_full_priority() -> PytorchAttention:
     """Hand SDPA the full backend priority order; let torch's dispatcher pick at call time.
     ``sdpa_kernel(_SDPA_FULL_PRIORITY, set_priority=True)`` enables all four
@@ -253,10 +267,14 @@ def _sdpa_full_priority() -> PytorchAttention:
 def _select_primary_attention() -> AttentionCallable:
     """Pick the fastest unmasked attention based on installed extras and GPU arch.
     Priority by arch:
-    - Hopper (sm_90, H100): FA3 / xFormers (mutually exclusive at import) > FA4 > SDPA.
+    - Hopper (sm_90, H100): FA3 > FA4 > SDPA.
     - Datacenter Blackwell (sm_100, B200): FA4 > SDPA. FA4 is intentionally *not*
       picked on consumer Blackwell (sm_120) -- known regressions in newer
       FA4 betas; users who want it on sm_120 must opt in explicitly.
+    - macOS (Apple Silicon / MPS): Apple's fused MPSGraph kernel via ``mps-sdpa``
+      (a platform-marked hard dependency on Apple Silicon) -- it avoids the
+      full-score-matrix memory wall on long video sequences. On a non-Apple-Silicon
+      mac (Intel/CPU) it falls back to torch's SDPA.
     - Everywhere else (Ada, Ampere, CPU): SDPA with the full backend priority
       list -- torch's runtime dispatcher picks the best fit at call time.
     """
@@ -265,21 +283,23 @@ def _select_primary_attention() -> AttentionCallable:
         if major == 9:
             if flash_attn_interface is not None:
                 return FlashAttention3()
-            if memory_efficient_attention is not None:
-                return XFormersAttention()
             if flash_attn_4_func is not None:
                 return FlashAttention4()
         if major == 10 and flash_attn_4_func is not None:
             return FlashAttention4()
+    if _on_macos():
+        return MPSSdpaAttention() if _mps_sdpa_available() else _sdpa_full_priority()
     return _sdpa_full_priority()
 
 
 def _select_masked_attention() -> MaskedAttentionCallable:
-    """Pick a mask-aware attention. Prefers xFormers when installed; else SDPA with
-    the full priority list (the dispatcher rejects FLASH automatically when a
-    mask is present and walks past it)."""
-    if memory_efficient_attention is not None:
-        return XFormersAttention()
+    """Pick a mask-aware attention. On macOS, Apple's fused MPSGraph kernel via
+    ``mps-sdpa`` (a hard dependency on Apple Silicon, else torch's SDPA on
+    Intel/CPU macs); else SDPA with the full priority list (the dispatcher
+    rejects FLASH automatically when a mask is present and walks past it --
+    torch SDPA handles the additive mask directly)."""
+    if _on_macos():
+        return MPSSdpaAttention() if _mps_sdpa_available() else _sdpa_full_priority()
     return _sdpa_full_priority()
 
 
@@ -323,18 +343,21 @@ def _resolve_sdpa_variant(backend: SDPBackend, name: str, *, with_mask: bool) ->
 
 class AttentionFunction(Enum):
     PYTORCH = "pytorch"
-    XFORMERS = "xformers"
     FLASH_ATTENTION_3 = "flash_attention_3"
     FLASH_ATTENTION_4 = "flash_attention_4"
     SDPA_CUDNN = "sdpa_cudnn"
     SDPA_FLASH = "sdpa_flash"
     SDPA_EFFICIENT = "sdpa_efficient"
     SDPA_MATH = "sdpa_math"
+    # Apple's fused MPSGraph SDPA via the `mps-sdpa` package (macOS/MPS only, a
+    # platform-marked hard dependency on Apple Silicon). The AUTOMATIC default on
+    # MPS; never materializes the score matrix.
+    MPS_SDPA = "mps_sdpa"
     # Pick the fastest unmasked backend for the current GPU/extras combo; see
     # :func:`automatic_attention`. Default for :class:`AttentionOps`.
     AUTOMATIC = "automatic"
 
-    def to_callable(self) -> AttentionCallable:  # noqa: PLR0911
+    def to_callable(self) -> AttentionCallable:  # noqa: PLR0911, PLR0912
         """Resolve to a concrete callable. Use this at module init time so that
         torch.compile can trace through the attention call without graph breaks.
         Every non-AUTOMATIC variant raises :class:`RuntimeError` when the backend
@@ -348,14 +371,14 @@ class AttentionFunction(Enum):
                 return automatic_attention()
             case AttentionFunction.PYTORCH:
                 return PytorchAttention()
-            case AttentionFunction.XFORMERS:
-                if memory_efficient_attention is None:
-                    raise RuntimeError("AttentionFunction.XFORMERS selected but `xformers` is not installed.")
-                return XFormersAttention()
             case AttentionFunction.FLASH_ATTENTION_3:
                 if flash_attn_interface is None:
                     raise RuntimeError(
                         "AttentionFunction.FLASH_ATTENTION_3 selected but `flash-attn-3` is not installed."
+                    )
+                if not torch.cuda.is_available():
+                    raise RuntimeError(
+                        "AttentionFunction.FLASH_ATTENTION_3 requires CUDA. Use PyTorch SDPA on CPU or MPS."
                     )
                 return FlashAttention3()
             case AttentionFunction.FLASH_ATTENTION_4:
@@ -363,9 +386,17 @@ class AttentionFunction(Enum):
                     raise RuntimeError(
                         "AttentionFunction.FLASH_ATTENTION_4 selected but `flash-attn-4` is not installed."
                     )
+                if not torch.cuda.is_available():
+                    raise RuntimeError(
+                        "AttentionFunction.FLASH_ATTENTION_4 requires CUDA. Use PyTorch SDPA on CPU or MPS."
+                    )
                 return FlashAttention4()
             case AttentionFunction.SDPA_MATH:
                 return PytorchAttention(priority=[SDPBackend.MATH])
+            case AttentionFunction.MPS_SDPA:
+                if _mps_sdpa_opt is None:
+                    raise RuntimeError("AttentionFunction.MPS_SDPA selected but `mps-sdpa` is not installed.")
+                return MPSSdpaAttention()
             case AttentionFunction.SDPA_CUDNN:
                 return _resolve_sdpa_variant(
                     SDPBackend.CUDNN_ATTENTION, "AttentionFunction.SDPA_CUDNN", with_mask=False
@@ -388,10 +419,13 @@ class MaskedAttentionFunction(Enum):
     Keeping them out makes "this backend cannot mask" a type error, not a runtime one."""
 
     PYTORCH = "pytorch"
-    XFORMERS = "xformers"
     SDPA_CUDNN = "sdpa_cudnn"
     SDPA_EFFICIENT = "sdpa_efficient"
     SDPA_MATH = "sdpa_math"
+    # Apple's fused MPSGraph SDPA via the `mps-sdpa` package (macOS/MPS only, a
+    # platform-marked hard dependency on Apple Silicon); the AUTOMATIC default on
+    # MPS. Mask-aware.
+    MPS_SDPA = "mps_sdpa"
     # Pick the fastest mask-capable backend for the current extras combo; see
     # :func:`automatic_masked_attention`. Default for the masked slot of
     # :class:`AttentionOps`.
@@ -410,12 +444,12 @@ class MaskedAttentionFunction(Enum):
                 return automatic_masked_attention()
             case MaskedAttentionFunction.PYTORCH:
                 return PytorchAttention()
-            case MaskedAttentionFunction.XFORMERS:
-                if memory_efficient_attention is None:
-                    raise RuntimeError("MaskedAttentionFunction.XFORMERS selected but `xformers` is not installed.")
-                return XFormersAttention()
             case MaskedAttentionFunction.SDPA_MATH:
                 return PytorchAttention(priority=[SDPBackend.MATH])
+            case MaskedAttentionFunction.MPS_SDPA:
+                if _mps_sdpa_opt is None:
+                    raise RuntimeError("MaskedAttentionFunction.MPS_SDPA selected but `mps-sdpa` is not installed.")
+                return MPSSdpaAttention()
             case MaskedAttentionFunction.SDPA_CUDNN:
                 return _resolve_sdpa_variant(
                     SDPBackend.CUDNN_ATTENTION, "MaskedAttentionFunction.SDPA_CUDNN", with_mask=True
@@ -499,7 +533,7 @@ class Attention(torch.nn.Module):
             context: Key/value context tensor of shape ``(B, S, context_dim)``.
                 Falls back to ``x`` (self-attention) when *None*.
             mask: Optional attention mask. Interpretation depends on the attention
-                backend (additive bias for xformers/PyTorch SDPA). A non-None
+                backend (additive bias for PyTorch SDPA). A non-None
                 ``mask`` routes to ``masked_attention_function``; ``None`` keeps
                 the unmasked path.
             pe: Rotary positional embeddings applied to both ``q`` and ``k``.

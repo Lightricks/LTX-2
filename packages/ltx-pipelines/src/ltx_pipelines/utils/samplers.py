@@ -8,6 +8,7 @@ from tqdm import tqdm
 
 from ltx_core.components.diffusion_steps import EulerCfgPpDiffusionStep, Res2sDiffusionStep
 from ltx_core.components.protocols import DiffusionStepProtocol
+from ltx_core.devices import highest_precision_float
 from ltx_core.model.transformer import X0Model
 from ltx_core.utils import to_denoised, to_velocity
 from ltx_pipelines.utils.helpers import post_process_latent, timesteps_from_mask
@@ -157,7 +158,10 @@ def _channelwise_normalize(x: torch.Tensor) -> torch.Tensor:
 
 
 def _get_new_noise(x: torch.Tensor, generator: torch.Generator) -> torch.Tensor:
-    noise = torch.randn(x.shape, generator=generator, dtype=torch.float64, device=generator.device)
+    # float64 on CUDA/CPU for numerical stability; MPS has no float64, so degrade to float32.
+    noise = torch.randn(
+        x.shape, generator=generator, dtype=highest_precision_float(generator.device), device=generator.device
+    )
     noise = (noise - noise.mean()) / noise.std()
     return _channelwise_normalize(noise)
 
@@ -175,10 +179,11 @@ def _inject_sde_noise(
     eta: float = 0.5,
 ) -> torch.Tensor:
     sigmas_copy = sigmas.clone()
+    hp = highest_precision_float(state.denoise_mask.device)
     new_noise = new_noise_fn(state.latent, step_noise_generator)
     if not legacy_mode:
-        timesteps = timesteps_from_mask(state.denoise_mask.double(), sigmas_copy[step_idx].double())
-        next_timesteps = timesteps_from_mask(state.denoise_mask.double(), sigmas_copy[step_idx + 1].double())
+        timesteps = timesteps_from_mask(state.denoise_mask.to(hp), sigmas_copy[step_idx].to(hp))
+        next_timesteps = timesteps_from_mask(state.denoise_mask.to(hp), sigmas_copy[step_idx + 1].to(hp))
         sigmas = torch.stack([timesteps, next_timesteps])
         step_idx = 0
     x_next = stepper.step(
@@ -249,6 +254,8 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
     if present_state is None:
         raise ValueError("At least one of video_state or audio_state must be provided")
     state_device = present_state.latent.device
+    # float64 on CUDA/CPU for ODE numerical stability; MPS has no float64, so degrade to float32.
+    hp = highest_precision_float(state_device)
 
     # Initialize noise generators with different seeds
     if noise_seed_substep is None:
@@ -270,19 +277,19 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
     if sigmas[-1] == 0:
         sigmas = torch.cat([sigmas[:-1], torch.tensor([0.0011, 0.0], device=sigmas.device)], dim=0)
     # Compute step sizes in hyperbolic space
-    hs = -torch.log(sigmas[1:].double().cpu() / (sigmas[:-1].double().cpu()))
+    hs = -torch.log(sigmas[1:].to(hp).cpu() / (sigmas[:-1].to(hp).cpu()))
 
     # Initialize phi cache for reuse across loop iterations
     phi_cache = {}
     c2 = 0.5  # Midpoint for res_2s
 
     for step_idx in tqdm(range(n_full_steps)):
-        sigma = sigmas[step_idx].double()
-        sigma_next = sigmas[step_idx + 1].double()
+        sigma = sigmas[step_idx].to(hp)
+        sigma_next = sigmas[step_idx + 1].to(hp)
 
         # Initialize anchor point
-        x_anchor_video = video_state.latent.clone().double() if video_state is not None else None
-        x_anchor_audio = audio_state.latent.clone().double() if audio_state is not None else None
+        x_anchor_video = video_state.latent.clone().to(hp) if video_state is not None else None
+        x_anchor_audio = audio_state.latent.clone().to(hp) if audio_state is not None else None
 
         # ====================================================================
         # STAGE 1: Evaluate at current point
@@ -307,15 +314,15 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
         # Compute substep x using RK coefficient a21
         # ====================================================================
         if x_anchor_video is not None and denoised_video_1 is not None:
-            eps_1_video = denoised_video_1.double() - x_anchor_video
-            x_mid_video = x_anchor_video.double() + h * a21 * eps_1_video
+            eps_1_video = denoised_video_1.to(hp) - x_anchor_video
+            x_mid_video = x_anchor_video.to(hp) + h * a21 * eps_1_video
         else:
             eps_1_video = None
             x_mid_video = None
 
         if x_anchor_audio is not None and denoised_audio_1 is not None:
-            eps_1_audio = denoised_audio_1.double() - x_anchor_audio
-            x_mid_audio = x_anchor_audio.double() + h * a21 * eps_1_audio
+            eps_1_audio = denoised_audio_1.to(hp) - x_anchor_audio
+            x_mid_audio = x_anchor_audio.to(hp) + h * a21 * eps_1_audio
         else:
             eps_1_audio = None
             x_mid_audio = None
@@ -347,10 +354,10 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
             for _ in range(bongmath_max_iter):
                 if x_mid_video is not None and eps_1_video is not None:
                     x_anchor_video = x_mid_video - h * a21 * eps_1_video
-                    eps_1_video = denoised_video_1.double() - x_anchor_video
+                    eps_1_video = denoised_video_1.to(hp) - x_anchor_video
                 if x_mid_audio is not None and eps_1_audio is not None:
                     x_anchor_audio = x_mid_audio - h * a21 * eps_1_audio
-                    eps_1_audio = denoised_audio_1.double() - x_anchor_audio
+                    eps_1_audio = denoised_audio_1.to(hp) - x_anchor_audio
 
         # ====================================================================
         # STAGE 2: Evaluate at substep point (WITH NOISE)
@@ -384,13 +391,13 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915,PLR0912
         # FINAL COMBINATION: Compute x_next using RK coefficients
         # ====================================================================
         if x_anchor_video is not None and eps_1_video is not None and denoised_video_2 is not None:
-            eps_2_video = denoised_video_2.double() - x_anchor_video
+            eps_2_video = denoised_video_2.to(hp) - x_anchor_video
             x_next_video = x_anchor_video + h * (b1 * eps_1_video + b2 * eps_2_video)
         else:
             x_next_video = None
 
         if x_anchor_audio is not None and eps_1_audio is not None and denoised_audio_2 is not None:
-            eps_2_audio = denoised_audio_2.double() - x_anchor_audio
+            eps_2_audio = denoised_audio_2.to(hp) - x_anchor_audio
             x_next_audio = x_anchor_audio + h * (b1 * eps_1_audio + b2 * eps_2_audio)
         else:
             x_next_audio = None

@@ -13,6 +13,7 @@ from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import Audio, AudioLatentShape, VideoPixelShape
+from ltx_pipelines.utils.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_pipelines.utils.args import default_2_stage_arg_parser
 from ltx_pipelines.utils.blocks import (
     AudioConditioner,
@@ -43,7 +44,7 @@ class A2VidPipelineTwoStage:
     both video and audio using a distilled LoRA for higher quality output.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         checkpoint_path: str,
         distilled_lora: list[LoraPathStrengthAndSDOps],
@@ -55,17 +56,28 @@ class A2VidPipelineTwoStage:
         registry: Registry | None = None,
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
+        alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
         self._scheduler = LTX2Scheduler()
 
         self.prompt_encoder = PromptEncoder(
-            checkpoint_path, gemma_root, self.dtype, self.device, registry=registry, offload_mode=offload_mode
+            checkpoint_path,
+            gemma_root,
+            self.dtype,
+            self.device,
+            registry=registry,
+            offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
-        self.image_conditioner = ImageConditioner(checkpoint_path, self.dtype, self.device, registry=registry)
-        self.audio_conditioner = AudioConditioner(checkpoint_path, self.dtype, self.device, registry=registry)
-        self.stage_1 = DiffusionStage(
+        self.image_conditioner = ImageConditioner(
+            checkpoint_path, self.dtype, self.device, registry=registry, alloc_trim_strategy=alloc_trim_strategy
+        )
+        self.audio_conditioner = AudioConditioner(
+            checkpoint_path, self.dtype, self.device, registry=registry, alloc_trim_strategy=alloc_trim_strategy
+        )
+        self.stage_1 = DiffusionStage.from_checkpoint(
             checkpoint_path,
             self.dtype,
             self.device,
@@ -74,9 +86,10 @@ class A2VidPipelineTwoStage:
             registry=registry,
             compilation_config=compilation_config,
             offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
         stage_2_loras = (*tuple(loras), *tuple(distilled_lora))
-        self.stage_2 = DiffusionStage(
+        self.stage_2 = DiffusionStage.from_checkpoint(
             checkpoint_path,
             self.dtype,
             self.device,
@@ -85,11 +98,19 @@ class A2VidPipelineTwoStage:
             registry=registry,
             compilation_config=compilation_config,
             offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
         self.upsampler = VideoUpsampler(
-            checkpoint_path, spatial_upsampler_path, self.dtype, self.device, registry=registry
+            checkpoint_path,
+            spatial_upsampler_path,
+            self.dtype,
+            self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
-        self.video_decoder = VideoDecoder(checkpoint_path, self.dtype, self.device, registry=registry)
+        self.video_decoder = VideoDecoder(
+            checkpoint_path, self.dtype, self.device, registry=registry, alloc_trim_strategy=alloc_trim_strategy
+        )
 
     def __call__(  # noqa: PLR0913
         self,

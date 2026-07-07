@@ -16,12 +16,13 @@ from ltx_pipelines.iclora_utils import (
     read_lora_reference_downscale_factor,
     read_lora_reference_temporal_scale_factor,
 )
+from ltx_pipelines.utils.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_pipelines.utils.args import (
     ImageConditioningInput,
     VideoConditioningAction,
     VideoMaskConditioningAction,
     default_2_stage_distilled_arg_parser,
-    detect_checkpoint_path,
+    resolve_cli_params,
 )
 from ltx_pipelines.utils.blocks import (
     AudioDecoder,
@@ -34,7 +35,6 @@ from ltx_pipelines.utils.blocks import (
 from ltx_pipelines.utils.constants import (
     DISTILLED_SIGMAS,
     STAGE_2_DISTILLED_SIGMAS,
-    detect_params,
 )
 from ltx_pipelines.utils.denoisers import SimpleDenoiser
 from ltx_pipelines.utils.helpers import assert_resolution, combined_image_conditionings, get_device
@@ -64,6 +64,7 @@ class ICLoraPipeline:
         registry: Registry | None = None,
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
+        alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
@@ -75,9 +76,16 @@ class ICLoraPipeline:
             self.device,
             registry=registry,
             offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
-        self.image_conditioner = ImageConditioner(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
-        self.stage_1 = DiffusionStage(
+        self.image_conditioner = ImageConditioner(
+            distilled_checkpoint_path,
+            self.dtype,
+            self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
+        )
+        self.stage_1 = DiffusionStage.from_checkpoint(
             distilled_checkpoint_path,
             self.dtype,
             self.device,
@@ -86,8 +94,9 @@ class ICLoraPipeline:
             registry=registry,
             compilation_config=compilation_config,
             offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
-        self.stage_2 = DiffusionStage(
+        self.stage_2 = DiffusionStage.from_checkpoint(
             distilled_checkpoint_path,
             self.dtype,
             self.device,
@@ -96,12 +105,30 @@ class ICLoraPipeline:
             registry=registry,
             compilation_config=compilation_config,
             offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
         self.upsampler = VideoUpsampler(
-            distilled_checkpoint_path, spatial_upsampler_path, self.dtype, self.device, registry=registry
+            distilled_checkpoint_path,
+            spatial_upsampler_path,
+            self.dtype,
+            self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
-        self.video_decoder = VideoDecoder(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
-        self.audio_decoder = AudioDecoder(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
+        self.video_decoder = VideoDecoder(
+            distilled_checkpoint_path,
+            self.dtype,
+            self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
+        )
+        self.audio_decoder = AudioDecoder(
+            distilled_checkpoint_path,
+            self.dtype,
+            self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
+        )
 
         # Read reference scale factors from LoRA metadata.
         # IC-LoRAs trained with scaled reference videos store these factors
@@ -344,8 +371,7 @@ class ICLoraPipeline:
 @torch.inference_mode()
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    checkpoint_path = detect_checkpoint_path(distilled=True)
-    params = detect_params(checkpoint_path)
+    params = resolve_cli_params(distilled=True)
     parser = default_2_stage_distilled_arg_parser(params=params)
     parser.add_argument(
         "--video-conditioning",

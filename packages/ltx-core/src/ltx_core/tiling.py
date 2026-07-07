@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import math
 from dataclasses import dataclass, replace
 from typing import Callable, NamedTuple
 
@@ -462,3 +463,16 @@ class TileCountConfig:
     frames: DimensionTilingConfig = DimensionTilingConfig(num_tiles=1, overlap=0)
     height: DimensionTilingConfig = DimensionTilingConfig(num_tiles=1, overlap=0)
     width: DimensionTilingConfig = DimensionTilingConfig(num_tiles=1, overlap=0)
+
+
+def balanced_tile_split(num_tiles: int) -> tuple[int, int]:
+    """Factor ``num_tiles`` into ``(small, large)`` as square as possible.
+    ``small`` is the largest divisor not exceeding the square root, so
+    ``small * large == num_tiles`` and ``small <= large``. E.g. 2 -> (1, 2),
+    4 -> (2, 2), 8 -> (2, 4), 16 -> (4, 4). The caller decides which tiled
+    dimension gets which factor.
+    """
+    if num_tiles < 1:
+        raise ValueError(f"num_tiles must be >= 1, got {num_tiles}")
+    small = next(d for d in range(math.isqrt(num_tiles), 0, -1) if num_tiles % d == 0)
+    return small, num_tiles // small

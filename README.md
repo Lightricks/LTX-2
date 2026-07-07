@@ -14,19 +14,43 @@
 
 ## 🚀 Quick Start
 
+Clone the repo
+
 ```bash
-# Clone the repository
 git clone https://github.com/Lightricks/LTX-2.git
 cd LTX-2
-
-# Set up the environment
-uv sync --frozen
-source .venv/bin/activate
 ```
 
-### Required Models
+Download the relevant [models](https://huggingface.co/Lightricks/LTX-2.3) or use the [Hugging Face CLI](https://huggingface.co/docs/huggingface_hub/guides/cli)
 
-Download the following models from the [LTX-2.3 HuggingFace repository](https://huggingface.co/Lightricks/LTX-2.3):
+```bash
+hf auth login
+hf download Lightricks/LTX-2.3 \
+    ltx-2.3-22b-distilled-1.1.safetensors ltx-2.3-spatial-upscaler-x2-1.1.safetensors --local-dir models/ltx-2.3
+hf download google/gemma-3-12b-it-qat-q4_0-unquantized --local-dir models/gemma-3-12b
+```
+
+If you get a 401/403, accept the model terms on Hugging Face and log in with a **Read** token (fine-grained tokens need the "read gated repos" scope enabled).
+
+Generate
+
+```bash
+uv run python -m ltx_pipelines.distilled \
+    --distilled-checkpoint-path models/ltx-2.3/ltx-2.3-22b-distilled-1.1.safetensors \
+    --spatial-upsampler-path    models/ltx-2.3/ltx-2.3-spatial-upscaler-x2-1.1.safetensors \
+    --gemma-root models/gemma-3-12b \
+    --seed 42 \
+    --output-path output.mp4 \
+    --prompt "A medium close-up shot features a Caucasian man with a beard, wearing a green and white baseball cap without any letters on the front, and a light blue shirt over a white t-shirt. He is positioned in the center of the frame, looking intently directly at the camera, his eyes focused on camera. His facial expression is one of deep concentration, with his brow slightly raised. As he looks straight at the camera, a quick sniff sound is heard, and then he speaks with a deep male voice and a satisfied tone, saying, 'I think it's so good.' The camera remains static throughout, maintaining a shallow depth of field, which keeps the man in sharp focus while the background is softly blurred, showing a beige wall behind him. After a brief pause, another short, audible sniff is heard. The man then continues to speak, his voice maintaining the same quality, as he states, 'So good. So good.' He elaborates further, emphasizing his point with a final statement, 'This got to be, it's got to be the best tool I've ever seen.'"
+```
+
+In cases of GPU memory constraints, consider `--quantization fp8-cast --offload {cpu, disk}`. See [additional flags](packages/ltx-pipelines/docs/installation.md#common-cli-flags).
+
+This uses the distilled model and pipeline for fast results. For better quality or other capabilities, see [Models](#full-model-list) and [Pipelines](#available-pipelines).
+
+### Full Model List
+
+For pipelines beyond the quickstart, download the relevant models from the [LTX-2.3 HuggingFace repository](https://huggingface.co/Lightricks/LTX-2.3):
 
 **LTX-2.3 Model Checkpoint** (choose and download one of the following)
   * [`ltx-2.3-22b-dev.safetensors`](https://huggingface.co/Lightricks/LTX-2.3/blob/main/ltx-2.3-22b-dev.safetensors) - [Download](https://huggingface.co/Lightricks/LTX-2.3/resolve/main/ltx-2.3-22b-dev.safetensors)
@@ -76,9 +100,9 @@ Download the following models from the [LTX-2.3 HuggingFace repository](https://
 ### ⚡ Optimization Tips
 
 * **Use DistilledPipeline** - Fastest inference with only 8 predefined sigmas (8 steps stage 1, 4 steps stage 2)
-* **Enable FP8 quantization** - Enables lower memory footprint: `--quantization fp8-cast` (CLI) or `quantization=QuantizationPolicy.fp8_cast()` (Python). Fp8-cast should be used with bf16 checkpoints, it shall downcast them on the fly. For Hopper GPUs with TensorRT-LLM, use `--quantization fp8-scaled-mm` for FP8 scaled matrix multiplication. Fp8-scaled-mm should be used with fp8 checkpoints.
-* **Install attention optimizations** - On datacenter Blackwell GPUs (B200), install FlashAttention 4 manually: `uv pip install 'flash-attn-4==4.0.0b9'` (this specific revision is the one we have verified against torch 2.9.1+cu128; newer betas have known issues on consumer Blackwell). On other CUDA GPUs (including Hopper), use xFormers (`uv sync --extra xformers`).
-* **Use gradient estimation** - Reduce inference steps from 40 to 20-30 while maintaining quality (see [pipeline documentation](packages/ltx-pipelines/README.md#denoising-loop-optimization))
+* **Enable FP8 quantization** - Enables lower memory footprint: `--quantization fp8-cast` (CLI) or `quantization=QuantizationPolicy.fp8_cast()` (Python). Fp8-cast should be used with bf16 checkpoints, it shall downcast them on the fly. On Hopper+ GPUs with native FP8 support, use `--quantization fp8-scaled-mm` for FP8 scaled matrix multiplication. Fp8-scaled-mm should be used with fp8 checkpoints.
+* **Install attention optimizations** - On datacenter Blackwell GPUs (B200), install FlashAttention 4 manually: `uv pip install 'flash-attn-4==4.0.0b9'` (this specific revision is the one we have verified against torch 2.9.1+cu128; newer betas have known issues on consumer Blackwell). On Hopper GPUs, install the FlashAttention 3 wheel. On other CUDA GPUs, PyTorch SDPA is used automatically. An installed backend is selected automatically at runtime; forcing a specific one is a Python-API option (`AttentionFunction.FLASH_ATTENTION_3`/`FLASH_ATTENTION_4`), not a CLI flag.
+* **Use gradient estimation** - Reduce inference steps from 40 to 20-30 while maintaining quality (see [pipeline documentation](packages/ltx-pipelines/docs/optimization.md#denoising-loop-optimization))
 * **Skip memory cleanup** - If you have sufficient VRAM, disable automatic memory cleanup between stages for faster processing
 * **Choose single-stage pipeline** - Use `TI2VidOneStagePipeline` for faster generation when high resolution isn't required
 
@@ -94,7 +118,7 @@ When writing prompts, focus on detailed, chronological descriptions of actions a
 - Describe lighting and colors
 - Note any changes or sudden events
 
-For additional guidance on writing a prompt please refer to <https://ltx.video/blog/how-to-prompt-for-ltx-2>
+For additional guidance on writing a prompt please refer to <https://ltx.io/blog/prompting-guide-for-ltx-2>
 
 ### Automatic Prompt Enhancement
 

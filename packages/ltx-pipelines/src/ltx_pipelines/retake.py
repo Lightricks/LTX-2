@@ -17,6 +17,7 @@ from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import (
     SpatioTemporalScaleFactors,
 )
+from ltx_pipelines.utils.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_pipelines.utils.args import video_editing_arg_parser
 from ltx_pipelines.utils.blocks import (
     AudioConditioner,
@@ -76,6 +77,7 @@ class RetakePipeline:
         distilled: bool = True,
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
+        alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
@@ -89,20 +91,23 @@ class RetakePipeline:
             device=self.device,
             registry=registry,
             offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
         self.image_conditioner = ImageConditioner(
             checkpoint_path=checkpoint_path,
             dtype=self.dtype,
             device=self.device,
             registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
         self.audio_conditioner = AudioConditioner(
             checkpoint_path=checkpoint_path,
             dtype=self.dtype,
             device=self.device,
             registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
-        self.stage = DiffusionStage(
+        self.stage = DiffusionStage.from_checkpoint(
             checkpoint_path=checkpoint_path,
             dtype=self.dtype,
             device=self.device,
@@ -111,18 +116,21 @@ class RetakePipeline:
             registry=registry,
             compilation_config=compilation_config,
             offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
         self.video_decoder = VideoDecoder(
             checkpoint_path=checkpoint_path,
             dtype=self.dtype,
             device=self.device,
             registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
         self.audio_decoder = AudioDecoder(
             checkpoint_path=checkpoint_path,
             dtype=self.dtype,
             device=self.device,
             registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
 
     # --------------------------------------------------------------------- #

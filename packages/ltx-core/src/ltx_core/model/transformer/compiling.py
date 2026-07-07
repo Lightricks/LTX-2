@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
@@ -27,18 +27,18 @@ class CompilationConfig:
     dynamo_config: dict[str, Any] = field(default_factory=lambda: dict(_DEFAULT_DYNAMO_CONFIG))
 
 
-class _SeqDynamicMarkingProcessor:
-    """Marks the per-block seq dim dynamic, then delegates to an inner processor.
-    Installed by ``compile_transformer`` so the per-block compile artifact stays
-    shape-polymorphic. Wraps whatever ``block_input_processor`` was already on
-    the model -- callers that customised the processor keep their customisation;
-    only the seq-dim marking is layered on top. Lives outside the compiled
-    region, so ``mark_dynamic`` runs in eager mode on the tensors that are
-    about to cross into the trace.
+class CompiledBlockPerturbationsProcessor(BlockPerturbationsProcessor):
+    """Per-block input prep for compiled blocks: mark the seq dim dynamic, then attach perturbation
+    as config-independent runtime masks so the block traces ONCE.
+    The ``mark_dynamic`` calls keep the per-block compile artifact shape-polymorphic; they run in
+    eager mode (this processor lives outside the compiled region) on the tensors about to cross into
+    the trace. Both keep-masks are then attached UNCONDITIONALLY and the skip flags pinned False, so
+    the trace is identical for every pass (cond / uncond / STG): the block never sees a flipped
+    Python bool (``self_attn_all_perturbed``) or a None-vs-tensor mask that Dynamo would specialise
+    on, so the STG pass no longer triggers a recompile. An all-keep mask blends to a no-op
+    (``out*1 + v*0``); an all-zero mask reproduces the skip. Reads only ``mask`` (runtime tensor
+    indexing), never the host-side ``all_in_batch`` / ``any_in_batch``.
     """
-
-    def __init__(self, inner: BlockPerturbationsProcessor) -> None:
-        self.inner = inner
 
     def __call__(
         self,
@@ -84,7 +84,14 @@ class _SeqDynamicMarkingProcessor:
         # and broadcasts, leave it static. Same guard pattern as `timesteps`.
         if args.cross_scale_shift_timestep is not None and args.cross_scale_shift_timestep.shape[1] > 1:
             torch._dynamo.mark_dynamic(args.cross_scale_shift_timestep, 1)
-        return self.inner(args, perturbations, block_idx, self_attn_type, cross_attn_type)
+        # Perturbation as config-independent runtime masks (skip flags pinned False -> no recompile).
+        return replace(
+            args,
+            self_attn_perturbation_mask=perturbations.mask(self_attn_type, block_idx),
+            self_attn_all_perturbed=False,
+            cross_attn_perturbation_mask=perturbations.mask(cross_attn_type, block_idx),
+            cross_attn_skip_all=False,
+        )
 
 
 def compile_transformer(model: LTXModel, config: CompilationConfig) -> LTXModel:
@@ -100,7 +107,7 @@ def compile_transformer(model: LTXModel, config: CompilationConfig) -> LTXModel:
         torch.compile(m, mode=config.mode, backend=config.backend, fullgraph=config.fullgraph, dynamic=config.dynamic)
         for m in model.transformer_blocks
     )
-    model.block_input_processor = _SeqDynamicMarkingProcessor(inner=model.block_input_processor)
+    model.block_input_processor = CompiledBlockPerturbationsProcessor()
 
     def patched_dynamo_forward(*args, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
         torch.compiler.cudagraph_mark_step_begin()

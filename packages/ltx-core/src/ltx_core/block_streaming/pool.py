@@ -8,6 +8,7 @@ from typing import Callable
 import torch
 
 from ltx_core.block_streaming import utils
+from ltx_core.block_streaming.stream_sync import StreamEvent
 
 
 class BufferPool:
@@ -27,13 +28,13 @@ class BufferPool:
         slot_nbytes: int,
         capacity: int,
         device: torch.device,
-        reuse_barrier: Callable[[torch.cuda.Event], None],
+        reuse_barrier: Callable[[StreamEvent], None],
         pin_memory: bool = False,
     ) -> None:
         self._slot_nbytes = slot_nbytes
         self._capacity = capacity
         self._free: deque[torch.Tensor] = deque()
-        self._events: dict[int, torch.cuda.Event] = {}
+        self._events: dict[int, StreamEvent] = {}
         self._reuse_barrier = reuse_barrier
         buffer = utils.alloc_buffer(max(slot_nbytes * capacity, 1), device, pin_memory)
         for slot in range(capacity):
@@ -59,7 +60,7 @@ class BufferPool:
             self._reuse_barrier(event)
         return buffer
 
-    def release(self, buffer: torch.Tensor, event: torch.cuda.Event | None = None) -> None:
+    def release(self, buffer: torch.Tensor, event: StreamEvent | None = None) -> None:
         """Return a raw slot to the free list.
         The *buffer* must be the exact tensor object returned by :meth:`acquire`
         (reuse is keyed on its identity). If *event* is given it is waited on the

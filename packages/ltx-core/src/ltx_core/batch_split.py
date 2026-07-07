@@ -25,8 +25,12 @@ from ltx_core.model.transformer.modality import Modality
 
 def _split_perturbations(config: BatchedPerturbationConfig, sizes: list[int]) -> list[BatchedPerturbationConfig]:
     """Split a ``BatchedPerturbationConfig`` along the batch dimension."""
-    it = iter(config.perturbations)
-    return [BatchedPerturbationConfig([next(it) for _ in range(s)]) for s in sizes]
+    chunks = []
+    offset = 0
+    for size in sizes:
+        chunks.append(config.batch_slice(offset, offset + size))
+        offset += size
+    return chunks
 
 
 def _merge_tensors(tensors: list[torch.Tensor | None]) -> torch.Tensor | None:
@@ -54,6 +58,10 @@ class BatchSplitAdapter(nn.Module):
         self._model = model
         self._max_batch_size = max_batch_size
 
+    @property
+    def num_blocks(self) -> int:
+        return self._model.num_blocks
+
     def _get_chunk_sizes(self, batch_size: int) -> list[int]:
         full, remainder = divmod(batch_size, self._max_batch_size)
         sizes = [self._max_batch_size] * full
@@ -65,7 +73,7 @@ class BatchSplitAdapter(nn.Module):
         self,
         video: Modality | None,
         audio: Modality | None,
-        perturbations: BatchedPerturbationConfig,
+        perturbations: BatchedPerturbationConfig | None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         batch_size = (video or audio).latent.shape[0]
 
@@ -77,7 +85,9 @@ class BatchSplitAdapter(nn.Module):
 
         v_chunks = video.split(sizes) if video is not None else [None] * n
         a_chunks = audio.split(sizes) if audio is not None else [None] * n
-        p_chunks = _split_perturbations(perturbations, sizes)
+        # A None config means "perturb nothing"; forward it per chunk so the inner model
+        # builds a per-chunk all-keep mask (splitting None has nothing to slice).
+        p_chunks = _split_perturbations(perturbations, sizes) if perturbations is not None else [None] * n
 
         chunk_results = [
             self._model(video=vc, audio=ac, perturbations=pc)

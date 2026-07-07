@@ -16,16 +16,16 @@ from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import Audio
 from ltx_pipelines.utils import get_device
+from ltx_pipelines.utils.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_pipelines.utils.args import (
     default_1_stage_t2a_arg_parser,
-    detect_checkpoint_path,
+    resolve_cli_params,
 )
 from ltx_pipelines.utils.blocks import (
     AudioDecoder,
     DiffusionStage,
     PromptEncoder,
 )
-from ltx_pipelines.utils.constants import detect_params
 from ltx_pipelines.utils.denoisers import FactoryGuidedDenoiser
 from ltx_pipelines.utils.media_io import encode_audio
 from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
@@ -56,6 +56,7 @@ class T2AOneStagePipeline:
         registry: Registry | None = None,
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
+        alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
     ):
         self.dtype = torch.bfloat16
         self.device = device or get_device()
@@ -67,12 +68,13 @@ class T2AOneStagePipeline:
             device=self.device,
             registry=registry,
             offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
         # Audio-only: build an audio-only transformer (model_configurator) so the video
         # weights are never instantiated, plus a use-case-specific SDOps that restricts
         # checkpoint reads to the audio model's keys, so the video weights are never even
         # read from disk (the loader skips any key the SDOps maps to None).
-        self.stage = DiffusionStage(
+        self.stage = DiffusionStage.from_checkpoint(
             checkpoint_path=checkpoint_path,
             dtype=self.dtype,
             device=self.device,
@@ -83,12 +85,14 @@ class T2AOneStagePipeline:
             offload_mode=offload_mode,
             model_configurator=LTXAudioOnlyModelConfigurator,
             model_sd_ops=LTXV_AUDIO_ONLY_MODEL_COMFY_RENAMING_MAP,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
         self.audio_decoder = AudioDecoder(
             checkpoint_path=checkpoint_path,
             dtype=self.dtype,
             device=self.device,
             registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
 
     def __call__(
@@ -153,8 +157,7 @@ class T2AOneStagePipeline:
 @torch.inference_mode()
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    checkpoint_path = detect_checkpoint_path()
-    params = detect_params(checkpoint_path)
+    params = resolve_cli_params()
     parser = default_1_stage_t2a_arg_parser(params=params)
     args = parser.parse_args()
     pipeline = T2AOneStagePipeline(

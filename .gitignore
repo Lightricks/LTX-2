@@ -44,12 +44,18 @@ wandb/
 *.wav
 *.webp
 
-# HDR IC-LoRA e2e test baseline (checked in via Git LFS)
-!packages/ltx-pipelines/tests/assets/expected_hdr_ic_lora_exr/frame_*.exr
+# Full-params expected results for the --full-e2e quality lane (checked in via Git LFS)
+!packages/ltx-pipelines/tests/assets/full_e2e/
+!packages/ltx-pipelines/tests/assets/full_e2e/*.mp4
+!packages/ltx-pipelines/tests/assets/full_e2e/*.wav
+!packages/ltx-pipelines/tests/assets/full_e2e/expected_hdr_ic_lora_exr/frame_*.exr
+
+# HDR IC-LoRA e2e test input clip (checked in via Git LFS)
 !packages/ltx-pipelines/tests/assets/hdr_ic_lora_test_input.mp4
 
-# Text-to-audio (T2A) e2e test baseline (checked in via Git LFS)
-!packages/ltx-pipelines/tests/assets/expected_t2a_one_stage_ltx2_3.wav
+# Fast integration-profile goldens (bit-exact decoded video/audio; checked in via Git LFS)
+!packages/ltx-pipelines/tests/assets/integration/
+!packages/ltx-pipelines/tests/assets/integration/*.safetensors
 
 # ltx-bench Grafana dashboards (source of truth in the repo)
 !packages/ltx-bench/grafana/*.json

@@ -20,6 +20,8 @@ STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 
 DISTILLED_SIGMAS = torch.tensor(DISTILLED_SIGMA_VALUES)
 STAGE_2_DISTILLED_SIGMAS = torch.tensor(STAGE_2_DISTILLED_SIGMA_VALUES)
+# Stage 2 schedule for the tiled-data-parallel multi-GPU runner.
+TDP_DISTILLED_SIGMAS = torch.tensor([0.625, 0.4, 0.0])
 
 
 # =============================================================================

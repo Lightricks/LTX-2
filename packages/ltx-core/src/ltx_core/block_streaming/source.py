@@ -8,6 +8,7 @@ import torch
 
 from ltx_core.block_streaming.block_fetcher import BlockFetcher, FetchHandle
 from ltx_core.block_streaming.pool import BufferPool
+from ltx_core.block_streaming.stream_sync import StreamEvent
 from ltx_core.block_streaming.utils import carve_buffer, layout_nbytes
 from ltx_core.loader.primitives import TensorLayout
 
@@ -33,7 +34,7 @@ class WeightSource(Protocol):
         """Return one contiguous CPU buffer for block *idx*."""
         ...
 
-    def release(self, idx: int, event: torch.cuda.Event | None) -> None:
+    def release(self, idx: int, event: StreamEvent | None) -> None:
         """Signal that an async operation using these weights is guarded by *event*."""
         ...
 
@@ -108,7 +109,7 @@ class DiskWeightSource(WeightSource):
             self._ensure_scheduled((idx + k) % self._blocks_number)
         return scheduled.raw
 
-    def release(self, idx: int, event: torch.cuda.Event | None) -> None:
+    def release(self, idx: int, event: StreamEvent | None) -> None:
         raw_buffer = self._in_flight.pop(idx)
         self._pool.release(raw_buffer, event=event)
 
@@ -164,7 +165,7 @@ class PinnedWeightSource(WeightSource):
     def get(self, idx: int) -> torch.Tensor:
         return self._blocks[idx].buffer
 
-    def release(self, idx: int, event: torch.cuda.Event | None) -> None:
+    def release(self, idx: int, event: StreamEvent | None) -> None:
         pass
 
     def cleanup(self) -> None:

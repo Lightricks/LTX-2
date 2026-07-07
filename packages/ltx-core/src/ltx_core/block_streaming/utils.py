@@ -88,12 +88,13 @@ def alloc_buffer(nbytes: int, device: torch.device | None, pin_memory: bool) -> 
     """Allocate one ``uint8`` buffer for :func:`allocate_layout_views`.
     For pinned host buffers, prefer ``cudaHostRegister`` to dodge the caching
     allocator's power-of-2 rounding. Falls back to the caching allocator if
-    registration fails. Raises if pinning is requested without a CUDA runtime,
-    since pinning is fundamentally a CUDA driver operation.
+    registration fails. Pinning is fundamentally a CUDA driver operation; when
+    requested without a CUDA runtime (e.g. on MPS/CPU, where H2D copies are
+    synchronous and pinning is meaningless) it degrades to a normal allocation.
     """
+    if pin_memory and not torch.cuda.is_available():
+        pin_memory = False  # pinning is CUDA-only; degrade gracefully off-CUDA
     if pin_memory and (device is None or torch.device(device).type == "cpu"):
-        if not torch.cuda.is_available():
-            raise RuntimeError("pin_memory=True requires CUDA, which is not available")
         buf = _alloc_pinned_exact(nbytes)
         if buf is not None:
             return buf

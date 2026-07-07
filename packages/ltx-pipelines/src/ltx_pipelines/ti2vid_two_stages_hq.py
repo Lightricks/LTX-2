@@ -13,6 +13,7 @@ from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import Audio, VideoLatentShape, VideoPixelShape
+from ltx_pipelines.utils.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_pipelines.utils.args import ImageConditioningInput, hq_2_stage_arg_parser
 from ltx_pipelines.utils.blocks import (
     AudioDecoder,
@@ -63,6 +64,7 @@ class TI2VidTwoStagesHQPipeline:
         registry: Registry | None = None,
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
+        alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
@@ -80,16 +82,33 @@ class TI2VidTwoStagesHQPipeline:
         )
 
         self.prompt_encoder = PromptEncoder(
-            checkpoint_path, gemma_root, self.dtype, self.device, registry=registry, offload_mode=offload_mode
+            checkpoint_path,
+            gemma_root,
+            self.dtype,
+            self.device,
+            registry=registry,
+            offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
-        self.image_conditioner = ImageConditioner(checkpoint_path, self.dtype, self.device, registry=registry)
+        self.image_conditioner = ImageConditioner(
+            checkpoint_path, self.dtype, self.device, registry=registry, alloc_trim_strategy=alloc_trim_strategy
+        )
         self.upsampler = VideoUpsampler(
-            checkpoint_path, spatial_upsampler_path, self.dtype, self.device, registry=registry
+            checkpoint_path,
+            spatial_upsampler_path,
+            self.dtype,
+            self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
-        self.video_decoder = VideoDecoder(checkpoint_path, self.dtype, self.device, registry=registry)
-        self.audio_decoder = AudioDecoder(checkpoint_path, self.dtype, self.device, registry=registry)
+        self.video_decoder = VideoDecoder(
+            checkpoint_path, self.dtype, self.device, registry=registry, alloc_trim_strategy=alloc_trim_strategy
+        )
+        self.audio_decoder = AudioDecoder(
+            checkpoint_path, self.dtype, self.device, registry=registry, alloc_trim_strategy=alloc_trim_strategy
+        )
 
-        self.stage_1 = DiffusionStage(
+        self.stage_1 = DiffusionStage.from_checkpoint(
             checkpoint_path,
             self.dtype,
             self.device,
@@ -98,8 +117,9 @@ class TI2VidTwoStagesHQPipeline:
             registry=registry,
             compilation_config=compilation_config,
             offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
-        self.stage_2 = DiffusionStage(
+        self.stage_2 = DiffusionStage.from_checkpoint(
             checkpoint_path,
             self.dtype,
             self.device,
@@ -108,6 +128,7 @@ class TI2VidTwoStagesHQPipeline:
             registry=registry,
             compilation_config=compilation_config,
             offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
 
     @torch.inference_mode()
@@ -213,7 +234,9 @@ class TI2VidTwoStagesHQPipeline:
             )
         )
 
-        video_state, audio_state = self.stage_2(
+        # Stage 2 refines video only; discard its audio. On the multi-GPU path stage-2 audio
+        # runs under partial tiled/TDP video context, so the full-context stage-1 audio is kept.
+        video_state, _ = self.stage_2(
             denoiser=SimpleDenoiser(v_context=v_context_p, a_context=a_context_p),
             sigmas=stage_2_sigmas,
             noiser=noiser,

@@ -21,10 +21,11 @@ from ltx_pipelines.utils import (
     combined_image_conditionings,
     get_device,
 )
+from ltx_pipelines.utils.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_pipelines.utils.args import (
     ImageConditioningInput,
     default_1_stage_arg_parser,
-    detect_checkpoint_path,
+    resolve_cli_params,
 )
 from ltx_pipelines.utils.blocks import (
     AudioDecoder,
@@ -33,7 +34,6 @@ from ltx_pipelines.utils.blocks import (
     PromptEncoder,
     VideoDecoder,
 )
-from ltx_pipelines.utils.constants import detect_params
 from ltx_pipelines.utils.denoisers import FactoryGuidedDenoiser
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import ModalitySpec, OffloadMode
@@ -58,6 +58,7 @@ class TI2VidOneStagePipeline:
         registry: Registry | None = None,
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
+        alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
     ):
         self.dtype = torch.bfloat16
         self.device = device or get_device()
@@ -69,14 +70,16 @@ class TI2VidOneStagePipeline:
             device=self.device,
             registry=registry,
             offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
         self.image_conditioner = ImageConditioner(
             checkpoint_path=checkpoint_path,
             dtype=self.dtype,
             device=self.device,
             registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
-        self.stage = DiffusionStage(
+        self.stage = DiffusionStage.from_checkpoint(
             checkpoint_path=checkpoint_path,
             dtype=self.dtype,
             device=self.device,
@@ -85,18 +88,21 @@ class TI2VidOneStagePipeline:
             registry=registry,
             compilation_config=compilation_config,
             offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
         self.video_decoder = VideoDecoder(
             checkpoint_path=checkpoint_path,
             dtype=self.dtype,
             device=self.device,
             registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
         self.audio_decoder = AudioDecoder(
             checkpoint_path=checkpoint_path,
             dtype=self.dtype,
             device=self.device,
             registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
 
     def __call__(  # noqa: PLR0913
@@ -187,8 +193,7 @@ class TI2VidOneStagePipeline:
 @torch.inference_mode()
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    checkpoint_path = detect_checkpoint_path()
-    params = detect_params(checkpoint_path)
+    params = resolve_cli_params()
     parser = default_1_stage_arg_parser(params=params)
     args = parser.parse_args()
     pipeline = TI2VidOneStagePipeline(

@@ -88,6 +88,11 @@ class ModelBuilderProtocol(BuilderProtocol[BuiltType], Protocol[BuiltType]):
     """
 
     @property
+    def checkpoint(self) -> str | tuple[str, ...]:
+        """Path(s) to the checkpoint this builder loads from (for logging/diagnostics)."""
+        ...
+
+    @property
     def model_sd_ops(self) -> SDOps | None: ...
 
     @property

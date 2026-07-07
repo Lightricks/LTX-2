@@ -258,16 +258,22 @@ def decode_image(image_path: str) -> np.ndarray:
     return np_array
 
 
-def _write_audio(container: av.container.Container, audio_stream: av.audio.AudioStream, audio: Audio) -> None:
+def _validate_audio_waveform(audio: Audio) -> None:
+    """Raise ValueError if the waveform is empty or not stereo ``(2, N)`` / ``(N, 2)``."""
     samples = audio.waveform
-    if samples.ndim == 1:
-        samples = samples[:, None]
+    if samples.numel() == 0:
+        raise ValueError("audio.waveform is empty; pass audio=None for no audio.")
+    if samples.ndim != 2 or 2 not in samples.shape:
+        raise ValueError(f"audio.waveform must be stereo (2, N) or (N, 2); got shape {tuple(samples.shape)}.")
 
-    if samples.shape[1] != 2 and samples.shape[0] == 2:
-        samples = samples.T
 
-    if samples.shape[1] != 2:
-        raise ValueError(f"Expected samples with 2 channels; got shape {samples.shape}.")
+def _normalize_audio_waveform(samples: torch.Tensor) -> torch.Tensor:
+    """Transpose a validated stereo waveform to channel-last ``(N, 2)``."""
+    return samples.T if samples.shape[1] != 2 else samples
+
+
+def _write_audio(container: av.container.Container, audio_stream: av.audio.AudioStream, audio: Audio) -> None:
+    samples = _normalize_audio_waveform(audio.waveform)
 
     # Convert to int16 packed for ingestion; resampler converts to encoder fmt.
     if samples.dtype != torch.int16:
@@ -335,13 +341,35 @@ def encode_video(
     preset: str = "veryfast",
     thread_count: int = 0,
 ) -> None:
+    """Encode RGB frames to an H.264 file, optionally muxing an audio track.
+    Args:
+        video: RGB frames as a ``(F, H, W, C)`` float ``[0, 1]`` tensor, or an iterator of
+            such per-chunk tensors (e.g. the VAE decoder output). An empty iterator raises.
+        fps: Output frame rate.
+        audio: Audio track to mux, or None for a video-only file. Waveform must be stereo
+            ``(2, N)`` or ``(N, 2)``.
+        output_path: Destination path. Partial output is removed if encoding fails.
+        video_chunks_number: Number of chunks yielded by ``video``, for the progress bar.
+        frame_converter: Float-to-pixel converter (default YUV420p BT.709).
+        crf: libx264 constant rate factor; lower is higher quality (0-51).
+        preset: libx264 speed/compression preset.
+        thread_count: libx264 thread count (0 = auto).
+    Raises:
+        ValueError: On an empty ``video`` or a non-stereo ``audio.waveform``.
+    """
+    if audio is not None:
+        _validate_audio_waveform(audio)
+
     if isinstance(video, torch.Tensor):
         video = iter([video])
 
     def convert(chunk: torch.Tensor) -> torch.Tensor:
         return frame_converter(chunk.movedim(-1, -3))
 
-    first_chunk = convert(next(video))
+    first_raw_chunk = next(video, None)
+    if first_raw_chunk is None:
+        raise ValueError("video is empty; expected at least one frame chunk.")
+    first_chunk = convert(first_raw_chunk)
 
     if frame_converter.pixel_format == PixelFormat.RGB24:
         height, width = first_chunk.shape[-3], first_chunk.shape[-2]
@@ -397,6 +425,7 @@ def encode_audio(audio: Audio, output_path: str) -> None:
     the only difference is a PCM (``pcm_s16le``) stream in a WAV container instead of
     the AAC stream used for muxed video.
     """
+    _validate_audio_waveform(audio)
     container = av.open(output_path, mode="w")
     audio_stream = container.add_stream("pcm_s16le", rate=audio.sampling_rate)
     audio_stream.codec_context.sample_rate = audio.sampling_rate

@@ -1,5 +1,6 @@
 import argparse
 import json
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -14,6 +15,7 @@ from ltx_pipelines.utils.constants import (
     LTX_2_3_HQ_PARAMS,
     LTX_2_3_PARAMS,
     PipelineParams,
+    detect_params,
 )
 from ltx_pipelines.utils.quantization_factory import QuantizationKind
 from ltx_pipelines.utils.types import OffloadMode
@@ -261,6 +263,24 @@ def detect_checkpoint_path(distilled: bool = False) -> str:
     pre.add_argument(flag, type=resolve_existing_path, required=True)
     known, _ = pre.parse_known_args()
     return known.distilled_checkpoint_path if distilled else known.checkpoint_path
+
+
+def help_requested() -> bool:
+    """Whether ``-h``/``--help`` appears on the command line."""
+    return "-h" in sys.argv or "--help" in sys.argv
+
+
+def resolve_cli_params(distilled: bool = False) -> PipelineParams:
+    """Return the model params a pipeline CLI uses to build its argument parser.
+    Reads the model version from the checkpoint named on the command line so the
+    parser's defaults match the target model.
+    Args:
+        distilled: Whether the pipeline takes a distilled checkpoint
+            (``--distilled-checkpoint-path``) rather than a full one (``--checkpoint-path``).
+    """
+    if help_requested():
+        return LTX_2_3_PARAMS
+    return detect_params(detect_checkpoint_path(distilled=distilled))
 
 
 def basic_arg_parser(

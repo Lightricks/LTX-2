@@ -21,10 +21,11 @@ from ltx_pipelines.iclora_utils import (
     append_ic_lora_reference_video_conditionings,
     read_lora_reference_downscale_factor,
 )
+from ltx_pipelines.utils.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_pipelines.utils.args import (
     ImageConditioningInput,
-    detect_checkpoint_path,
     lipdub_arg_parser,
+    resolve_cli_params,
 )
 from ltx_pipelines.utils.blocks import (
     AudioConditioner,
@@ -35,7 +36,7 @@ from ltx_pipelines.utils.blocks import (
     VideoDecoder,
     VideoUpsampler,
 )
-from ltx_pipelines.utils.constants import DISTILLED_SIGMAS, STAGE_2_DISTILLED_SIGMAS, detect_params
+from ltx_pipelines.utils.constants import DISTILLED_SIGMAS, STAGE_2_DISTILLED_SIGMAS
 from ltx_pipelines.utils.denoisers import SimpleDenoiser
 from ltx_pipelines.utils.helpers import assert_resolution, combined_image_conditionings, get_device
 from ltx_pipelines.utils.media_io import decode_audio_from_file, encode_video, get_videostream_metadata
@@ -62,6 +63,7 @@ class LipDubPipeline:
         registry: Registry | None = None,
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
+        alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
     ) -> None:
         self.device = device or get_device()
         self.dtype = torch.bfloat16
@@ -75,15 +77,23 @@ class LipDubPipeline:
             self.device,
             registry=registry,
             offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
-        self.image_conditioner = ImageConditioner(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
+        self.image_conditioner = ImageConditioner(
+            distilled_checkpoint_path,
+            self.dtype,
+            self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
+        )
         self.audio_conditioner = AudioConditioner(
             distilled_checkpoint_path,
             self.dtype,
             self.device,
             registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
-        self.stage = DiffusionStage(
+        self.stage = DiffusionStage.from_checkpoint(
             distilled_checkpoint_path,
             self.dtype,
             self.device,
@@ -92,12 +102,30 @@ class LipDubPipeline:
             registry=registry,
             compilation_config=compilation_config,
             offload_mode=offload_mode,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
         self.upsampler = VideoUpsampler(
-            distilled_checkpoint_path, spatial_upsampler_path, self.dtype, self.device, registry=registry
+            distilled_checkpoint_path,
+            spatial_upsampler_path,
+            self.dtype,
+            self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
         )
-        self.video_decoder = VideoDecoder(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
-        self.audio_decoder = AudioDecoder(distilled_checkpoint_path, self.dtype, self.device, registry=registry)
+        self.video_decoder = VideoDecoder(
+            distilled_checkpoint_path,
+            self.dtype,
+            self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
+        )
+        self.audio_decoder = AudioDecoder(
+            distilled_checkpoint_path,
+            self.dtype,
+            self.device,
+            registry=registry,
+            alloc_trim_strategy=alloc_trim_strategy,
+        )
         self.reference_downscale_factor = read_lora_reference_downscale_factor(ic_lora.path)
 
     def _create_stage_conditionings(
@@ -291,8 +319,7 @@ def patchify_lipdub_audio_reference_latent(
 @torch.inference_mode()
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
-    checkpoint_path = detect_checkpoint_path(distilled=True)
-    params = detect_params(checkpoint_path)
+    params = resolve_cli_params(distilled=True)
     parser = lipdub_arg_parser(params=params)
     args = parser.parse_args()
 

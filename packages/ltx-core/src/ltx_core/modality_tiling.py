@@ -93,7 +93,7 @@ class VideoModalityTilingHelper:
             keep_per_tile_cond = self._all_tiles_cond_keep(modality)  # (num_tiles, num_cond) bool
             tile_idx = next((i for i, t in enumerate(self._tiles) if t.in_coords == tile.in_coords), None)
             if tile_idx is None:
-                raise ValueError(
+                raise RuntimeError(
                     f"Tile with in_coords={tile.in_coords} is not in this helper's tile set; "
                     f"pass a tile obtained from `helper.tiles`."
                 )
@@ -164,7 +164,7 @@ class VideoModalityTilingHelper:
 
         if output is not None:
             if output.shape != expected_shape:
-                raise ValueError(f"Expected output shape {expected_shape}, got {output.shape}")
+                raise RuntimeError(f"Expected output shape {expected_shape}, got {output.shape}")
             result = output
         else:
             result = torch.zeros(*expected_shape, device=tile_to_blend.device, dtype=tile_to_blend.dtype)

@@ -77,7 +77,7 @@ class LTXModel(torch.nn.Module):
         super().__init__()
         # Log the attention backends this transformer is built with. Reading the resolved
         # ``label`` off the ops reports whatever was selected -- AUTOMATIC, an explicit pin
-        # (PYTORCH/XFORMERS/FA3/FA4/SDPA_*), or a directly supplied callable -- so this is the
+        # (PYTORCH/FA3/FA4/SDPA_*), or a directly supplied callable -- so this is the
         # single source of truth for which kernel a build uses. Fires once per build.
         logger.info(
             "Building transformer with attention backends -- self: %s, masked: %s",
@@ -358,21 +358,18 @@ class LTXModel(torch.nn.Module):
         """
         self._enable_gradient_checkpointing = enable
 
+    @property
+    def num_blocks(self) -> int:
+        """Number of transformer blocks."""
+        return len(self.transformer_blocks)
+
     def _process_transformer_blocks(
         self,
         video: TransformerArgs | None,
         audio: TransformerArgs | None,
-        perturbations: BatchedPerturbationConfig | None,
+        perturbations: BatchedPerturbationConfig,
     ) -> tuple[TransformerArgs | None, TransformerArgs | None]:
-        """Process transformer blocks for LTXAV.
-        Per-block perturbation masks are precomputed here and attached to each
-        modality's ``TransformerArgs`` so the block forward has no per-block
-        identity to specialise on — all blocks share a single Dynamo cache slot.
-        """
-        if perturbations is None:
-            batch_size = (video or audio).x.shape[0]
-            perturbations = BatchedPerturbationConfig.empty(batch_size)
-
+        """Process transformer blocks for LTX."""
         for block_idx, block in enumerate(self.transformer_blocks):
             if video is not None:
                 video = self.block_input_processor(
@@ -424,7 +421,7 @@ class LTXModel(torch.nn.Module):
         return x
 
     def forward(
-        self, video: Modality | None, audio: Modality | None, perturbations: BatchedPerturbationConfig
+        self, video: Modality | None, audio: Modality | None, perturbations: BatchedPerturbationConfig | None
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """
         Forward pass for LTX models.
@@ -438,6 +435,11 @@ class LTXModel(torch.nn.Module):
 
         video_args = self.video_args_preprocessor.prepare(video, audio) if video is not None else None
         audio_args = self.audio_args_preprocessor.prepare(audio, video) if audio is not None else None
+        # Materialize the no-perturbation mask here (eager); a None config means "perturb nothing"
+        # -> all-keep masks. The block loop never builds masks.
+        if perturbations is None:
+            ref = (video_args or audio_args).x
+            perturbations = BatchedPerturbationConfig.empty(ref.shape[0], self.num_blocks, ref.device, ref.dtype)
         # Process transformer blocks
         video_out, audio_out = self._process_transformer_blocks(
             video=video_args,
@@ -477,6 +479,11 @@ class LegacyX0Model(torch.nn.Module):
         super().__init__()
         self.velocity_model = velocity_model
 
+    @property
+    def num_blocks(self) -> int:
+        """Number of transformer blocks."""
+        return self.velocity_model.num_blocks
+
     def forward(
         self,
         video: Modality | None,
@@ -506,11 +513,16 @@ class X0Model(torch.nn.Module):
         super().__init__()
         self.velocity_model = velocity_model
 
+    @property
+    def num_blocks(self) -> int:
+        """Number of transformer blocks."""
+        return self.velocity_model.num_blocks
+
     def forward(
         self,
         video: Modality | None,
         audio: Modality | None,
-        perturbations: BatchedPerturbationConfig,
+        perturbations: BatchedPerturbationConfig | None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """
         Denoise the video and audio according to the sigma.

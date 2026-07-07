@@ -62,18 +62,16 @@ class BlockPerturbationsProcessor:
         self_attn_type: PerturbationType,
         cross_attn_type: PerturbationType,
     ) -> "TransformerArgs":
-        device, dtype = args.x.device, args.x.dtype
-
         all_self = perturbations.all_in_batch(self_attn_type, block_idx)
         any_self = perturbations.any_in_batch(self_attn_type, block_idx)
         self_mask: torch.Tensor | None = None
         if any_self and not all_self:
-            self_mask = perturbations.mask(self_attn_type, block_idx, device, dtype).view(-1, 1, 1)
+            self_mask = perturbations.mask(self_attn_type, block_idx)
 
         all_cross = perturbations.all_in_batch(cross_attn_type, block_idx)
         cross_mask: torch.Tensor | None = None
         if not all_cross:
-            cross_mask = perturbations.mask(cross_attn_type, block_idx, device, dtype).view(-1, 1, 1)
+            cross_mask = perturbations.mask(cross_attn_type, block_idx)
 
         return replace(
             args,

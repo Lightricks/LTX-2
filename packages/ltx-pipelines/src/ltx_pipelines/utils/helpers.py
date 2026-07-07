@@ -1,4 +1,3 @@
-import gc
 import logging
 
 import torch
@@ -9,6 +8,7 @@ from ltx_core.conditioning import (
     VideoConditionByKeyframeIndex,
     VideoConditionByLatentIndex,
 )
+from ltx_core.devices import cleanup_accelerator_memory, get_preferred_device
 from ltx_core.model.audio_vae import encode_audio
 from ltx_core.model.transformer import Modality
 from ltx_core.model.video_vae import TilingConfig, VideoEncoder
@@ -28,20 +28,11 @@ from ltx_pipelines.utils.media_io import (
 
 
 def get_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda", torch.cuda.current_device())
-    return torch.device("cpu")
+    return get_preferred_device()
 
 
 def cleanup_memory() -> None:
-    gc.collect()
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
-    try:
-        if hasattr(torch._C, "_host_emptyCache"):
-            torch._C._host_emptyCache()
-    except Exception:
-        logging.warning("Host empty cache cleanup failed; ignoring.", exc_info=True)
+    cleanup_accelerator_memory()
 
 
 def _conform_latent_length(latent: torch.Tensor, expected_frames_count: int) -> torch.Tensor:

@@ -10,7 +10,6 @@ from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.primitives import StateDict
 from ltx_core.model.transformer import LTXModel
 from ltx_core.quantization.policy import QuantizationPolicy
-from ltx_core.quantization.trtllm_scaled_usable import trtllm_scaled_mm_usable
 
 
 def _read_safetensors_dtypes(path: str) -> dict[str, str]:
@@ -50,34 +49,21 @@ class FP8Linear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         origin_shape = x.shape
 
-        if trtllm_scaled_mm_usable():
-            qinput, cur_input_scale = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(x, self.input_scale)
-            if qinput.dim() == 3:
-                qinput = qinput.reshape(-1, qinput.shape[-1])
-            output = torch.ops.trtllm.cublas_scaled_mm(
-                qinput,
-                self.weight.t(),
-                scale_a=cur_input_scale,
-                scale_b=self.weight_scale,
-                bias=None,
-                out_dtype=x.dtype,
-            )
-        else:
-            # Clamp before cast: out-of-range values cast to NaN/saturated FP8, which
-            # produces black-screen output on some checkpoints (e.g. ltx-2-19b-dev-fp8).
-            fp8_min = torch.finfo(torch.float8_e4m3fn).min
-            fp8_max = torch.finfo(torch.float8_e4m3fn).max
-            qinput = torch.clamp(x * self.input_scale.reciprocal(), fp8_min, fp8_max).to(torch.float8_e4m3fn)
-            if qinput.dim() == 3:
-                qinput = qinput.reshape(-1, qinput.shape[-1])
-            output = torch._scaled_mm(
-                qinput,
-                self.weight.t(),
-                scale_a=self.input_scale,
-                scale_b=self.weight_scale,
-                out_dtype=x.dtype,
-                use_fast_accum=True,
-            )
+        # Clamp before cast: out-of-range values cast to NaN/saturated FP8, which
+        # produces black-screen output on some checkpoints (e.g. ltx-2-19b-dev-fp8).
+        fp8_min = torch.finfo(torch.float8_e4m3fn).min
+        fp8_max = torch.finfo(torch.float8_e4m3fn).max
+        qinput = torch.clamp(x * self.input_scale.reciprocal(), fp8_min, fp8_max).to(torch.float8_e4m3fn)
+        if qinput.dim() == 3:
+            qinput = qinput.reshape(-1, qinput.shape[-1])
+        output = torch._scaled_mm(
+            qinput,
+            self.weight.t(),
+            scale_a=self.input_scale,
+            scale_b=self.weight_scale,
+            out_dtype=x.dtype,
+            use_fast_accum=True,
+        )
 
         if self.bias is not None:
             output = output + self.bias.to(output.dtype)
