@@ -180,7 +180,7 @@ class LatentsDecoder:
     def _process_file(self, latent_file: Path, output_dir: Path, seed: int | None) -> None:
         """Process a single latent file."""
         # Load the latent data
-        data = torch.load(latent_file, map_location=self.device, weights_only=False)
+        data = torch.load(latent_file, map_location=self.device, weights_only=True)  # nosemgrep: trailofbits.python.pickles-in-pytorch.pickles-in-pytorch
 
         # Get latents - handle both old patchified [seq_len, C] and new [C, F, H, W] formats
         latents = data["latents"]
@@ -261,7 +261,7 @@ class LatentsDecoder:
     def _process_audio_file(self, latent_file: Path, output_dir: Path) -> None:
         """Process a single audio latent file."""
         # Load the latent data
-        data = torch.load(latent_file, map_location=self.device, weights_only=False)
+        data = torch.load(latent_file, map_location=self.device, weights_only=True)  # nosemgrep: trailofbits.python.pickles-in-pytorch.pickles-in-pytorch
 
         latents = data["latents"].to(device=self.device, dtype=torch.float32)
         num_time_steps = data["num_time_steps"]
