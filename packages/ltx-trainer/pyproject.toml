@@ -54,7 +54,7 @@ build-backend = "hatchling.build"
 
 
 [tool.ruff]
-target-version = "1.1.7"
+target-version = "py311"
 line-length = 120
 # Restrict isort first-party detection to src/ so stray dirs (e.g. wandb/ run output)
 # next to pyproject.toml don't get classified as first-party packages. See ruff#10519.
