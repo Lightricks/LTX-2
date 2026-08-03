@@ -201,6 +201,36 @@ class UpcastWithStochasticRounding(ModuleOps):
         )
 
 
+_CUDA_CC = None
+
+
+def _cuda_cc() -> tuple:
+    """Cached CUDA compute capability, e.g. (8, 6) for a 3090."""
+    global _CUDA_CC
+    if _CUDA_CC is None:
+        try:
+            _CUDA_CC = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+        except Exception:
+            _CUDA_CC = (0, 0)
+    return _CUDA_CC
+
+
+def _triton_can_stochastic_round(dtype: torch.dtype) -> bool:
+    """Whether the fused_add_round Triton kernel can compile for *dtype* here.
+
+    The kernel casts to the fp8 storage dtype. Triton supports fp8e4nv
+    (``float8_e4m3fn``) only on Ada (sm_89) and newer; on Ampere (sm_86) it
+    raises "type fp8e4nv not supported in this architecture". fp8e5
+    (``float8_e5m2``) compiles on Ampere too. When unsupported, callers use a
+    deterministic bf16 fallback (no stochastic rounding).
+    """
+    if not TRITON_AVAILABLE:
+        return False
+    if dtype == torch.float8_e4m3fn:
+        return _cuda_cc() >= (8, 9)
+    return _cuda_cc() >= (8, 0)
+
+
 def fuse_cast_fp8_weight(
     delta_bf16: torch.Tensor,
     weight_fp8: torch.Tensor,
@@ -212,7 +242,7 @@ def fuse_cast_fp8_weight(
     """
     if delta_bf16.dtype != torch.bfloat16:
         raise ValueError(f"delta_bf16 must be bfloat16, got {delta_bf16.dtype}")
-    if str(weight_fp8.device).startswith("cuda") and TRITON_AVAILABLE:
+    if str(weight_fp8.device).startswith("cuda") and _triton_can_stochastic_round(weight_fp8.dtype):
         fused_add_round_launch(delta_bf16, weight_fp8, seed=0)
     else:
         delta_bf16.add_(weight_fp8.to(dtype=torch.bfloat16))
@@ -256,12 +286,25 @@ def _read_scales(checkpoint_path: str | Path) -> dict[str, torch.Tensor]:
     latter is absent in the current LTX-2.3 prequant checkpoints but
     accepted for forward compatibility.
     """
+    import json as _json
+
     out: dict[str, torch.Tensor] = {}
+    # Peek only the safetensors header (8-byte little-endian length prefix +
+    # that many bytes of JSON) to discover which tensors the file contains.
+    # This avoids safe_open()'s mmap of the entire (~46GB bf16) checkpoint,
+    # which fails with "Cannot allocate memory" when the mapping can't be
+    # committed on memory-limited hosts. A bf16 checkpoint carries no
+    # ``*_scale`` tensors, so we return {} after a tiny header read. The full
+    # mmap is only reached when prequant scales are actually present (fp8
+    # checkpoints, which are roughly half the size).
+    with open(checkpoint_path, "rb") as f:
+        header_len = int.from_bytes(f.read(8), "little")
+        header = _json.loads(f.read(header_len))
+    scale_keys = [k for k in header if k != "__metadata__" and k.endswith("_scale")]
+    if not scale_keys:
+        return out
     with safetensors.safe_open(str(checkpoint_path), framework="pt", device="cpu") as h:
-        raw_keys = h.keys()
-        for k in raw_keys:
-            if not k.endswith("_scale"):
-                continue
+        for k in scale_keys:
             if not k.startswith(_RAW_DIFFUSION_MODEL_PREFIX):
                 raise ValueError(
                     f"Scale key {k!r} does not start with the expected raw prefix {_RAW_DIFFUSION_MODEL_PREFIX!r}"

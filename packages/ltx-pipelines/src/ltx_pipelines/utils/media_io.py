@@ -592,6 +592,13 @@ def decode_audio_from_file(
 
     audio = np.concatenate(samples, axis=-1)
 
+    # LTX-2's audio VAE (and the output mux path) require a 2-channel
+    # (stereo) waveform: conv_in has in_channels=2, and _validate_audio_waveform
+    # rejects mono. Upmix a mono source to dual-mono (L=R) so mono TTS/wav
+    # inputs don't crash with 'expected input to have 2 channels, but got 1'.
+    if audio.shape[0] == 1:
+        audio = np.repeat(audio, 2, axis=0)
+
     # Trim samples that fall outside the requested [start_time, start_time + max_duration] window.
     # Audio codecs decode in fixed-size frames whose boundaries may not align with the requested
     # time range, so the first frame can start before start_time and the last frame can end after

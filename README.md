@@ -25,9 +25,13 @@ Download the relevant [models](https://huggingface.co/Lightricks/LTX-2.3) or use
 
 ```bash
 hf auth login
-hf download Lightricks/LTX-2.3 \
-    ltx-2.3-22b-distilled-1.1.safetensors ltx-2.3-spatial-upscaler-x2-1.1.safetensors --local-dir models/ltx-2.3
+hf download Lightricks/LTX-2.3 ltx-2.3-22b-distilled-1.1.safetensors ltx-2.3-spatial-upscaler-x2-1.1.safetensors ltx-2.3-22b-distilled-lora-384-1.1.safetensors --local-dir models/ltx-2.3
 hf download google/gemma-3-12b-it-qat-q4_0-unquantized --local-dir models/gemma-3-12b
+hf download Lightricks/LTX-2.3-fp8 ltx-2.3-22b-distilled-fp8.safetensors --local-dir models/ltx-2.3
+hf download TenStrip/LTX2.3-10Eros 10Eros_v1.4_bf16.safetensors 10Eros_v1.4_fp8mixed_learned.safetensors --local-dir models/ltx-2.3
+hf download TenStrip/LTX2.3_Distilled_Lora_1.1_Experiments ltx-2.3-22b-distilled-lora-1.1_fro90_ceil72_condsafe.safetensors --local-dir models/ltx-2.3
+
+uv sync --frozen
 ```
 
 If you get a 401/403, accept the model terms on Hugging Face and log in with a **Read** token (fine-grained tokens need the "read gated repos" scope enabled).
