@@ -320,7 +320,15 @@ class LtxvTrainer:
             global_batch_size=cfg.optimization.batch_size * self._accelerator.num_processes,
         )
 
-        saved_path = self._save_checkpoint()
+        # An interval checkpoint may already have been written at the final step.
+        # Re-saving the same path would append it twice to the retention list and
+        # keep_last_n=1 could then delete the just-written file as its own "old" copy.
+        prefix = "lora" if cfg.model.training_mode == "lora" else "model"
+        final_checkpoint_path = (
+            Path(cfg.output_dir) / "checkpoints" / f"{prefix}_weights_step_{self._global_step:05d}.safetensors"
+        )
+        self._accelerator.wait_for_everyone()
+        saved_path = final_checkpoint_path if final_checkpoint_path.exists() else self._save_checkpoint()
 
         if IS_MAIN_PROCESS:
             # Log the training statistics
@@ -769,6 +777,10 @@ class LtxvTrainer:
         self._accelerator = Accelerator(
             mixed_precision=self._config.acceleration.mixed_precision_mode,
             gradient_accumulation_steps=self._config.optimization.gradient_accumulation_steps,
+            # The trainer explicitly advances the scheduler once per optimizer step.
+            # Disable Accelerate's distributed batch-size adjustment, which would
+            # otherwise advance it once per process (8x per step on an 8-GPU run).
+            step_scheduler_with_optimizer=False,
             kwargs_handlers=[ddp_kwargs],
         )
 

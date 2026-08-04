@@ -772,10 +772,15 @@ class ValidationRunner:
         stepper = EulerDiffusionStep()
         cfg_guider = CFGGuider(cfg.guidance_scale)
         stg_guider = STGGuider(cfg.stg_scale)
+        transformer_config_source = getattr(transformer, "module", transformer)
 
         stg_perturbation_config = (
             self._build_stg_perturbation_config(
-                cfg.stg_blocks, cfg.stg_mode, transformer.num_blocks, device, next(transformer.parameters()).dtype
+                cfg.stg_blocks,
+                cfg.stg_mode,
+                transformer_config_source.num_blocks,
+                device,
+                next(transformer.parameters()).dtype,
             )
             if stg_guider.enabled()
             else None
