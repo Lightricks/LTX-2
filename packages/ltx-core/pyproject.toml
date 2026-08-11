@@ -10,7 +10,12 @@ dependencies = [
     "einops",
     "numpy",
     "av",
-    "transformers>=5.8.0",
+    # Upper bound: transformers 5.15.0 routes config attribute access through the
+    # heterogeneity layer, which raises AmbiguousGlobalPerLayerAttributeError on global
+    # `config.head_dim` -- but its own gemma4_unified model code still reads it that way
+    # (modeling_gemma4_unified.py, compute_default_rope_parameters), so the Gemma 4 text
+    # encoder cannot be built at all. 5.14.1 is the newest release verified working.
+    "transformers>=5.8.0,<5.15",
     "safetensors",
     "accelerate",
     "scipy>=1.14",
