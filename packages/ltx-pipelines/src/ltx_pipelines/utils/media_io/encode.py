@@ -119,7 +119,7 @@ def _encode_hdr_video_outputs(
 
 def encode_video(
     video: torch.Tensor | Iterator[torch.Tensor],
-    fps: int,
+    fps: float,
     audio: Audio | None,
     output_path: str,
     video_chunks_number: int,
@@ -189,7 +189,9 @@ def encode_video(
     container = av.open(output_path, mode="w")
     success = False
     try:
-        stream = container.add_stream("libx264", rate=int(fps), options={"crf": str(crf), "preset": preset})
+        stream = container.add_stream(
+            "libx264", rate=Fraction(fps).limit_denominator(1000), options={"crf": str(crf), "preset": preset}
+        )
         stream.width = width
         stream.height = height
         stream.pix_fmt = "yuv420p"

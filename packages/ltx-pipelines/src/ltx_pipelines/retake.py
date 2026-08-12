@@ -385,7 +385,7 @@ def main() -> None:
     video_chunks_number = get_video_chunks_number(src.frames, tiling_config)
     encode_video(
         video=video_iter,
-        fps=int(src.fps),
+        fps=src.fps,
         audio=audio,
         output_path=args.output_path,
         video_chunks_number=video_chunks_number,
