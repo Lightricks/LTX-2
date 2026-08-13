@@ -240,6 +240,7 @@ if __name__ == "__main__":
         distilled_lora_path=args.distilled_lora[0].path,
         compilation_config=args.compile,
         diffvae_optimization=args.diffvae_optimization,
+        quantization=args.quantization_builder,
     )
     try:
         for _ in controller.stream(

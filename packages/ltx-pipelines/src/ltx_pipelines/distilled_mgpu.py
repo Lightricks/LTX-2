@@ -212,6 +212,7 @@ if __name__ == "__main__":
         vae_queue=vae_queue,
         compilation_config=args.compile,
         diffvae_optimization=args.diffvae_optimization,
+        quantization=args.quantization_builder,
     )
     try:
         for _ in controller.stream(

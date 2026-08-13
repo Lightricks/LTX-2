@@ -1,4 +1,5 @@
 import argparse
+import functools
 import json
 import logging
 import sys
@@ -303,6 +304,11 @@ def _resolve_quantization(namespace: argparse.Namespace) -> None:
     # Resolution is deferred until after parse_args because fp8-scaled-mm needs the
     # checkpoint path, which isn't on the namespace when the --quantization argument
     # is parsed.
+    #
+    # Two forms are produced. Single-GPU pipelines take ``quantization`` (the built
+    # policy). The multi-GPU runners build the policy inside each spawned worker and
+    # therefore need ``quantization_builder``: a picklable zero-arg callable.
+    namespace.quantization_builder = None
     name = getattr(namespace, "quantization", None)
     if name is None or isinstance(name, QuantizationPolicy):
         return
@@ -324,6 +330,7 @@ def _resolve_quantization(namespace: argparse.Namespace) -> None:
             "--distilled-checkpoint-path, or --transformer-path."
         )
     namespace.quantization = kind.to_policy(checkpoint_path=ckpt)
+    namespace.quantization_builder = functools.partial(kind.to_policy, checkpoint_path=ckpt)
 
 
 def _resolve_model_paths(namespace: argparse.Namespace) -> None:
