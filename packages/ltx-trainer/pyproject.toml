@@ -110,6 +110,10 @@ ignore = [
     "PTH123", # `open()` should be replaced by `Path.open()`
     "PLR2004", # Magic value used in comparison, consider replacing with a constant variable
 ]
+[tool.ruff.lint.per-file-ignores]
+# Vendored verbatim from ostris/ai-toolkit (MIT) so it stays diffable upstream.
+"src/ltx_trainer/optimizers/automagic.py" = ["ALL"]
+
 [tool.ruff.lint.pylint]
 max-args = 10
 [tool.ruff.lint.isort]

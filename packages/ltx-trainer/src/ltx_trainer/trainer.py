@@ -271,7 +271,13 @@ class LtxvTrainer:
                     self._accelerator.wait_for_everyone()
 
                     # Update progress and log metrics
-                    current_lr = self._optimizer.param_groups[0]["lr"]
+                    # Self-adapting optimizers (Automagic) keep the live rate in their own
+                    # state, not on the param group — reading the group would log a constant.
+                    optimizer = getattr(self._optimizer, "optimizer", self._optimizer)
+                    if hasattr(optimizer, "get_avg_learning_rate"):
+                        current_lr = optimizer.get_avg_learning_rate()
+                    else:
+                        current_lr = self._optimizer.param_groups[0]["lr"]
                     step_time = (time.time() - step_start_time) * cfg.optimization.gradient_accumulation_steps
                     step_loss = output.loss.detach().mean().item()
 
@@ -740,9 +746,41 @@ class LtxvTrainer:
                 use_bias_correction=True,
                 safeguard_warmup=True,
             )
+        elif opt_cfg.optimizer_type == "automagic":
+            from ltx_trainer.optimizers import Automagic3  # noqa: PLC0415
+
+            # Automagic adapts the lr itself; the configured value is only where it starts.
+            # fused=True would bypass accelerate's clipping and cannot see accumulated
+            # gradients, so it is refused when accumulation is on.
+            if opt_cfg.automagic_fused and opt_cfg.gradient_accumulation_steps > 1:
+                raise ValueError(
+                    "optimizer_type='automagic' with automagic_fused=true is incompatible with "
+                    "gradient_accumulation_steps > 1 (the fused update runs inside backward, "
+                    "before gradients finish accumulating)."
+                )
+            logger.info(
+                "Automagic: starting lr %s is a launch point — the optimizer adapts it from "
+                "the pooled sign-polarity vote.",
+                lr,
+            )
+            optimizer = Automagic3(
+                self._trainable_params,
+                lr=lr,
+                weight_decay=opt_cfg.automagic_weight_decay,
+                polarity_history=opt_cfg.automagic_polarity_history,
+                fused=opt_cfg.automagic_fused,
+            )
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
 
+        if opt_cfg.optimizer_type == "automagic" and opt_cfg.scheduler_type != "constant":
+            # Automagic owns the learning rate: it adapts state["lr"] per parameter and never
+            # reads param_groups["lr"], so a scheduler would drive a value nothing consumes.
+            logger.warning(
+                "optimizer_type='automagic' ignores the LR scheduler (scheduler_type=%s); "
+                "the optimizer adapts its own rate.",
+                opt_cfg.scheduler_type,
+            )
         lr_scheduler = self._create_scheduler(optimizer)
 
         # noinspection PyTypeChecker

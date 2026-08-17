@@ -364,11 +364,39 @@ class OptimizationConfig(ConfigBaseModel):
         description="Maximum gradient norm for clipping",
     )
 
-    optimizer_type: Literal["adamw", "adamw8bit", "prodigy"] = Field(
+    optimizer_type: Literal["adamw", "adamw8bit", "prodigy", "automagic"] = Field(
         default="adamw",
         description=(
-            "Optimizer. 'prodigy' estimates its own step size and expects learning_rate: 1.0; "
-            "it needs the optional 'prodigy' extra (pip install prodigyopt)."
+            "Optimizer. 'prodigy' estimates its own step size and expects learning_rate: 1.0 "
+            "(needs the optional 'prodigy' extra). 'automagic' adapts one learning rate per "
+            "parameter group from the sign polarity of its own updates, so learning_rate is a "
+            "starting point rather than a target."
+        ),
+    )
+
+    automagic_polarity_history: int = Field(
+        default=8,
+        ge=2,
+        le=64,
+        description=(
+            "Automagic only: sign-history window length H. Longer windows make the up/down "
+            "votes rarer and more decisive, at the cost of H/8 bytes per element and an "
+            "H-step reaction lag."
+        ),
+    )
+
+    automagic_weight_decay: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Automagic only: decoupled weight decay.",
+    )
+
+    automagic_fused: bool = Field(
+        default=False,
+        description=(
+            "Automagic only: fuse the update into the backward pass for lower peak VRAM. "
+            "Bypasses gradient clipping and the nan-skip, and is incompatible with "
+            "gradient accumulation > 1, so it defaults off inside this trainer."
         ),
     )
 
