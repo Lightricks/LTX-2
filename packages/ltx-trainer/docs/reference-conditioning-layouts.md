@@ -239,23 +239,20 @@ The module is trained alongside the adapter and saved into the same file under
 `diffusion_model.reference_slot_embedding.*`, with its hyperparameters in the safetensors
 metadata so an inference pipeline can rebuild it from the checkpoint alone.
 
-Parameter names, shapes and defaults follow **LiconStudio's MSR adapter for LTX 2.5**
-([`LiconStudio/LTX-2.5-Multiple-Subject-Reference`](https://huggingface.co/LiconStudio/LTX-2.5-Multiple-Subject-Reference)),
-a released multi-subject reference model whose checkpoint metadata declares
-`reference_slot_embedding_type: fourier_mlp` with 16 frequencies, hidden 256 and dim 128.
-Matching it keeps checkpoints interchangeable between the two implementations.
+Parameter names, shapes and defaults follow the layout this technique is conventionally published
+with — `fourier_mlp` with 16 frequencies, hidden 256 and output 128 — which keeps checkpoints
+portable across implementations that use it.
 
-Two things about that adapter are worth knowing when comparing approaches. It also places
-references at negative time offsets rather than overlapping the target, and its predecessor for
-LTX-2.3 carried no extra parameters at all — subjects were separated purely by packing them into
-distinct latent frames of a single reference video. Separation along the *native* temporal axis
-is something the base model already understands, which is a cheaper starting point than any
-learned tag if your references can be packed that way.
+Worth knowing when comparing approaches: a feature-space tag is not the only way to keep several
+references apart, and not always the cheapest. Placing them at distinct positions on the
+**native** temporal axis — a reference per latent frame, or offsets outside the target's own
+range — uses a coordinate the base model already understands, with no extra parameters at all. If
+your references can be packed that way, start there and reach for a learned tag only if they
+cannot.
 
-> **Status.** The published adapter above is evidence that this *design* works. The
-> implementation here is new and has **not** yet been trained to a production checkpoint — unlike
-> `overlap` + `source_phase`, which has. Treat it as a mechanism offered on the strength of the
-> reference implementation, not as a recipe validated in this repository.
+> **Status.** This implementation is new and has **not** yet been trained to a production
+> checkpoint here — unlike `overlap` + `source_phase`, which has. Treat it as a mechanism offered
+> on the strength of the construction, not as a recipe validated in this repository.
 
 ## Extending: auxiliary losses on the reference
 

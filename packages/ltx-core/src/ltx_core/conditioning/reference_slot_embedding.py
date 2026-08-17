@@ -14,14 +14,14 @@ which the attention layers can use directly.
 The two mechanisms are independent and compose: the phase separates positionally, the slot
 embedding tags in feature space.
 
-Layout and hyperparameters follow the published LiconStudio MSR adapter for LTX 2.5
-(``LiconStudio/LTX-2.5-Multiple-Subject-Reference``), whose checkpoint metadata declares
-``reference_slot_embedding_type: fourier_mlp``, ``num_frequencies: 16``, ``hidden_dim: 256``,
-``dim: 128``. Matching its parameter names (``frequencies``, ``net.0``, ``net.2``) keeps
-checkpoints interchangeable between the two implementations.
+Fourier-featurising a scalar before a small MLP is the standard way to give a network a usable
+handle on an integer or coordinate — the same construction as sinusoidal position encodings and
+NeRF-style input encodings. Here the scalar is the slot index, and the MLP's output width is the
+patchified token width so the result can simply be added.
 
-One detail is *not* recoverable from a checkpoint: the activation between the two linear layers
-has no parameters, so it leaves no trace in the weights. ``SiLU`` is used here.
+Defaults (16 frequencies, hidden 256, output 128) and the parameter names ``frequencies`` /
+``net.0`` / ``net.2`` follow the layout this technique is conventionally published with, which
+keeps checkpoints portable across implementations that use it.
 """
 
 from __future__ import annotations

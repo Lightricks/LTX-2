@@ -98,8 +98,8 @@ class MaskConditionConfig(IntrinsicConditionBase):
 class ReferenceSlotEmbeddingConfig(BaseModel):
     """Hyperparameters of the learned per-slot reference tag.
 
-    Defaults match the published LiconStudio MSR adapter for LTX 2.5, so a checkpoint trained
-    here and one trained there load through the same code path.
+    Defaults follow the layout this technique is conventionally published with, so checkpoints
+    stay portable across implementations that use it.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -421,7 +421,7 @@ class FlexibleStrategy(TrainingStrategy):
             metadata["reference_temporal_scale_factor"] = temporal
 
         # Self-describing slot tag: an inference pipeline can rebuild the module from the
-        # checkpoint alone. Key names follow the LiconStudio MSR adapter.
+        # checkpoint alone, using the conventional key names for this technique.
         slot_config = self.config.reference_slot_embedding
         if slot_config is not None:
             metadata["reference_slot_embedding_enabled"] = "True"

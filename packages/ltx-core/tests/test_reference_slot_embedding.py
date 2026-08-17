@@ -5,8 +5,8 @@ import torch
 from ltx_core.conditioning.reference_slot_embedding import ReferenceSlotEmbedding
 
 
-def test_parameter_layout_matches_published_adapter() -> None:
-    """Key names and shapes must match the LiconStudio MSR adapter so checkpoints interchange."""
+def test_parameter_layout_matches_convention() -> None:
+    """Key names and shapes must match the conventional layout so checkpoints stay portable."""
     module = ReferenceSlotEmbedding()
     shapes = {name: tuple(tensor.shape) for name, tensor in module.state_dict().items()}
 
@@ -60,7 +60,7 @@ def test_accepts_batched_indices() -> None:
 
 
 def test_frequencies_travel_with_the_checkpoint() -> None:
-    """Persistent buffer: loading a foreign adapter must bring its own frequency schedule."""
+    """Persistent buffer: loading a foreign checkpoint must bring its own frequency schedule."""
     module = ReferenceSlotEmbedding()
     foreign = {**module.state_dict(), "frequencies": torch.full((16,), 3.0)}
 
