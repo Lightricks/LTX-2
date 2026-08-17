@@ -390,7 +390,7 @@ def main() -> None:
     )
     encode_video(
         video=video,
-        fps=int(src.fps),
+        fps=src.fps,
         audio=audio,
         output_path=args.output_path,
         video_chunks_number=get_video_chunks_number(snap_frames_to_grid(src.frames), tiling_config),
