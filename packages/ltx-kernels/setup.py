@@ -244,7 +244,18 @@ if __name__ == "__main__":
     ext_modules = []
 
     # all2all_cpp -- unchanged.
-    all2all_args = ["-O3", "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter", "-Wno-attributes"]
+    all2all_args = [
+        "-O3",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        "-Wno-unused-parameter",
+        "-Wno-attributes",
+        # CUDA 12.8's cuSPARSE headers declare legacy API types as deprecated.
+        # Those third-party declarations are pulled in transitively by PyTorch
+        # and must not fail this extension's otherwise strict warning policy.
+        "-Wno-deprecated-declarations",
+    ]
     ext_modules.append(
         CUDAExtension(
             name="all2all_cpp",
