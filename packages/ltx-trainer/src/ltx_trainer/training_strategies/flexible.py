@@ -147,6 +147,16 @@ class ReferenceConditionConfig(BaseModel):
         ge=0,
         description="Slot index fed to the embedding. Defaults to source_id when unset.",
     )
+    augment_noise: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "Training-only Gaussian noise added to this reference's latents, as a fraction of "
+            "their own per-sample standard deviation. Breaks the copy shortcut: a reference "
+            "that no longer matches the target pixel-for-pixel cannot be reproduced verbatim, "
+            "so the model has to extract content from it instead. 0.0 disables."
+        ),
+    )
     source_phase: bool = Field(
         default=False,
         description=(
@@ -729,6 +739,32 @@ class FlexibleStrategy(TrainingStrategy):
 
         return LatentData(latents=latents, num_frames=num_frames, height=height, width=width, fps=fps)
 
+    @staticmethod
+    def _augment_reference(cond_latents: Tensor, config: ReferenceConditionConfig) -> Tensor:
+        """Perturb reference latents so they cannot be copied verbatim.
+
+        Reference conditioning has a degenerate solution the objective does not discourage on
+        its own: when a reference shares content with the target — the same subject, the same
+        clothing, often the same source photograph — reproducing it wholesale already scores
+        well, and does so from the first steps, while composing the references into a new scene
+        pays off far later. Training then converges on copying one reference and discarding the
+        rest.
+
+        Noising the reference removes that shortcut. A copied noisy reference is a noisy
+        prediction, which the loss penalises, so the content has to be re-synthesised rather
+        than passed through. The noise is scaled by the reference's own standard deviation so
+        the setting means the same thing regardless of how the VAE scales its latents.
+
+        Training only — references are clean at inference, and validation samples the model the
+        way it will actually be used.
+        """
+        if config.augment_noise <= 0.0:
+            return cond_latents
+
+        scale = cond_latents.std().clamp(min=1e-6)
+        noise = torch.randn_like(cond_latents) * (scale * config.augment_noise)
+        return cond_latents + noise
+
     def _apply_slot_embedding(self, cond_latents: Tensor, config: ReferenceConditionConfig) -> Tensor:
         """Add this reference's learned slot tag to its tokens, in feature space.
 
@@ -832,6 +868,7 @@ class FlexibleStrategy(TrainingStrategy):
                 strata_start=strata_start,
             )
 
+        cond_latents = self._augment_reference(cond_latents, config)
         cond_latents = self._apply_slot_embedding(cond_latents, config)
 
         # Condition tokens: clean, timestep=0, no loss

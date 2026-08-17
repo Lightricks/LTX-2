@@ -254,6 +254,50 @@ cannot.
 > checkpoint here — unlike `overlap` + `source_phase`, which has. Treat it as a mechanism offered
 > on the strength of the construction, not as a recipe validated in this repository.
 
+## Reference augmentation
+
+Reference conditioning has a degenerate solution the objective does not discourage on its own.
+When a reference shares content with the target — the same subject, the same clothing, often the
+same source photograph — reproducing it wholesale already scores well, and scores well from the
+very first steps, while learning to compose several references into a new scene pays off much
+later. Training can settle on copying one reference and discarding the rest, and it will look
+like the model is ignoring your conditioning when in fact it is exploiting it.
+
+`augment_noise` removes the shortcut by making the reference un-copyable:
+
+```yaml
+conditions:
+  - type: reference
+    latents_dir: reference_latents
+    augment_noise: 0.3     # fraction of the reference's own std; 0.0 disables
+```
+
+A copied noisy reference is a noisy prediction, which the loss penalises, so the content has to
+be re-synthesised rather than passed through. The noise is scaled by the reference's own standard
+deviation, so the setting means the same thing regardless of how the VAE scales its latents.
+
+It applies **during training only**. References are clean at inference, and validation samples the
+model the way it will actually be used.
+
+| Value | Effect |
+|---|---|
+| `0.15` | Barely visible; flat regions pick up faint texture. Rarely enough to matter. |
+| `0.3` | Flat regions become grainy while subjects, faces and patterns stay intact. A good starting point. |
+| `0.5` | Heavy grain; content still legible. Use when copying persists at lower values. |
+
+Noise lands hardest on smooth regions, which are exactly the ones that are cheapest to copy, and
+leaves textured detail — the part that carries identity — largely intact.
+
+Two related levers, if copying persists: the per-condition `probability`, which drops a reference
+outright on some steps so the model cannot assume any single one is present; and pixel-space
+augmentation (crop, flip, colour jitter) at preprocessing time, which is stronger but requires
+re-encoding the reference latents.
+
+> **Check your captions too.** If a dataset describes two references identically — `<Image 1> is
+> the woman. <Image 2> is the woman.` — then no augmentation can help, because nothing in the
+> input says which is which. Those samples actively teach that the tags carry no information. See
+> [binding prompt tags to sources](#binding-prompt-tags-to-sources).
+
 ## Extending: auxiliary losses on the reference
 
 The layouts and the source phase only decide *where* the reference sits and *how* it is
@@ -357,6 +401,7 @@ untested here beyond the single-reference case).
 | `source_phase` | `false` | Enable the per-source rotary tag |
 | `source_id` | `2` | Source index for this reference; target is always `0` |
 | `phase_scale` | `1.0` | Multiplier on the source phase |
+| `augment_noise` | `0.0` | Training-only noise on this reference, as a fraction of its own std |
 | `slot_embedding` | `false` | Add the learned per-slot tag to this reference |
 | `slot_index` | `null` | Index fed to the slot embedding; defaults to `source_id` |
 | `sidecar_margin_pixels` | `0.0` | Gap between target and sidecar panel |

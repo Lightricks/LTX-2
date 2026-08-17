@@ -735,18 +735,42 @@ class LtxvTrainer:
             if isinstance(module, (BaseTunerLayer, ModulesToSaveWrapper)):
                 module.reset_lora_parameters(adapter_name="default", init_lora_weights=True)
 
+    def _optimizer_param_groups(self) -> list[dict[str, Any]] | list[torch.nn.Parameter]:
+        """Split the reference slot embedding into its own parameter group.
+
+        It is a few tens of thousands of parameters next to hundreds of millions of adapter
+        weights, and it starts from a zero-initialised output while the adapter starts at its
+        working scale — the two want different step sizes. Sharing one group also breaks
+        self-tuning optimizers specifically: Automagic pools its sign-polarity vote per group,
+        so a module holding well under a thousandth of the parameters has no say in the rate
+        it is trained at.
+        """
+        slot_embedding = getattr(self._transformer, "reference_slot_embedding", None)
+        if slot_embedding is None:
+            return self._trainable_params
+
+        slot_params = set(slot_embedding.parameters())
+        rest = [p for p in self._trainable_params if p not in slot_params]
+        return [
+            {"params": rest},
+            {"params": [p for p in slot_embedding.parameters() if p.requires_grad]},
+        ]
+
     def _init_optimizer(self) -> None:
         """Initialize the optimizer and learning rate scheduler."""
         opt_cfg = self._config.optimization
 
         lr = opt_cfg.learning_rate
+        # Grouped view for the optimizer only. ``_trainable_params`` stays a flat list because
+        # gradient clipping iterates it directly.
+        params = self._optimizer_param_groups()
         if opt_cfg.optimizer_type == "adamw":
-            optimizer = AdamW(self._trainable_params, lr=lr)
+            optimizer = AdamW(params, lr=lr)
         elif opt_cfg.optimizer_type == "adamw8bit":
             # noinspection PyUnresolvedReferences
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
 
-            optimizer = AdamW8bit(self._trainable_params, lr=lr)
+            optimizer = AdamW8bit(params, lr=lr)
         elif opt_cfg.optimizer_type == "prodigy":
             try:
                 from prodigyopt import Prodigy  # noqa: PLC0415
@@ -767,7 +791,7 @@ class LtxvTrainer:
                     lr,
                 )
             optimizer = Prodigy(
-                self._trainable_params,
+                params,
                 lr=lr,
                 weight_decay=opt_cfg.prodigy_weight_decay,
                 d_coef=opt_cfg.prodigy_d_coef,
@@ -792,7 +816,7 @@ class LtxvTrainer:
                 lr,
             )
             optimizer = Automagic3(
-                self._trainable_params,
+                params,
                 lr=lr,
                 weight_decay=opt_cfg.automagic_weight_decay,
                 polarity_history=opt_cfg.automagic_polarity_history,
