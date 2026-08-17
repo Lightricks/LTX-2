@@ -8,6 +8,7 @@ Convention table:
     video           → Video VAE    → latents/
     audio           → Audio VAE    → audio_latents/
     reference_video → Video VAE    → reference_latents/
+    reference_video_N → Video VAE  → reference_latents_N/   (multiple references)
     reference_audio → Audio VAE    → reference_audio_latents/
     video_mask      → (downsample) → video_masks/
     audio_mask      → (downsample) → audio_masks/
@@ -18,6 +19,7 @@ Basic usage:
         --model-path /path/to/ltx-checkpoint.safetensors --text-encoder-path /path/to/gemma-root
 """
 
+import re
 from pathlib import Path
 
 import typer
@@ -44,12 +46,24 @@ app = typer.Typer(
     pretty_exceptions_enable=False,
     no_args_is_help=True,
     help="Preprocess a media dataset for LTX family training. "
-    "Automatically detects columns (video, audio, reference_video, reference_audio, caption) "
+    "Automatically detects columns (video, audio, reference_video, reference_video_N, "
+    "reference_audio, caption) "
     "and processes each with the appropriate encoder.",
 )
 
 _KNOWN_ROLES = {"video", "audio", "reference_video", "reference_audio", "video_mask", "audio_mask", "caption"}
 _LEGACY_ALIASES = {"media_path": "video", "ref_media_path": "reference_video"}
+# Multiple video references: reference_video_0, reference_video_1, ... Each becomes its own
+# latents directory (reference_latents_0, ...) so a config can point one `reference` condition
+# at each and give them distinct source ids. Plain `reference_video` keeps writing to
+# `reference_latents`, so single-reference datasets are unaffected.
+_REFERENCE_VIDEO_RE = re.compile(r"^reference_video_(\d+)$")
+
+
+def reference_latents_dirname(role: str) -> str:
+    """Output directory for a video-reference role."""
+    m = _REFERENCE_VIDEO_RE.match(role)
+    return f"reference_latents_{m.group(1)}" if m else "reference_latents"
 
 
 def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
@@ -161,8 +175,11 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
                 overwrite=overwrite,
             )
 
-        # Process reference video if present
-        if "reference_video" in roles:
+        # Process every video reference present (reference_video, reference_video_0, ...)
+        reference_video_roles = sorted(
+            r for r in roles if r == "reference_video" or _REFERENCE_VIDEO_RE.match(r)
+        )
+        for reference_role in reference_video_roles:
             if reference_downscale_factor > 1 and len(resolution_buckets) > 1:
                 raise ValueError(
                     "When using --reference-downscale-factor > 1, only a single resolution bucket is supported."
@@ -187,9 +204,9 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
                 compute_latents(
                     dataset_file=dataset_file,
                     main_media_column=roles["video"],
-                    video_column=roles["reference_video"],
+                    video_column=roles[reference_role],
                     resolution_buckets=reference_buckets,
-                    output_dir=str(output_base / "reference_latents"),
+                    output_dir=str(output_base / reference_latents_dirname(reference_role)),
                     model_path=model_path,
                     video_vae_path=video_vae_path,
                     audio_vae_path=audio_vae_path,
@@ -269,8 +286,12 @@ def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
         )
         if has_video:
             decoder.decode(output_base / "latents", output_base / "decoded_videos")
-        if "reference_video" in roles and (output_base / "reference_latents").exists():
-            decoder.decode(output_base / "reference_latents", output_base / "decoded_reference_videos")
+        for reference_role in sorted(
+            r for r in roles if r == "reference_video" or _REFERENCE_VIDEO_RE.match(r)
+        ):
+            name = reference_latents_dirname(reference_role)
+            if (output_base / name).exists():
+                decoder.decode(output_base / name, output_base / f"decoded_{name}")
 
     # --- Summary ---
     logger.info(f"Dataset preprocessing complete! Results saved to {output_base}")
@@ -300,7 +321,7 @@ def _resolve_columns(
     roles: dict[str, str] = {}
     for col in dataset_columns:
         role = _LEGACY_ALIASES.get(col, col)
-        if role in _KNOWN_ROLES:
+        if role in _KNOWN_ROLES or _REFERENCE_VIDEO_RE.match(role):
             roles[role] = col
 
     if video_column_override and video_column_override in dataset_columns:

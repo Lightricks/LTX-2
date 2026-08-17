@@ -9,9 +9,14 @@ from __future__ import annotations
 import torch
 
 VALID_REFERENCE_LAYOUTS = ("overlap", "st_drc", "sidecar", "virtual_sidecar", "strata")
+
+# Strata-RoPE (UnityShots, arXiv:2606.21661) was designed for multi-shot memory rather than
+# general reference conditioning: memory slots sit on fixed ABSOLUTE temporal bands near
+# ``f_lim``, far from the current shot's [0, T-1], so the rotary attenuates cross-band
+# interaction by distance. Only the temporal axis moves; H/W stay on the target's grid.
 STRATA_F_LIM = 128
-STRATA_P_STM = 4
-STRATA_P_LTM = 2
+STRATA_P_STM = 4  # short-term memory band, in latent frames
+STRATA_P_LTM = 2  # long-term memory band, in latent frames
 
 
 def strata_temporal_start(
@@ -21,7 +26,12 @@ def strata_temporal_start(
     p_stm: int = STRATA_P_STM,
     p_ltm: int = STRATA_P_LTM,
 ) -> float:
-    """Return the absolute temporal start for an LTM or STM Strata-RoPE band."""
+    """Return the absolute temporal start for an LTM or STM Strata-RoPE band.
+
+    STM occupies ``[f_lim - p_stm, f_lim - 1]``; LTM sits just before it. The paper's
+    ``f_lim=128`` is a large distance, which on short latent-frame counts can attenuate a
+    reference to near-zero influence — hence ``f_lim`` is configurable.
+    """
     normalized_slot = str(slot).lower()
     if normalized_slot == "stm":
         return float(f_lim - p_stm)

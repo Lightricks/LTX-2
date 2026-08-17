@@ -14,6 +14,15 @@ Both are **off by default**. A config that does not opt in produces byte-identic
 upstream: `layout="overlap"` returns the reference positions unchanged, and a `segment_ids`
 field that is all-zero (or `None`) is an exact no-op in the rotary maths.
 
+## References
+
+| Layout / mechanism | Source |
+|---|---|
+| `st_drc` | ST-DRC — [arXiv:2606.02441](https://arxiv.org/abs/2606.02441) |
+| `strata` | Strata-RoPE, UnityShots — [arXiv:2606.21661](https://arxiv.org/abs/2606.21661) |
+| `overlap` + `source_phase` | Not from a paper — added here (see below) |
+| `sidecar` | Not from a paper — added here |
+
 ## Background
 
 The `st_drc` layout implements the coordinate separation described in **ST-DRC**
@@ -47,13 +56,18 @@ checked against a working artefact rather than taken on faith.
 | `overlap` | Reference reuses the target's coordinates. | Upstream behaviour. **Recommended**, combined with `source_phase`. |
 | `st_drc` | Shifts the reference past the target's extent on **every** axis (T, H, W). | The literal ST-DRC construction. |
 | `sidecar` | Parks the reference as a panel to the right of the target, vertically centred, spanning the clip temporally. | `virtual_sidecar` is an accepted alias. `sidecar_margin_pixels` sets the gap. |
-| `strata` | Shifts **only** the temporal axis to an absolute band; H/W keep overlapping the target. | For stacked memory-style references. Requires `strata_slot` (`ltm` or `stm`). |
+| `strata` | Shifts **only** the temporal axis to an absolute band; H/W keep overlapping the target. | Multi-shot memory slots, not general reference conditioning. Requires `strata_slot` (`ltm` or `stm`). |
 
-`strata` follows the band construction from Strata-RoPE: memory slots sit on fixed absolute
-temporal bands near `strata_f_lim`, far from the current shot, so the rotary attenuates
-cross-band interaction by distance. The paper's `f_lim=128` is a large distance; on LTX's short
-latent-frame counts that can attenuate a reference to near-zero influence, which is why
-`strata_f_lim` is configurable — lower it to keep the band close enough to still condition.
+`strata` follows Strata-RoPE from **UnityShots** ([arXiv:2606.21661](https://arxiv.org/abs/2606.21661)),
+which was designed for a narrower problem than the other layouts: keeping a subject consistent
+across **multiple shots**. Short- and long-term memory slots sit on fixed absolute temporal
+bands near `strata_f_lim`, far from the current shot's own range, so the rotary attenuates
+cross-band interaction by distance. If you are conditioning on a single reference, this is not
+the layout you want — use `overlap`.
+
+The paper's `f_lim=128` is a large distance; on LTX's short latent-frame counts that can
+attenuate a reference to near-zero influence, which is why `strata_f_lim` is configurable —
+lower it to keep the band close enough to still condition.
 
 ## Source phase
 
@@ -95,10 +109,57 @@ conditions:
     source_id: 3
 ```
 
+Preprocess one column per reference. `process_dataset.py` accepts numbered reference columns
+and writes each to its own latents directory:
+
+| Dataset column | Output directory |
+|---|---|
+| `reference_video` | `reference_latents` |
+| `reference_video_0` | `reference_latents_0` |
+| `reference_video_1` | `reference_latents_1` |
+
+```csv
+video,reference_video_0,reference_video_1,caption
+target.mp4,ref_a.png,ref_b.png,"..."
+```
+
+Plain `reference_video` is unchanged, so single-reference datasets keep working exactly as
+before.
+
 > **Validated scope.** What has actually been trained and verified so far is the **single
 > reference at `source_id: 2`** case. Multiple simultaneous sources at distinct ids are
 > supported by the implementation and are a natural extension, but they have not been validated
 > here — treat them as untested.
+
+## Extending: auxiliary losses on the reference
+
+The layouts and the source phase only decide *where* the reference sits and *how* it is
+tagged. They do not add any pressure on the model to actually preserve what the reference
+shows — the flow-matching objective alone has to carry that.
+
+For identity-style tasks this is often the missing piece, and it composes cleanly with the
+mechanisms here: because reference tokens are separable (by coordinates under `st_drc` /
+`sidecar`, or by source phase under `overlap`), it is straightforward to decode the generated
+region and score it against the reference with an auxiliary term. Some directions people have
+found useful:
+
+- **Face embedding loss** (ArcFace / InsightFace-style): cosine distance between the reference
+  face embedding and the generated one. Effective when the reference is a person and identity
+  drift is the failure mode.
+- **Appearance / feature loss** (DINOv2, DINOv3, SigLIP): cosine or L2 on pooled features,
+  which constrains general appearance rather than facial identity — useful for objects,
+  clothing and non-human subjects where a face model does not apply.
+- **Region-restricted variants**: apply either of the above only inside a mask (a detected
+  face box, a segmented subject) so the term does not fight the prompt over background.
+
+Two practical notes if you build one. Auxiliary losses on a diffusion objective usually need
+the prediction converted to an `x0` estimate before decoding, which is only meaningful at low
+sigma — gating the term by timestep avoids paying for a decode on samples where the estimate is
+mostly noise. And the weight matters more than the choice of network: too high and the model
+optimises the embedding metric at the expense of prompt adherence.
+
+This trainer does not ship such a loss; `FlexibleStrategy.compute_loss` is the place to add
+one, and the reference latents are already on the batch under the condition's `latents_dir`.
 
 ## Keeping training and inference aligned
 
