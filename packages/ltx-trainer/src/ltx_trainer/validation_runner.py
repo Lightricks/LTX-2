@@ -832,7 +832,14 @@ class ValidationRunner:
     def _apply_reference_side_by_side(
         video_output: Tensor, sample: ValidationSample, cached_media: CachedSampleMedia
     ) -> Tensor:
-        """Concatenate reference video pixels side-by-side with generated output if requested."""
+        """Concatenate reference video pixels side-by-side with generated output if requested.
+
+        Panels are laid out left-to-right in config order, with the generated output last, so a
+        multi-reference sample reads as ``[ref[0] | ref[1] | ... | output]``. Prepending each
+        reference to the accumulated result instead would reverse them, which silently
+        misattributes which ``source_id`` produced what.
+        """
+        panels: list[Tensor] = []
         for cond_idx, cond in enumerate(sample.conditions):
             if cond.type == "reference" and cond.include_in_output:
                 media = cached_media.conditions.get(cond_idx)
@@ -852,7 +859,9 @@ class ValidationRunner:
                         else:
                             indices = torch.linspace(0, ref_frames - 1, output_frames).round().long()
                         ref_pixels = ref_pixels[:, indices]
-                    video_output = _concatenate_videos_side_by_side(ref_pixels, video_output)
+                    panels.append(ref_pixels)
+        for ref_pixels in reversed(panels):
+            video_output = _concatenate_videos_side_by_side(ref_pixels, video_output)
         return video_output
 
     # ------------------------------------------------------------------
