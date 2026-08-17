@@ -393,6 +393,20 @@ class OptimizationConfig(ConfigBaseModel):
         description="Automagic only: decoupled weight decay.",
     )
 
+    automagic_max_lr: float | None = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "Automagic only: ceiling on the adapted rate for the main parameter group. The "
+            "optimizer raises its rate until the sign polarity of its own updates stops "
+            "agreeing, which on a large adapter can settle above what the run is stable at — "
+            "the symptom is a loss that flattens early while samples keep swinging between "
+            "behaviours from checkpoint to checkpoint. Leave unset to let it choose freely. "
+            "Small trained modules keep their own group and are not capped by this, since a "
+            "zero-initialised module legitimately needs a much higher rate to grow at all."
+        ),
+    )
+
     automagic_fused: bool = Field(
         default=False,
         description=(

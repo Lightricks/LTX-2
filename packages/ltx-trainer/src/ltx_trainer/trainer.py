@@ -20,7 +20,7 @@ from peft.utils import ModulesToSaveWrapper
 from pydantic import BaseModel
 from safetensors.torch import load_file, save_file
 from torch import Tensor
-from torch.optim import AdamW
+from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import (
     CosineAnnealingLR,
     CosineAnnealingWarmRestarts,
@@ -271,13 +271,8 @@ class LtxvTrainer:
                     self._accelerator.wait_for_everyone()
 
                     # Update progress and log metrics
-                    # Self-adapting optimizers (Automagic) keep the live rate in their own
-                    # state, not on the param group — reading the group would log a constant.
                     optimizer = getattr(self._optimizer, "optimizer", self._optimizer)
-                    if hasattr(optimizer, "get_avg_learning_rate"):
-                        current_lr = optimizer.get_avg_learning_rate()
-                    else:
-                        current_lr = self._optimizer.param_groups[0]["lr"]
+                    current_lr, per_group_lrs = self._current_learning_rates(optimizer)
                     step_time = (time.time() - step_start_time) * cfg.optimization.gradient_accumulation_steps
                     step_loss = output.loss.detach().mean().item()
 
@@ -295,6 +290,13 @@ class LtxvTrainer:
                         metrics = {
                             "train/loss": step_loss,
                             "train/learning_rate": current_lr,
+                            # Per group as well: with a separate group for a small trained module
+                            # the groups diverge by design, and a single number hides it.
+                            **{
+                                f"train/learning_rate_group_{i}": lr
+                                for i, lr in enumerate(per_group_lrs)
+                                if len(per_group_lrs) > 1
+                            },
                             "train/step_time": step_time,
                             "train/global_step": self._global_step,
                         }
@@ -544,6 +546,36 @@ class LtxvTrainer:
 
         logger.info("✅ Full model checkpoint loaded successfully")
 
+    def _restore_reference_slot_embedding(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Pull the slot embedding out of a checkpoint into the module, returning the rest.
+
+        Returns the state dict with those keys removed so PEFT only sees adapter weights.
+        """
+        prefix = "reference_slot_embedding."
+        slot_state = {k[len(prefix) :]: v for k, v in state_dict.items() if k.startswith(prefix)}
+        remainder = {k: v for k, v in state_dict.items() if not k.startswith(prefix)}
+
+        module = getattr(self._transformer, "reference_slot_embedding", None)
+        if module is None:
+            if slot_state:
+                logger.warning(
+                    "⚠️ Checkpoint carries a reference slot embedding but this run has none "
+                    "configured; its tag will be ignored."
+                )
+            return remainder
+
+        if not slot_state:
+            logger.warning(
+                "⚠️ This run trains a reference slot embedding but the checkpoint has none — "
+                "it will start from its zero init rather than resuming."
+            )
+            return remainder
+
+        device = next(module.parameters()).device
+        module.load_state_dict({k: v.to(device=device, dtype=torch.float32) for k, v in slot_state.items()})
+        logger.info("✅ Reference slot embedding restored from checkpoint")
+        return remainder
+
     def _load_lora_checkpoint(self, checkpoint_path: Path) -> None:
         """Load LoRA checkpoint with DDP/FSDP compatibility."""
         state_dict = load_file(checkpoint_path)
@@ -551,6 +583,12 @@ class LtxvTrainer:
         # Adjust layer names to match internal format.
         # (Weights are saved in ComfyUI-compatible format, with "diffusion_model." prefix)
         state_dict = {k.replace("diffusion_model.", "", 1): v for k, v in state_dict.items()}
+
+        # Modules trained alongside the adapter have to be restored explicitly: PEFT ignores
+        # keys it does not recognise, so resuming would silently reset them to their init —
+        # for the zero-initialised slot embedding, that means resuming with no tag at all while
+        # the run reports a successful load.
+        state_dict = self._restore_reference_slot_embedding(state_dict)
 
         # Load LoRA weights and verify all weights were loaded
         base_model = self._transformer.get_base_model()
@@ -735,6 +773,28 @@ class LtxvTrainer:
             if isinstance(module, (BaseTunerLayer, ModulesToSaveWrapper)):
                 module.reset_lora_parameters(adapter_name="default", init_lora_weights=True)
 
+    @staticmethod
+    def _current_learning_rates(optimizer: Optimizer) -> tuple[float, list[float]]:
+        """The rate to plot, plus one entry per parameter group.
+
+        Self-adapting optimizers (Automagic) keep the live rate in their own state rather than on
+        the param group, so reading the group logs a constant and hides whether adaptation
+        happened at all. Their average is taken across *groups*, unweighted — which is fine with
+        one group and misleading with two, since a group holding a thousandth of the parameters
+        then accounts for half the reported number. So the headline value is the group holding the
+        most parameters (the adapter), and every group is reported alongside it.
+        """
+        if hasattr(optimizer, "get_learning_rates"):
+            group_lrs = [float(lr) for lr in optimizer.get_learning_rates()]
+        else:
+            group_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+        if not group_lrs:
+            return 0.0, []
+
+        sizes = [sum(p.numel() for p in group["params"]) for group in optimizer.param_groups]
+        headline = group_lrs[max(range(len(sizes)), key=sizes.__getitem__)] if sizes else group_lrs[0]
+        return headline, group_lrs
+
     def _optimizer_param_groups(self) -> list[dict[str, Any]] | list[torch.nn.Parameter]:
         """Split the reference slot embedding into its own parameter group.
 
@@ -751,8 +811,17 @@ class LtxvTrainer:
 
         slot_params = set(slot_embedding.parameters())
         rest = [p for p in self._trainable_params if p not in slot_params]
+
+        adapter_group: dict[str, Any] = {"params": rest}
+        # The ceiling applies to the adapter only. The slot embedding starts at a zero output
+        # and has to climb to be heard at all, so capping it at a rate tuned for hundreds of
+        # millions of mature weights would keep it silent.
+        max_lr = self._config.optimization.automagic_max_lr
+        if max_lr is not None:
+            adapter_group["max_lr"] = max_lr
+
         return [
-            {"params": rest},
+            adapter_group,
             {"params": [p for p in slot_embedding.parameters() if p.requires_grad]},
         ]
 
