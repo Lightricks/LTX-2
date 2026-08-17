@@ -5,8 +5,6 @@ from ltx_core.conditioning.reference_layout import apply_reference_layout
 from ltx_core.conditioning.types.reference_video_cond import VideoConditionByReferenceLatent
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.rope import apply_segment_phase_to_freqs_cis, segment_phase_rate_vector
-from ltx_core.model.transformer.transformer import BasicAVTransformerBlock, TransformerConfig
-from ltx_core.model.transformer.transformer_args import TransformerArgs
 from ltx_core.multigpu.transformer.sequence_parallel import (
     pad_modality_for_uniform_sharding,
     tile_modality_for_rank,
