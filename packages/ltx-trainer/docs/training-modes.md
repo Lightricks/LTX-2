@@ -31,6 +31,7 @@ Before diving into individual modes, here are the core ideas behind the flexible
 | **I2V**               | Generated | Generated | `first_frame`       | [`i2v_lora`](../configs/i2v_lora.yaml) |
 | **Video Extension**   | Generated | Generated | `prefix`/`suffix`   | [`video_extend_lora`](../configs/video_extend_lora.yaml) |
 | **V2V IC-LoRA**       | Generated | —         | `reference`         | [`v2v_ic_lora`](../configs/v2v_ic_lora.yaml) |
+| **Reference + source phase** | Generated | —  | `reference`         | [`v2v_ic_lora_reference_phase`](../configs/v2v_ic_lora_reference_phase.yaml) |
 | **A2V**               | Generated | Frozen    | —                   | [`a2v_lora`](../configs/a2v_lora.yaml) |
 | **V2A (Foley)**       | Frozen    | Generated | —                   | [`v2a_lora`](../configs/v2a_lora.yaml) |
 | **Video Inpainting**  | Generated | —         | `mask`              | [`video_inpainting_lora`](../configs/video_inpainting_lora.yaml) |
@@ -142,6 +143,22 @@ training_strategy:
 > Use [AV2AV IC-LoRA](#av2av-ic-lora) when both video and audio references should be trained jointly.
 
 **Example config:** 📄 [v2v_ic_lora.yaml](../configs/v2v_ic_lora.yaml)
+
+### Reference RoPE layouts and source phase
+
+The `reference` condition can additionally control *where* the reference sits in the RoPE grid
+(`layout`) and tag each source with an independent rotary phase (`source_phase`). Both are
+opt-in; the defaults reproduce the behaviour above exactly.
+
+The recommended starting point for reference/identity transfer is `layout: overlap` with
+`source_phase: true` — the reference keeps the target's coordinates and the sources are told
+apart by phase.
+
+**Example config:** 📄 [v2v_ic_lora_reference_phase.yaml](../configs/v2v_ic_lora_reference_phase.yaml)
+
+See [reference-conditioning-layouts.md](./reference-conditioning-layouts.md) for the full
+description, the ST-DRC reference, multi-source configuration, and the training/inference
+parity requirements.
 
 ### Dataset Requirements
 

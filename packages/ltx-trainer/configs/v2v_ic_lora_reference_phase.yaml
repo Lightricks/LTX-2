@@ -1,0 +1,112 @@
+# Reference conditioning with source phase (recommended reference-transfer recipe).
+#
+# Same shape as v2v_ic_lora.yaml, but the reference block keeps the target's RoPE
+# coordinates (layout: overlap) and is separated from the target by an independent
+# rotary tag (source_phase) instead of by a coordinate shift.
+#
+# See docs/reference-conditioning-layouts.md. A released LoRA trained with exactly this
+# recipe: https://huggingface.co/Alissonerdx/LTX-Best-Face-ID
+model:
+  model_path: /path/to/ltx-2.3.safetensors
+  text_encoder_path: /path/to/gemma
+  training_mode: lora
+  load_checkpoint: null
+
+lora:
+  rank: 128
+  alpha: 128
+  dropout: 0.0
+  target_modules:
+    - attn1.to_k
+    - attn1.to_q
+    - attn1.to_v
+    - attn1.to_out.0
+    - attn2.to_k
+    - attn2.to_q
+    - attn2.to_v
+    - attn2.to_out.0
+    - ff.net.0.proj
+    - ff.net.2
+
+training_strategy:
+  name: flexible
+  video:
+    is_generated: true
+    latents_dir: latents
+    conditions:
+      # The reference is clean (timestep 0, excluded from the loss) and concatenated to
+      # the target sequence. source_id 2 is the value used by the released checkpoints;
+      # the target is always source 0, which is an exact no-op in the rotary maths.
+      - type: reference
+        latents_dir: reference_latents
+        probability: 1.0
+        layout: overlap
+        source_phase: true
+        source_id: 2
+        phase_scale: 1.0
+
+      # A second reference would be another block at a distinct id. The implementation
+      # supports it; only the single-reference case above has been validated so far.
+      # - type: reference
+      #   latents_dir: reference_b_latents
+      #   layout: overlap
+      #   source_phase: true
+      #   source_id: 3
+
+optimization:
+  learning_rate: 1.0e-5
+  steps: 4000
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
+  optimizer_type: adamw
+  scheduler_type: linear
+  scheduler_params: {}
+  enable_gradient_checkpointing: true
+
+acceleration:
+  mixed_precision_mode: bf16
+  quantization: null
+  load_text_encoder_in_8bit: false
+  offload_optimizer_during_validation: true
+
+data:
+  preprocessed_data_root: /path/to/dataset/.precomputed
+  num_dataloader_workers: 2
+
+validation:
+  # Validation must use the SAME layout/phase as training, or the model is sampled under
+  # a coordinate frame it never saw.
+  samples:
+    - prompt: "A person speaking to camera in a bright room."
+      conditions:
+        - type: reference
+          video: /path/to/reference.mp4
+          layout: overlap
+          source_phase: true
+          source_id: 2
+          include_in_output: true
+  interval: 250
+  generate_audio: false
+  generate_video: true
+  skip_initial_validation: true
+
+checkpoints:
+  interval: 250
+  keep_last_n: 4
+  precision: bfloat16
+
+flow_matching:
+  timestep_sampling_mode: shifted_logit_normal
+  timestep_sampling_params: {}
+
+hub:
+  push_to_hub: false
+  hub_model_id: null
+
+wandb:
+  enabled: false
+  project: "ltx-reference-phase"
+
+seed: 42
+output_dir: /path/to/outputs

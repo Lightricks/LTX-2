@@ -15,6 +15,8 @@ import torch
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from torch import Tensor
 
+from ltx_core.conditioning.reference_layout import apply_reference_layout, strata_temporal_start
+from ltx_core.conditioning.reference_slot_embedding import ReferenceSlotEmbedding
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.types import SpatioTemporalScaleFactors
 from ltx_trainer.timestep_samplers import TimestepSampler
@@ -93,6 +95,19 @@ class MaskConditionConfig(IntrinsicConditionBase):
     )
 
 
+class ReferenceSlotEmbeddingConfig(BaseModel):
+    """Hyperparameters of the learned per-slot reference tag.
+
+    Defaults follow the layout this technique is conventionally published with, so checkpoints
+    stay portable across implementations that use it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    num_frequencies: int = Field(default=16, ge=1, description="Fourier frequencies for the slot index.")
+    hidden_dim: int = Field(default=256, ge=1, description="Hidden width of the slot MLP.")
+
+
 class ReferenceConditionConfig(BaseModel):
     """Reference conditioning (IC-LoRA style concatenation).
     External reference latents are concatenated to the target sequence.
@@ -105,6 +120,70 @@ class ReferenceConditionConfig(BaseModel):
     type: Literal["reference"] = "reference"
     latents_dir: str = Field(..., description="Directory for reference latents")
     probability: float = Field(default=1.0, ge=0.0, le=1.0, description="Probability of applying this condition")
+    layout: Literal["overlap", "st_drc", "sidecar", "virtual_sidecar", "strata"] = Field(
+        default="overlap",
+        description=(
+            "Where reference tokens sit in the RoPE grid. 'overlap' reuses the target's "
+            "coordinates (upstream behaviour); 'st_drc' shifts the block past the target on "
+            "every axis; 'sidecar' parks it as a panel to the right; 'strata' shifts the "
+            "temporal axis only. 'virtual_sidecar' is an alias for 'sidecar'."
+        ),
+    )
+    strata_slot: Literal["ltm", "stm"] | None = Field(
+        default=None,
+        description="Memory band used by layout='strata'.",
+    )
+    strata_f_lim: int = Field(default=128, ge=4, description="Ceiling of the absolute Strata-RoPE bands.")
+    slot_embedding: bool = Field(
+        default=False,
+        description=(
+            "Add a learned per-slot embedding to this reference's tokens. Unlike source_phase, "
+            "which tags positionally, this is an additive feature-space tag the attention "
+            "layers can read directly. Requires reference_slot_embedding on the strategy."
+        ),
+    )
+    slot_index: int | None = Field(
+        default=None,
+        ge=0,
+        description="Slot index fed to the embedding. Defaults to source_id when unset.",
+    )
+    augment_noise: float = Field(
+        default=0.0,
+        ge=0.0,
+        description=(
+            "Training-only Gaussian noise added to this reference's latents, as a fraction of "
+            "their own per-sample standard deviation. Breaks the copy shortcut: a reference "
+            "that no longer matches the target pixel-for-pixel cannot be reproduced verbatim, "
+            "so the model has to extract content from it instead. 0.0 disables."
+        ),
+    )
+    source_phase: bool = Field(
+        default=False,
+        description=(
+            "Give reference tokens an independent rotary source tag so they stay separable "
+            "even when they share the target's coordinates. Target tokens remain zero."
+        ),
+    )
+    source_id: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "Reference source id (target is always zero). Distinct ids give distinct phases, "
+            "so several references can be told apart under layout='overlap'."
+        ),
+    )
+    phase_scale: float = Field(default=1.0, ge=0.0, description="Multiplier applied to the source id phase.")
+    sidecar_margin_pixels: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Horizontal gap between the target and sidecar reference panel.",
+    )
+
+    @model_validator(mode="after")
+    def validate_reference_layout(self) -> "ReferenceConditionConfig":
+        if self.layout == "strata" and self.strata_slot is None:
+            raise ValueError("layout='strata' requires strata_slot ('ltm' or 'stm')")
+        return self
 
 
 # Discriminated union for condition configs
@@ -161,6 +240,31 @@ class FlexibleStrategyConfig(TrainingStrategyConfigBase):
         default=None,
         description="Audio modality configuration",
     )
+
+    reference_slot_embedding: ReferenceSlotEmbeddingConfig | None = Field(
+        default=None,
+        description=(
+            "Learned per-slot reference tag. When set, a small Fourier+MLP module is trained "
+            "alongside the adapter and its output is added to the tokens of every reference "
+            "condition with slot_embedding=true."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_slot_embedding_enabled(self) -> "FlexibleStrategyConfig":
+        """A condition asking for a slot tag without the module would silently get nothing."""
+        if self.reference_slot_embedding is not None:
+            return self
+        for modality in (self.video, self.audio):
+            if modality is None:
+                continue
+            for condition in modality.conditions:
+                if getattr(condition, "slot_embedding", False):
+                    raise ValueError(
+                        "A reference condition sets slot_embedding=true but the strategy has no "
+                        "'reference_slot_embedding' block; the tag would never be applied."
+                    )
+        return self
 
     @model_validator(mode="after")
     def validate_at_least_one_generated(self) -> "FlexibleStrategyConfig":
@@ -256,6 +360,16 @@ class FlexibleStrategy(TrainingStrategy):
         self.reference_spatial_scale_factor, self.reference_temporal_scale_factor = (
             self._infer_reference_scale_factors_from_config()
         )
+        # Built here so its parameters exist before the trainer collects trainable params,
+        # but attached to the transformer by the trainer so it lands in the checkpoint.
+        self.reference_slot_embedding: ReferenceSlotEmbedding | None = (
+            ReferenceSlotEmbedding(
+                num_frequencies=config.reference_slot_embedding.num_frequencies,
+                hidden_dim=config.reference_slot_embedding.hidden_dim,
+            )
+            if config.reference_slot_embedding is not None
+            else None
+        )
 
     def prepare_training_inputs(
         self,
@@ -315,6 +429,27 @@ class FlexibleStrategy(TrainingStrategy):
             metadata["reference_downscale_factor"] = spatial  # backward compat
         if temporal is not None and temporal != 1:
             metadata["reference_temporal_scale_factor"] = temporal
+
+        # Self-describing slot tag: an inference pipeline can rebuild the module from the
+        # checkpoint alone, using the conventional key names for this technique.
+        slot_config = self.config.reference_slot_embedding
+        if slot_config is not None:
+            metadata["reference_slot_embedding_enabled"] = "True"
+            metadata["reference_slot_embedding_type"] = "fourier_mlp"
+            metadata["reference_slot_embedding_num_frequencies"] = slot_config.num_frequencies
+            metadata["reference_slot_embedding_hidden_dim"] = slot_config.hidden_dim
+            metadata["reference_slot_embedding_dim"] = ReferenceSlotEmbedding().token_dim
+            metadata["reference_token_order"] = "prepend"
+            slots = sorted(
+                {
+                    cond.slot_index if cond.slot_index is not None else cond.source_id
+                    for modality in (self.config.video, self.config.audio)
+                    if modality is not None
+                    for cond in modality.conditions
+                    if isinstance(cond, ReferenceConditionConfig) and cond.slot_embedding
+                }
+            )
+            metadata["reference_slot_indices"] = ",".join(str(s) for s in slots)
         return metadata
 
     def _infer_reference_scale_factors_from_config(self) -> tuple[int | None, int | None]:
@@ -415,9 +550,17 @@ class FlexibleStrategy(TrainingStrategy):
                     batch=batch,
                 )
 
+        segment_ids: Tensor | None = None
         for cond in modality_config.conditions:
             if isinstance(cond, ReferenceConditionConfig):
-                noisy_latents, positions, timesteps, loss_mask, targets = self._apply_reference_condition(
+                (
+                    noisy_latents,
+                    positions,
+                    timesteps,
+                    loss_mask,
+                    targets,
+                    segment_ids,
+                ) = self._apply_reference_condition(
                     noisy_latents=noisy_latents,
                     positions=positions,
                     timesteps=timesteps,
@@ -426,6 +569,7 @@ class FlexibleStrategy(TrainingStrategy):
                     batch=batch,
                     config=cond,
                     modality_key=modality_key,
+                    segment_ids=segment_ids,
                 )
 
         # Step 6: Build Modality
@@ -437,6 +581,7 @@ class FlexibleStrategy(TrainingStrategy):
             positions=positions,
             context=prompt_embeds,
             context_mask=prompt_attention_mask,
+            segment_ids=segment_ids,
         )
 
         return ModalityProcessingResult(
@@ -594,6 +739,57 @@ class FlexibleStrategy(TrainingStrategy):
 
         return LatentData(latents=latents, num_frames=num_frames, height=height, width=width, fps=fps)
 
+    @staticmethod
+    def _augment_reference(cond_latents: Tensor, config: ReferenceConditionConfig) -> Tensor:
+        """Perturb reference latents so they cannot be copied verbatim.
+
+        Reference conditioning has a degenerate solution the objective does not discourage on
+        its own: when a reference shares content with the target — the same subject, the same
+        clothing, often the same source photograph — reproducing it wholesale already scores
+        well, and does so from the first steps, while composing the references into a new scene
+        pays off far later. Training then converges on copying one reference and discarding the
+        rest.
+
+        Noising the reference removes that shortcut. A copied noisy reference is a noisy
+        prediction, which the loss penalises, so the content has to be re-synthesised rather
+        than passed through. The noise is scaled by the reference's own standard deviation so
+        the setting means the same thing regardless of how the VAE scales its latents.
+
+        Training only — references are clean at inference, and validation samples the model the
+        way it will actually be used.
+        """
+        if config.augment_noise <= 0.0:
+            return cond_latents
+
+        scale = cond_latents.std().clamp(min=1e-6)
+        noise = torch.randn_like(cond_latents) * (scale * config.augment_noise)
+        return cond_latents + noise
+
+    def _apply_slot_embedding(self, cond_latents: Tensor, config: ReferenceConditionConfig) -> Tensor:
+        """Add this reference's learned slot tag to its tokens, in feature space.
+
+        Zero-initialised, so a run that enables this starts identical to one that does not and
+        diverges only as the tag trains.
+        """
+        if not config.slot_embedding:
+            return cond_latents
+
+        slot_module = self.reference_slot_embedding
+        if slot_module is None:
+            raise RuntimeError(
+                "slot_embedding=true but no ReferenceSlotEmbedding was attached to the strategy; "
+                "the reference tag would be silently dropped."
+            )
+
+        slot_index = config.slot_index if config.slot_index is not None else config.source_id
+        slot_vector = slot_module(slot_index).to(cond_latents.dtype)
+        if slot_vector.shape[-1] != cond_latents.shape[-1]:
+            raise RuntimeError(
+                f"Slot embedding width {slot_vector.shape[-1]} does not match the patchified "
+                f"token width {cond_latents.shape[-1]}."
+            )
+        return cond_latents + slot_vector
+
     def _apply_reference_condition(
         self,
         noisy_latents: Tensor,
@@ -604,7 +800,8 @@ class FlexibleStrategy(TrainingStrategy):
         batch: dict[str, Any],
         config: ReferenceConditionConfig,
         modality_key: str,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None, Tensor | None]:
+        segment_ids: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None, Tensor | None, Tensor | None]:
         """Concatenate reference latents to target sequence for reference conditioning (IC-LoRA style).
         The apply/skip decision is batch-wide (reference conditioning changes the sequence
         length, so it cannot be applied to only part of a batch) but is drawn from the torch
@@ -612,7 +809,7 @@ class FlexibleStrategy(TrainingStrategy):
         per-sample draw rather than Python's unseeded ``random``.
         """
         if torch.rand((), device=noisy_latents.device).item() >= config.probability:
-            return noisy_latents, positions, timesteps, loss_mask, targets
+            return noisy_latents, positions, timesteps, loss_mask, targets, segment_ids
 
         # Load and patchify condition latents
         cond = self._patchify_latent_data(batch[config.latents_dir], modality_key)
@@ -657,6 +854,23 @@ class FlexibleStrategy(TrainingStrategy):
                     cond_positions[:, 1, ...] *= spatial_sf
                     cond_positions[:, 2, ...] *= spatial_sf
 
+        if modality_key == "video" and config.layout != "overlap":
+            strata_start = (
+                strata_temporal_start(config.strata_slot, f_lim=config.strata_f_lim)
+                if config.layout == "strata"
+                else None
+            )
+            cond_positions = apply_reference_layout(
+                cond_positions,
+                positions,
+                layout=config.layout,
+                sidecar_margin_pixels=config.sidecar_margin_pixels,
+                strata_start=strata_start,
+            )
+
+        cond_latents = self._augment_reference(cond_latents, config)
+        cond_latents = self._apply_slot_embedding(cond_latents, config)
+
         # Condition tokens: clean, timestep=0, no loss
         cond_timesteps = torch.zeros(batch_size, cond_seq_len, device=device, dtype=dtype)
         cond_loss_mask = torch.zeros(batch_size, cond_seq_len, dtype=torch.bool, device=device)
@@ -668,9 +882,31 @@ class FlexibleStrategy(TrainingStrategy):
 
         combined_loss_mask = torch.cat([cond_loss_mask, loss_mask], dim=1) if loss_mask is not None else None
 
+        # Source phase: reference tokens carry source_id * phase_scale, target tokens stay 0.
+        # A run that never opts in keeps segment_ids None, so the model takes the exact
+        # upstream RoPE path.
+        combined_segment_ids = segment_ids
+        if config.source_phase or segment_ids is not None:
+            if segment_ids is None:
+                segment_ids = torch.zeros(
+                    batch_size, noisy_latents.shape[1], device=device, dtype=torch.float32
+                )
+            phase = float(config.source_id) * float(config.phase_scale) if config.source_phase else 0.0
+            cond_segment_ids = torch.full(
+                (batch_size, cond_seq_len), phase, device=device, dtype=segment_ids.dtype
+            )
+            combined_segment_ids = torch.cat([cond_segment_ids, segment_ids], dim=1)
+
         # Targets remain unchanged (only for target portion, not condition portion)
 
-        return combined_latents, combined_positions, combined_timesteps, combined_loss_mask, targets
+        return (
+            combined_latents,
+            combined_positions,
+            combined_timesteps,
+            combined_loss_mask,
+            targets,
+            combined_segment_ids,
+        )
 
     @staticmethod
     def _compute_modality_loss(pred: Tensor, targets: Tensor, loss_mask: Tensor) -> Tensor:

@@ -488,6 +488,7 @@ def modality_from_latent_state(
         context_mask=None,
         attention_mask=state.attention_mask,
         keyframes_mask=state.keyframes_mask,
+        segment_ids=state.segment_ids,
     )
 
 

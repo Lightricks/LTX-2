@@ -8,9 +8,11 @@ from ltx_core.model.transformer.adaln import AdaLayerNormSingle
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.model.transformer.rope import (
     LTXRopeType,
+    apply_segment_phase_to_freqs_cis,
     generate_freq_grid_np,
     generate_freq_grid_pytorch,
     precompute_freqs_cis,
+    segment_phase_rate_vector,
 )
 
 #: Returns the model's keyframe absolute-position embedding, or ``None`` when the model has none.
@@ -286,6 +288,12 @@ class TransformerArgsPreprocessor:
             num_attention_heads=self.num_attention_heads,
             x_dtype=modality.latent.dtype,
         )
+        if modality.segment_ids is not None:
+            # Compose the positional RoPE with an independent per-source rotary phase, so
+            # references sharing the target's coordinates still carry a distinct tag.
+            # Segment zero is an exact no-op, so models that do not opt in are untouched.
+            rate_vector = segment_phase_rate_vector(pe[0].shape[-1], self.positional_embedding_theta)
+            pe = apply_segment_phase_to_freqs_cis(pe, modality.segment_ids, rate_vector)
         self_attention_mask = self._prepare_self_attention_mask(modality.attention_mask, modality.latent.dtype)
         return TransformerArgs(
             x=x,
