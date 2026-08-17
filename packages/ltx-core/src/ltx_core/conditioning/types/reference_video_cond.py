@@ -5,6 +5,7 @@ import torch
 from ltx_core.components.patchifiers import get_pixel_coords
 from ltx_core.conditioning.item import ConditioningItem
 from ltx_core.conditioning.mask_utils import extend_keyframes_mask, update_attention_mask
+from ltx_core.conditioning.reference_layout import apply_reference_layout, extend_segment_ids, strata_temporal_start
 from ltx_core.tools import VideoLatentTools
 from ltx_core.types import LatentState, VideoLatentShape
 
@@ -28,19 +29,36 @@ class VideoConditionByReferenceLatent(ConditioningItem):
         temporal_scale_factor: Target/reference temporal ratio S (e.g. 4 = ref at 1/4 fps).
         strength: Conditioning strength. 1.0 = full (reference kept clean),
             0.0 = none (reference denoised). Default 1.0.
+        layout: RoPE placement for the reference: overlap, st_drc, sidecar,
+            virtual_sidecar, or strata.
+        source_phase: Tag reference tokens with an independent source RoPE phase.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913, PLR0917
         self,
         latent: torch.Tensor,
         downscale_factor: int = 1,
         temporal_scale_factor: int = 1,
         strength: float = 1.0,
+        layout: str = "overlap",
+        strata_slot: str | None = None,
+        strata_f_lim: int = 128,
+        source_phase: bool = False,
+        source_id: int = 2,
+        phase_scale: float = 1.0,
+        sidecar_margin_pixels: float = 0.0,
     ):
         self.latent = latent
         self.downscale_factor = downscale_factor
         self.temporal_scale_factor = temporal_scale_factor
         self.strength = strength
+        self.layout = layout
+        self.strata_slot = strata_slot
+        self.strata_f_lim = strata_f_lim
+        self.source_phase = source_phase
+        self.source_id = source_id
+        self.phase_scale = phase_scale
+        self.sidecar_margin_pixels = sidecar_margin_pixels
 
     def apply_to(
         self,
@@ -76,6 +94,19 @@ class VideoConditionByReferenceLatent(ConditioningItem):
             positions[:, 1, ...] *= self.downscale_factor  # height axis
             positions[:, 2, ...] *= self.downscale_factor  # width axis
 
+        if self.layout != "overlap":
+            target_positions = latent_state.positions[:, :, : latent_tools.target_shape.token_count()]
+            strata_start = (
+                strata_temporal_start(self.strata_slot, f_lim=self.strata_f_lim) if self.layout == "strata" else None
+            )
+            positions = apply_reference_layout(
+                positions,
+                target_positions,
+                layout=self.layout,
+                sidecar_margin_pixels=self.sidecar_margin_pixels,
+                strata_start=strata_start,
+            )
+
         denoise_mask = torch.full(
             size=(*tokens.shape[:2], 1),
             fill_value=1.0 - self.strength,
@@ -102,6 +133,12 @@ class VideoConditionByReferenceLatent(ConditioningItem):
             # Reference tokens are never keyframes. Their own first latent frame also spans a single
             # pixel frame, so a position-derived marker would wrongly claim them.
             keyframes_mask=extend_keyframes_mask(latent_state, tokens.shape[1], marked=False),
+            segment_ids=extend_segment_ids(
+                latent_state.segment_ids,
+                latent_state.denoise_mask,
+                tokens.shape[1],
+                value=float(self.source_id) * float(self.phase_scale) if self.source_phase else 0.0,
+            ),
             generated_keyframe_layout=latent_state.generated_keyframe_layout,
             generated_keyframes=latent_state.generated_keyframes,
             frozen=latent_state.frozen,

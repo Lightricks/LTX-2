@@ -15,6 +15,7 @@ import torch
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from torch import Tensor
 
+from ltx_core.conditioning.reference_layout import apply_reference_layout, strata_temporal_start
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.types import SpatioTemporalScaleFactors
 from ltx_trainer.timestep_samplers import TimestepSampler
@@ -105,6 +106,47 @@ class ReferenceConditionConfig(BaseModel):
     type: Literal["reference"] = "reference"
     latents_dir: str = Field(..., description="Directory for reference latents")
     probability: float = Field(default=1.0, ge=0.0, le=1.0, description="Probability of applying this condition")
+    layout: Literal["overlap", "st_drc", "sidecar", "virtual_sidecar", "strata"] = Field(
+        default="overlap",
+        description=(
+            "Where reference tokens sit in the RoPE grid. 'overlap' reuses the target's "
+            "coordinates (upstream behaviour); 'st_drc' shifts the block past the target on "
+            "every axis; 'sidecar' parks it as a panel to the right; 'strata' shifts the "
+            "temporal axis only. 'virtual_sidecar' is an alias for 'sidecar'."
+        ),
+    )
+    strata_slot: Literal["ltm", "stm"] | None = Field(
+        default=None,
+        description="Memory band used by layout='strata'.",
+    )
+    strata_f_lim: int = Field(default=128, ge=4, description="Ceiling of the absolute Strata-RoPE bands.")
+    source_phase: bool = Field(
+        default=False,
+        description=(
+            "Give reference tokens an independent rotary source tag so they stay separable "
+            "even when they share the target's coordinates. Target tokens remain zero."
+        ),
+    )
+    source_id: int = Field(
+        default=2,
+        ge=1,
+        description=(
+            "Reference source id (target is always zero). Distinct ids give distinct phases, "
+            "so several references can be told apart under layout='overlap'."
+        ),
+    )
+    phase_scale: float = Field(default=1.0, ge=0.0, description="Multiplier applied to the source id phase.")
+    sidecar_margin_pixels: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Horizontal gap between the target and sidecar reference panel.",
+    )
+
+    @model_validator(mode="after")
+    def validate_reference_layout(self) -> "ReferenceConditionConfig":
+        if self.layout == "strata" and self.strata_slot is None:
+            raise ValueError("layout='strata' requires strata_slot ('ltm' or 'stm')")
+        return self
 
 
 # Discriminated union for condition configs
@@ -415,9 +457,17 @@ class FlexibleStrategy(TrainingStrategy):
                     batch=batch,
                 )
 
+        segment_ids: Tensor | None = None
         for cond in modality_config.conditions:
             if isinstance(cond, ReferenceConditionConfig):
-                noisy_latents, positions, timesteps, loss_mask, targets = self._apply_reference_condition(
+                (
+                    noisy_latents,
+                    positions,
+                    timesteps,
+                    loss_mask,
+                    targets,
+                    segment_ids,
+                ) = self._apply_reference_condition(
                     noisy_latents=noisy_latents,
                     positions=positions,
                     timesteps=timesteps,
@@ -426,6 +476,7 @@ class FlexibleStrategy(TrainingStrategy):
                     batch=batch,
                     config=cond,
                     modality_key=modality_key,
+                    segment_ids=segment_ids,
                 )
 
         # Step 6: Build Modality
@@ -437,6 +488,7 @@ class FlexibleStrategy(TrainingStrategy):
             positions=positions,
             context=prompt_embeds,
             context_mask=prompt_attention_mask,
+            segment_ids=segment_ids,
         )
 
         return ModalityProcessingResult(
@@ -604,7 +656,8 @@ class FlexibleStrategy(TrainingStrategy):
         batch: dict[str, Any],
         config: ReferenceConditionConfig,
         modality_key: str,
-    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None, Tensor | None]:
+        segment_ids: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor | None, Tensor | None, Tensor | None]:
         """Concatenate reference latents to target sequence for reference conditioning (IC-LoRA style).
         The apply/skip decision is batch-wide (reference conditioning changes the sequence
         length, so it cannot be applied to only part of a batch) but is drawn from the torch
@@ -612,7 +665,7 @@ class FlexibleStrategy(TrainingStrategy):
         per-sample draw rather than Python's unseeded ``random``.
         """
         if torch.rand((), device=noisy_latents.device).item() >= config.probability:
-            return noisy_latents, positions, timesteps, loss_mask, targets
+            return noisy_latents, positions, timesteps, loss_mask, targets, segment_ids
 
         # Load and patchify condition latents
         cond = self._patchify_latent_data(batch[config.latents_dir], modality_key)
@@ -657,6 +710,20 @@ class FlexibleStrategy(TrainingStrategy):
                     cond_positions[:, 1, ...] *= spatial_sf
                     cond_positions[:, 2, ...] *= spatial_sf
 
+        if modality_key == "video" and config.layout != "overlap":
+            strata_start = (
+                strata_temporal_start(config.strata_slot, f_lim=config.strata_f_lim)
+                if config.layout == "strata"
+                else None
+            )
+            cond_positions = apply_reference_layout(
+                cond_positions,
+                positions,
+                layout=config.layout,
+                sidecar_margin_pixels=config.sidecar_margin_pixels,
+                strata_start=strata_start,
+            )
+
         # Condition tokens: clean, timestep=0, no loss
         cond_timesteps = torch.zeros(batch_size, cond_seq_len, device=device, dtype=dtype)
         cond_loss_mask = torch.zeros(batch_size, cond_seq_len, dtype=torch.bool, device=device)
@@ -668,9 +735,31 @@ class FlexibleStrategy(TrainingStrategy):
 
         combined_loss_mask = torch.cat([cond_loss_mask, loss_mask], dim=1) if loss_mask is not None else None
 
+        # Source phase: reference tokens carry source_id * phase_scale, target tokens stay 0.
+        # A run that never opts in keeps segment_ids None, so the model takes the exact
+        # upstream RoPE path.
+        combined_segment_ids = segment_ids
+        if config.source_phase or segment_ids is not None:
+            if segment_ids is None:
+                segment_ids = torch.zeros(
+                    batch_size, noisy_latents.shape[1], device=device, dtype=torch.float32
+                )
+            phase = float(config.source_id) * float(config.phase_scale) if config.source_phase else 0.0
+            cond_segment_ids = torch.full(
+                (batch_size, cond_seq_len), phase, device=device, dtype=segment_ids.dtype
+            )
+            combined_segment_ids = torch.cat([cond_segment_ids, segment_ids], dim=1)
+
         # Targets remain unchanged (only for target portion, not condition portion)
 
-        return combined_latents, combined_positions, combined_timesteps, combined_loss_mask, targets
+        return (
+            combined_latents,
+            combined_positions,
+            combined_timesteps,
+            combined_loss_mask,
+            targets,
+            combined_segment_ids,
+        )
 
     @staticmethod
     def _compute_modality_loss(pred: Tensor, targets: Tensor, loss_mask: Tensor) -> Tensor:

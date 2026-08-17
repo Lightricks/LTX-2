@@ -195,6 +195,65 @@ def interleaved_freqs_cis(freqs: torch.Tensor, pad_size: int) -> tuple[torch.Ten
     return cos_freq, sin_freq
 
 
+@functools.lru_cache(maxsize=8)
+def segment_phase_rate_vector(rope_last_dim: int, theta: float) -> torch.Tensor:
+    """Per-output-dim base frequencies for the segment (TASS) RoPE.
+
+    The segment RoPE multiplies the spatiotemporal RoPE by an INDEPENDENT 1D rotary
+    embedding indexed by the segment (source) id, i.e. ``freqs *= segment_id_freqs``. This
+    builds that 1D RoPE over the per-head rope output dimensions, using standard
+    geometrically-decaying frequencies ``omega_k = theta**(-k/L)`` bounded in ``(0, 1]``
+    (high-freq dims carry the segment signal, low-freq dims barely move).
+
+    ``rope_last_dim`` is the last dim of the precomputed ``cos_freq``/``sin_freq`` (the
+    per-head rope half-dimension), so the returned vector broadcasts directly against them
+    and is agnostic to SPLIT vs INTERLEAVED layout. Segment zero is an exact no-op
+    regardless, since the phase is ``segment_id * rate``.
+    """
+    j = torch.arange(rope_last_dim, dtype=torch.float32)
+    return theta ** (-j / float(rope_last_dim))  # (0, 1], decaying
+
+
+def apply_segment_phase_to_freqs_cis(
+    freqs_cis: tuple[torch.Tensor, torch.Tensor],
+    segment_ids: torch.Tensor | None,
+    rate_vector: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compose positional RoPE with a norm-preserving per-source phase.
+
+    ``segment_ids`` has shape ``[B, T]``. Source zero is an exact no-op, so
+    models and configs that do not opt in retain the original RoPE values.
+    """
+    if segment_ids is None:
+        return freqs_cis
+
+    cos_freq, sin_freq = freqs_cis
+    if segment_ids.ndim != 2:
+        raise ValueError(f"segment_ids must have shape [B, T], got {tuple(segment_ids.shape)}")
+    token_dim = 2 if cos_freq.ndim == 4 else 1
+    if segment_ids.shape[0] != cos_freq.shape[0] or segment_ids.shape[1] != cos_freq.shape[token_dim]:
+        raise ValueError(
+            f"segment_ids shape {tuple(segment_ids.shape)} does not match RoPE shape {tuple(cos_freq.shape)}"
+        )
+    if rate_vector.shape[-1] != cos_freq.shape[-1]:
+        raise ValueError(
+            f"rate_vector dim {tuple(rate_vector.shape)} does not match RoPE last dim {cos_freq.shape[-1]}"
+        )
+
+    rate = rate_vector.to(device=cos_freq.device, dtype=torch.float32)
+    source = segment_ids.to(device=cos_freq.device, dtype=torch.float32)
+    if cos_freq.ndim == 4:
+        phase = source[:, None, :, None] * rate[None, None, None, :]
+    else:
+        phase = source[:, :, None] * rate[None, None, :]
+    phase_cos = phase.cos().to(dtype=cos_freq.dtype)
+    phase_sin = phase.sin().to(dtype=sin_freq.dtype)
+    return (
+        cos_freq * phase_cos - sin_freq * phase_sin,
+        sin_freq * phase_cos + cos_freq * phase_sin,
+    )
+
+
 def precompute_freqs_cis(
     indices_grid: torch.Tensor,
     dim: int,

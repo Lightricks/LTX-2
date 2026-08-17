@@ -20,6 +20,7 @@ adjust paths, dataset, and hyperparameters.
 | **I2V**               | Generated | Generated | `first_frame`       | [`i2v_lora.yaml`](./i2v_lora.yaml) |
 | **Video Extension**   | Generated | Generated | `prefix`/`suffix`   | [`video_extend_lora.yaml`](./video_extend_lora.yaml) (forward), [`video_suffix_lora.yaml`](./video_suffix_lora.yaml) (backward) |
 | **V2V IC-LoRA**       | Generated | —         | `reference`         | [`v2v_ic_lora.yaml`](./v2v_ic_lora.yaml) |
+| **Reference + source phase** | Generated | —  | `reference`         | [`v2v_ic_lora_reference_phase.yaml`](./v2v_ic_lora_reference_phase.yaml) |
 | **A2V**               | Generated | Frozen    | —                   | [`a2v_lora.yaml`](./a2v_lora.yaml) |
 | **V2A (Foley)**       | Frozen    | Generated | —                   | [`v2a_lora.yaml`](./v2a_lora.yaml) |
 | **Video Inpainting**  | Generated | —         | `mask`              | [`video_inpainting_lora.yaml`](./video_inpainting_lora.yaml) |

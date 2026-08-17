@@ -112,6 +112,10 @@ class VideoModalityTilingHelper:
         if modality.keyframes_mask is not None:
             tile_keyframes_mask = modality.keyframes_mask[:, keep_indices]
 
+        tile_segment_ids = None
+        if modality.segment_ids is not None:
+            tile_segment_ids = modality.segment_ids[:, keep_indices]
+
         positions = modality.positions[:, :, keep_indices, :]
         if normalize_positions:
             num_tile_gen = self._tile_generated_token_count(tile)
@@ -126,6 +130,7 @@ class VideoModalityTilingHelper:
             positions=positions,
             attention_mask=tile_attention_mask,
             keyframes_mask=tile_keyframes_mask,
+            segment_ids=tile_segment_ids,
         )
 
         return tiled, TilingContext(

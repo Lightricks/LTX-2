@@ -118,11 +118,24 @@ class ReferenceConditionConfig(ConfigBaseModel):
     downscale_factor: int = Field(default=1, ge=1)
     temporal_scale_factor: int = Field(default=1, ge=1)
     include_in_output: bool = False
+    # Must mirror the training-side ReferenceConditionConfig, otherwise validation
+    # samples the model under a geometry it was never trained on.
+    layout: Literal["overlap", "st_drc", "sidecar", "virtual_sidecar", "strata"] = "overlap"
+    strata_slot: Literal["ltm", "stm"] | None = None
+    strata_f_lim: int = Field(default=128, ge=4)
+    source_phase: bool = False
+    source_id: int = Field(default=2, ge=1)
+    phase_scale: float = Field(default=1.0, ge=0.0)
+    sidecar_margin_pixels: float = Field(default=0.0, ge=0.0)
 
     @model_validator(mode="after")
     def validate_exactly_one_modality(self) -> "ReferenceConditionConfig":
         if (self.video is None) == (self.audio is None):
             raise ValueError("Exactly one of 'video' or 'audio' must be set for reference condition")
+        if self.layout == "strata" and self.strata_slot is None:
+            raise ValueError("layout='strata' requires strata_slot ('ltm' or 'stm')")
+        if self.audio is not None and (self.layout != "overlap" or self.source_phase):
+            raise ValueError("Reference layout and source_phase apply to video references only")
         return self
 
 
@@ -351,9 +364,27 @@ class OptimizationConfig(ConfigBaseModel):
         description="Maximum gradient norm for clipping",
     )
 
-    optimizer_type: Literal["adamw", "adamw8bit"] = Field(
+    optimizer_type: Literal["adamw", "adamw8bit", "prodigy"] = Field(
         default="adamw",
-        description="Type of optimizer to use for training",
+        description=(
+            "Optimizer. 'prodigy' estimates its own step size and expects learning_rate: 1.0; "
+            "it needs the optional 'prodigy' extra (pip install prodigyopt)."
+        ),
+    )
+
+    prodigy_d_coef: float = Field(
+        default=1.0,
+        gt=0.0,
+        description=(
+            "Prodigy only: scales how fast the estimated step size grows. Lower it (e.g. 0.5) "
+            "if the run is unstable early, raise it if adaptation is too slow."
+        ),
+    )
+
+    prodigy_weight_decay: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Prodigy only: decoupled weight decay.",
     )
 
     scheduler_type: Literal[

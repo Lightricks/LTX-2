@@ -713,6 +713,33 @@ class LtxvTrainer:
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
 
             optimizer = AdamW8bit(self._trainable_params, lr=lr)
+        elif opt_cfg.optimizer_type == "prodigy":
+            try:
+                from prodigyopt import Prodigy  # noqa: PLC0415
+            except ImportError as exc:  # pragma: no cover - depends on optional extra
+                raise ImportError(
+                    "optimizer_type='prodigy' requires the optional dependency: "
+                    "install it with `uv sync --extra prodigy` (or `pip install prodigyopt`)."
+                ) from exc
+
+            # Prodigy estimates the step size itself; lr is a multiplier on that estimate and
+            # is meant to stay at 1.0. A config carrying a small AdamW-style lr (1e-5) would
+            # scale Prodigy's estimate down by that factor and effectively stall training.
+            if lr != 1.0:
+                logger.warning(
+                    "optimizer_type='prodigy' with learning_rate=%s: Prodigy adapts the step "
+                    "size itself and expects learning_rate=1.0, which is used as a multiplier. "
+                    "Set learning_rate: 1.0 unless you are deliberately scaling it.",
+                    lr,
+                )
+            optimizer = Prodigy(
+                self._trainable_params,
+                lr=lr,
+                weight_decay=opt_cfg.prodigy_weight_decay,
+                d_coef=opt_cfg.prodigy_d_coef,
+                use_bias_correction=True,
+                safeguard_warmup=True,
+            )
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
 

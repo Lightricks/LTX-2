@@ -41,6 +41,10 @@ dependencies = [
     "setuptools>=79.0.0",
 ]
 
+[project.optional-dependencies]
+# Prodigy is not vendored: it stays maintained upstream and its licence stays with it.
+prodigy = ["prodigyopt>=1.1.2"]
+
 [tool.uv.sources]
 torchcodec = { index = "torch" }
 torchaudio = { index = "torch-test" }

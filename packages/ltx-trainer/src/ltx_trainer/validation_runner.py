@@ -717,6 +717,13 @@ class ValidationRunner:
                     downscale_factor=cond.downscale_factor,
                     temporal_scale_factor=cond.temporal_scale_factor,
                     strength=1.0,
+                    layout=cond.layout,
+                    strata_slot=cond.strata_slot,
+                    strata_f_lim=cond.strata_f_lim,
+                    source_phase=cond.source_phase,
+                    source_id=cond.source_id,
+                    phase_scale=cond.phase_scale,
+                    sidecar_margin_pixels=cond.sidecar_margin_pixels,
                 ).apply_to(state, tools)
 
             elif cond.type == "mask":

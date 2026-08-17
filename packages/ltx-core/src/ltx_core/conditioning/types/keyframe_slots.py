@@ -20,6 +20,7 @@ import torch
 from ltx_core.components.patchifiers import get_pixel_coords
 from ltx_core.conditioning.item import ConditioningItem
 from ltx_core.conditioning.mask_utils import extend_keyframes_mask, update_attention_mask
+from ltx_core.conditioning.reference_layout import extend_segment_ids
 from ltx_core.tools import VideoLatentTools
 from ltx_core.types import GeneratedKeyframeLayout, LatentState
 
@@ -140,6 +141,9 @@ class VideoGeneratedKeyframeSlots(ConditioningItem):
             clean_latent=torch.cat([latent_state.clean_latent, torch.zeros_like(slot_tokens)], dim=1),
             attention_mask=new_attention_mask,
             keyframes_mask=keyframes_mask,
+            segment_ids=extend_segment_ids(
+                latent_state.segment_ids, latent_state.denoise_mask, num_new_tokens
+            ),
             generated_keyframe_layout=GeneratedKeyframeLayout(
                 pixel_frame_indices=self.pixel_frame_indices,
                 tokens_per_keyframe=tokens_per_keyframe,
