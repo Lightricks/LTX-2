@@ -465,8 +465,36 @@ class LtxvTrainer:
         else:
             raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
 
+        self._attach_reference_slot_embedding()
+
         self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
         logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
+
+    def _attach_reference_slot_embedding(self) -> None:
+        """Attach the strategy's learned reference-slot tag to the transformer, if configured.
+
+        It lives on the transformer rather than beside it so that the existing machinery picks
+        it up for free: parameter collection below, Accelerate's device placement and state-dict
+        gathering, and the checkpoint save path. Kept in float32 — it is ~40k parameters, and a
+        bf16 master weight is not worth the risk on a module whose whole job is to encode a small
+        integer distinctly.
+        """
+        slot_embedding = getattr(self._training_strategy, "reference_slot_embedding", None)
+        if slot_embedding is None:
+            return
+
+        slot_embedding = slot_embedding.to(device=self._accelerator.device, dtype=torch.float32)
+        slot_embedding.requires_grad_(True)
+        self._transformer.reference_slot_embedding = slot_embedding
+        # The strategy applies it during the forward pass, so both references must be the same
+        # object — re-assign in case ``.to()`` returned a copy.
+        self._training_strategy.reference_slot_embedding = slot_embedding
+        self._validation_runner.set_reference_slot_embedding(slot_embedding)
+
+        logger.info(
+            f"Reference slot embedding enabled: {sum(p.numel() for p in slot_embedding.parameters()):,} "
+            "trainable parameters added alongside the adapter"
+        )
 
     def _init_timestep_sampler(self) -> None:
         """Initialize the timestep sampler based on the config."""
@@ -1031,6 +1059,14 @@ class LtxvTrainer:
 
             # Convert to ComfyUI-compatible format (add "diffusion_model." prefix)
             state_dict = {f"diffusion_model.{k}": v for k, v in state_dict.items()}
+
+            # get_peft_model_state_dict returns adapter weights only, so any module trained
+            # alongside the adapter has to be merged back in explicitly — otherwise it trains
+            # for the whole run and is silently absent from every checkpoint.
+            slot_embedding = getattr(self._transformer, "reference_slot_embedding", None)
+            if slot_embedding is not None:
+                for key, value in slot_embedding.state_dict().items():
+                    state_dict[f"diffusion_model.reference_slot_embedding.{key}"] = value
 
         # Determine save precision
         save_dtype = torch.bfloat16 if self._config.checkpoints.precision == "bfloat16" else torch.float32

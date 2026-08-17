@@ -45,7 +45,7 @@ layouts are available for cases where you specifically want disjoint coordinates
 
 [**Alissonerdx/LTX-Best-Face-ID**](https://huggingface.co/Alissonerdx/LTX-Best-Face-ID) is a
 public identity-transfer LoRA for LTX-2.3 trained with this recipe — `layout: overlap`,
-`source_phase: true`, `source_id: 2`. The repository includes the LoRA, the character-sheet
+`source_phase: true`, `source_id: 1`. The repository includes the LoRA, the character-sheet
 variant, the reference sheets used, and the prompt format, so the configuration below can be
 checked against a working artefact rather than taken on faith.
 
@@ -126,10 +126,136 @@ target.mp4,ref_a.png,ref_b.png,"..."
 Plain `reference_video` is unchanged, so single-reference datasets keep working exactly as
 before.
 
-> **Validated scope.** What has actually been trained and verified so far is the **single
-> reference at `source_id: 2`** case. Multiple simultaneous sources at distinct ids are
-> supported by the implementation and are a natural extension, but they have not been validated
-> here — treat them as untested.
+### Binding prompt tags to sources
+
+The layout and the phase make the references *separable*. They do not tell the model **which
+reference is which** — that a particular source is "the woman" and another is "the jacket".
+
+Nothing in this code ties a prompt tag to a `source_id`. The correspondence is a **dataset
+convention**: it exists only if every caption in the training set uses the same tags in the same
+order as the conditions in the config, so the model can learn the association. Get the ordering
+inconsistent across the dataset and no binding forms, however well-separated the tokens are.
+
+The convention that has been used here is a bracketed tag per source, numbered to match the
+condition order:
+
+```yaml
+conditions:
+  - type: reference          # <Image 1>
+    latents_dir: reference_latents_0
+    source_id: 1
+  - type: reference          # <Image 2>
+    latents_dir: reference_latents_1
+    source_id: 2
+```
+
+```text
+<Image 1> is the woman. <Image 2> is the man. In a rustic kitchen, the man in a casual
+apron and the woman in a flour-dusted dress share a playful moment baking.
+```
+
+Two details matter in practice:
+
+- **Declare, then use.** Open the caption by stating what each tag *is*, then refer back to the
+  tags in the scene description. A tag that only ever appears inside prose has to carry both jobs
+  at once, which is a harder association to learn.
+- **The tag is baked into the text embedding.** Captions are encoded during preprocessing, so the
+  tags must be present *before* `process_captions.py` runs. Adding them later means re-encoding.
+
+At inference the same tags must appear in the prompt, in the same order as the conditions, or the
+model sees a convention it was never trained on.
+
+Nothing depends on the `<Image N>` spelling in particular — any consistent marker works, and the
+numbering does not have to equal the `source_id`. What matters is that the mapping from tag to
+condition position is identical in training and at sampling.
+
+With a **single** reference this is unnecessary: there is nothing to disambiguate, and plain
+captions are what the released single-reference recipe uses.
+
+> **Recommended numbering.** Start references at `source_id: 1` and count up. The field defaults
+> to `2` for backwards compatibility, which makes it tempting to number a second reference `3`
+> and leave both sources further from the target than they need to be.
+
+> **Validated scope.** Two configurations have been trained to production checkpoints:
+>
+> - **One reference** at `source_id: 1` — the Face-ID recipe.
+> - **Two references with different roles** at `source_id: 1` and `2` — the head-swap recipe,
+>   where source 1 is a motion/pose guide video and source 2 is the identity reference.
+>
+> Read that second case carefully before relying on it. The configuration used distinct ids and
+> the resulting checkpoint works, but **no ablation was run with both references on the same
+> id**, so it is not established that the distinct phases were load-bearing there: the two
+> sources also differ in content (a motion guide versus a portrait), which the model can use on
+> its own.
+>
+> Note also what the phase is *not* needed for. A reference is already separated from the target
+> by being clean (`denoise_mask = 0`) regardless of layout — that distinction does not require a
+> phase. The phase earns its place when two **references** must be told apart from each other.
+>
+> The case that would actually establish it — two references of the *same* role, e.g. two
+> distinct characters composed into one scene, separable only by phase — has not been
+> demonstrated. Treat it as open.
+
+## Learned slot embedding
+
+`source_phase` tags a reference positionally, by rotating its RoPE frequencies. That makes the
+tokens *separable*, but a rotary phase on a source axis is not a signal the base model was
+pretrained to read — an adapter has to learn to exploit it from scratch.
+
+The slot embedding takes the other route. Each reference's slot index is Fourier-featurised and
+passed through a small MLP, producing a vector that is **added to that reference's tokens** in
+feature space, where attention can use it directly:
+
+```yaml
+training_strategy:
+  name: flexible
+  reference_slot_embedding:      # trains the module
+    num_frequencies: 16
+    hidden_dim: 256
+  video:
+    conditions:
+      - type: reference
+        latents_dir: reference_latents_0
+        source_id: 1
+        slot_embedding: true     # tags this reference
+      - type: reference
+        latents_dir: reference_latents_1
+        source_id: 2
+        slot_embedding: true
+```
+
+`slot_index` defaults to `source_id`; set it explicitly to decouple the two. The module costs
+about **41k parameters** and its last layer is zero-initialised, so a run that enables it starts
+byte-identical to one that does not and departs only as the tag learns. The two mechanisms are
+independent and can be combined — the phase separates positionally, the slot tags in feature
+space.
+
+Mirror the fields on validation conditions, as with every other option here. The runner raises
+rather than sampling untagged if the module is missing, since that mismatch is otherwise silent.
+
+### Checkpoint layout
+
+The module is trained alongside the adapter and saved into the same file under
+`diffusion_model.reference_slot_embedding.*`, with its hyperparameters in the safetensors
+metadata so an inference pipeline can rebuild it from the checkpoint alone.
+
+Parameter names, shapes and defaults follow **LiconStudio's MSR adapter for LTX 2.5**
+([`LiconStudio/LTX-2.5-Multiple-Subject-Reference`](https://huggingface.co/LiconStudio/LTX-2.5-Multiple-Subject-Reference)),
+a released multi-subject reference model whose checkpoint metadata declares
+`reference_slot_embedding_type: fourier_mlp` with 16 frequencies, hidden 256 and dim 128.
+Matching it keeps checkpoints interchangeable between the two implementations.
+
+Two things about that adapter are worth knowing when comparing approaches. It also places
+references at negative time offsets rather than overlapping the target, and its predecessor for
+LTX-2.3 carried no extra parameters at all — subjects were separated purely by packing them into
+distinct latent frames of a single reference video. Separation along the *native* temporal axis
+is something the base model already understands, which is a cheaper starting point than any
+learned tag if your references can be packed that way.
+
+> **Status.** The published adapter above is evidence that this *design* works. The
+> implementation here is new and has **not** yet been trained to a production checkpoint — unlike
+> `overlap` + `source_phase`, which has. Treat it as a mechanism offered on the strength of the
+> reference implementation, not as a recipe validated in this repository.
 
 ## Extending: auxiliary losses on the reference
 
@@ -234,6 +360,8 @@ untested here beyond the single-reference case).
 | `source_phase` | `false` | Enable the per-source rotary tag |
 | `source_id` | `2` | Source index for this reference; target is always `0` |
 | `phase_scale` | `1.0` | Multiplier on the source phase |
+| `slot_embedding` | `false` | Add the learned per-slot tag to this reference |
+| `slot_index` | `null` | Index fed to the slot embedding; defaults to `source_id` |
 | `sidecar_margin_pixels` | `0.0` | Gap between target and sidecar panel |
 | `strata_slot` | `null` | `ltm` or `stm`; required by `layout: strata` |
 | `strata_f_lim` | `128` | Ceiling of the absolute Strata-RoPE bands |

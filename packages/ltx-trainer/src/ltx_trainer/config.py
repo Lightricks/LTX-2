@@ -127,6 +127,8 @@ class ReferenceConditionConfig(ConfigBaseModel):
     source_id: int = Field(default=2, ge=1)
     phase_scale: float = Field(default=1.0, ge=0.0)
     sidecar_margin_pixels: float = Field(default=0.0, ge=0.0)
+    slot_embedding: bool = False
+    slot_index: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def validate_exactly_one_modality(self) -> "ReferenceConditionConfig":

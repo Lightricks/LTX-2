@@ -47,6 +47,8 @@ class VideoConditionByReferenceLatent(ConditioningItem):
         source_id: int = 2,
         phase_scale: float = 1.0,
         sidecar_margin_pixels: float = 0.0,
+        slot_embedding: "torch.nn.Module | None" = None,
+        slot_index: int | None = None,
     ):
         self.latent = latent
         self.downscale_factor = downscale_factor
@@ -59,6 +61,8 @@ class VideoConditionByReferenceLatent(ConditioningItem):
         self.source_id = source_id
         self.phase_scale = phase_scale
         self.sidecar_margin_pixels = sidecar_margin_pixels
+        self.slot_embedding = slot_embedding
+        self.slot_index = slot_index
 
     def apply_to(
         self,
@@ -67,6 +71,14 @@ class VideoConditionByReferenceLatent(ConditioningItem):
     ) -> LatentState:
         """Append reference video tokens with positions translated into the target frame."""
         tokens = latent_tools.patchifier.patchify(self.latent)
+
+        # Learned slot tag, applied in feature space. Must mirror the training-side
+        # application exactly, or the checkpoint is sampled without a signal it was
+        # trained to rely on.
+        if self.slot_embedding is not None:
+            slot_index = self.slot_index if self.slot_index is not None else self.source_id
+            slot_vector = self.slot_embedding(slot_index).to(device=tokens.device, dtype=tokens.dtype)
+            tokens = tokens + slot_vector
 
         latent_coords = latent_tools.patchifier.get_patch_grid_bounds(
             output_shape=VideoLatentShape.from_torch_shape(self.latent.shape),

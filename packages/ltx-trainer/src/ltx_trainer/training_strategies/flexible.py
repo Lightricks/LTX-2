@@ -16,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from torch import Tensor
 
 from ltx_core.conditioning.reference_layout import apply_reference_layout, strata_temporal_start
+from ltx_core.conditioning.reference_slot_embedding import ReferenceSlotEmbedding
 from ltx_core.model.transformer.modality import Modality
 from ltx_core.types import SpatioTemporalScaleFactors
 from ltx_trainer.timestep_samplers import TimestepSampler
@@ -94,6 +95,19 @@ class MaskConditionConfig(IntrinsicConditionBase):
     )
 
 
+class ReferenceSlotEmbeddingConfig(BaseModel):
+    """Hyperparameters of the learned per-slot reference tag.
+
+    Defaults match the published LiconStudio MSR adapter for LTX 2.5, so a checkpoint trained
+    here and one trained there load through the same code path.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    num_frequencies: int = Field(default=16, ge=1, description="Fourier frequencies for the slot index.")
+    hidden_dim: int = Field(default=256, ge=1, description="Hidden width of the slot MLP.")
+
+
 class ReferenceConditionConfig(BaseModel):
     """Reference conditioning (IC-LoRA style concatenation).
     External reference latents are concatenated to the target sequence.
@@ -120,6 +134,19 @@ class ReferenceConditionConfig(BaseModel):
         description="Memory band used by layout='strata'.",
     )
     strata_f_lim: int = Field(default=128, ge=4, description="Ceiling of the absolute Strata-RoPE bands.")
+    slot_embedding: bool = Field(
+        default=False,
+        description=(
+            "Add a learned per-slot embedding to this reference's tokens. Unlike source_phase, "
+            "which tags positionally, this is an additive feature-space tag the attention "
+            "layers can read directly. Requires reference_slot_embedding on the strategy."
+        ),
+    )
+    slot_index: int | None = Field(
+        default=None,
+        ge=0,
+        description="Slot index fed to the embedding. Defaults to source_id when unset.",
+    )
     source_phase: bool = Field(
         default=False,
         description=(
@@ -203,6 +230,31 @@ class FlexibleStrategyConfig(TrainingStrategyConfigBase):
         default=None,
         description="Audio modality configuration",
     )
+
+    reference_slot_embedding: ReferenceSlotEmbeddingConfig | None = Field(
+        default=None,
+        description=(
+            "Learned per-slot reference tag. When set, a small Fourier+MLP module is trained "
+            "alongside the adapter and its output is added to the tokens of every reference "
+            "condition with slot_embedding=true."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def validate_slot_embedding_enabled(self) -> "FlexibleStrategyConfig":
+        """A condition asking for a slot tag without the module would silently get nothing."""
+        if self.reference_slot_embedding is not None:
+            return self
+        for modality in (self.video, self.audio):
+            if modality is None:
+                continue
+            for condition in modality.conditions:
+                if getattr(condition, "slot_embedding", False):
+                    raise ValueError(
+                        "A reference condition sets slot_embedding=true but the strategy has no "
+                        "'reference_slot_embedding' block; the tag would never be applied."
+                    )
+        return self
 
     @model_validator(mode="after")
     def validate_at_least_one_generated(self) -> "FlexibleStrategyConfig":
@@ -298,6 +350,16 @@ class FlexibleStrategy(TrainingStrategy):
         self.reference_spatial_scale_factor, self.reference_temporal_scale_factor = (
             self._infer_reference_scale_factors_from_config()
         )
+        # Built here so its parameters exist before the trainer collects trainable params,
+        # but attached to the transformer by the trainer so it lands in the checkpoint.
+        self.reference_slot_embedding: ReferenceSlotEmbedding | None = (
+            ReferenceSlotEmbedding(
+                num_frequencies=config.reference_slot_embedding.num_frequencies,
+                hidden_dim=config.reference_slot_embedding.hidden_dim,
+            )
+            if config.reference_slot_embedding is not None
+            else None
+        )
 
     def prepare_training_inputs(
         self,
@@ -357,6 +419,27 @@ class FlexibleStrategy(TrainingStrategy):
             metadata["reference_downscale_factor"] = spatial  # backward compat
         if temporal is not None and temporal != 1:
             metadata["reference_temporal_scale_factor"] = temporal
+
+        # Self-describing slot tag: an inference pipeline can rebuild the module from the
+        # checkpoint alone. Key names follow the LiconStudio MSR adapter.
+        slot_config = self.config.reference_slot_embedding
+        if slot_config is not None:
+            metadata["reference_slot_embedding_enabled"] = "True"
+            metadata["reference_slot_embedding_type"] = "fourier_mlp"
+            metadata["reference_slot_embedding_num_frequencies"] = slot_config.num_frequencies
+            metadata["reference_slot_embedding_hidden_dim"] = slot_config.hidden_dim
+            metadata["reference_slot_embedding_dim"] = ReferenceSlotEmbedding().token_dim
+            metadata["reference_token_order"] = "prepend"
+            slots = sorted(
+                {
+                    cond.slot_index if cond.slot_index is not None else cond.source_id
+                    for modality in (self.config.video, self.config.audio)
+                    if modality is not None
+                    for cond in modality.conditions
+                    if isinstance(cond, ReferenceConditionConfig) and cond.slot_embedding
+                }
+            )
+            metadata["reference_slot_indices"] = ",".join(str(s) for s in slots)
         return metadata
 
     def _infer_reference_scale_factors_from_config(self) -> tuple[int | None, int | None]:
@@ -646,6 +729,31 @@ class FlexibleStrategy(TrainingStrategy):
 
         return LatentData(latents=latents, num_frames=num_frames, height=height, width=width, fps=fps)
 
+    def _apply_slot_embedding(self, cond_latents: Tensor, config: ReferenceConditionConfig) -> Tensor:
+        """Add this reference's learned slot tag to its tokens, in feature space.
+
+        Zero-initialised, so a run that enables this starts identical to one that does not and
+        diverges only as the tag trains.
+        """
+        if not config.slot_embedding:
+            return cond_latents
+
+        slot_module = self.reference_slot_embedding
+        if slot_module is None:
+            raise RuntimeError(
+                "slot_embedding=true but no ReferenceSlotEmbedding was attached to the strategy; "
+                "the reference tag would be silently dropped."
+            )
+
+        slot_index = config.slot_index if config.slot_index is not None else config.source_id
+        slot_vector = slot_module(slot_index).to(cond_latents.dtype)
+        if slot_vector.shape[-1] != cond_latents.shape[-1]:
+            raise RuntimeError(
+                f"Slot embedding width {slot_vector.shape[-1]} does not match the patchified "
+                f"token width {cond_latents.shape[-1]}."
+            )
+        return cond_latents + slot_vector
+
     def _apply_reference_condition(
         self,
         noisy_latents: Tensor,
@@ -723,6 +831,8 @@ class FlexibleStrategy(TrainingStrategy):
                 sidecar_margin_pixels=config.sidecar_margin_pixels,
                 strata_start=strata_start,
             )
+
+        cond_latents = self._apply_slot_embedding(cond_latents, config)
 
         # Condition tokens: clean, timestep=0, no loss
         cond_timesteps = torch.zeros(batch_size, cond_seq_len, device=device, dtype=dtype)
