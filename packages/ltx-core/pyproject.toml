@@ -39,6 +39,7 @@ natten = [
 
 [tool.uv.sources]
 torch = { index = "torch" }
+torchvision = { index = "torch" }
 torchaudio = { index = "torch-test" }
 natten = { index = "natten" }
 
