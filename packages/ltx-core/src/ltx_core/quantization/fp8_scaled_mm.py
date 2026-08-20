@@ -180,7 +180,15 @@ def _fp8_scaled_mm_fuse(
     if scale_key not in model_sd.sd:
         return bf16_fuse_rule(key, weight, deltas, model_sd)
     weight_scale = model_sd.sd[scale_key]
-    original_weight = weight.to(torch.float32) * weight_scale
+    if weight.shape == deltas.shape:
+        original_weight = weight.to(torch.float32) * weight_scale
+    elif weight.t().shape == deltas.shape:
+        original_weight = weight.t().to(torch.float32) * weight_scale
+    else:
+        raise ValueError(
+            f"Cannot fuse LoRA delta for {key!r}: weight shape {tuple(weight.shape)} "
+            f"is incompatible with delta shape {tuple(deltas.shape)}."
+        )
     new_weight = original_weight + deltas.to(torch.float32)
     new_fp8_weight, new_weight_scale = quantize_weight_to_fp8_per_tensor(new_weight)
     return {key: new_fp8_weight, scale_key: new_weight_scale}
