@@ -42,8 +42,9 @@ dependencies = [
 ]
 
 [tool.uv.sources]
-torchcodec = { index = "torch" }
-torchaudio = { index = "torch-test" }
+# macOS/Apple Silicon: the cu132 indexes ship no darwin wheels, so fall back to PyPI there.
+torchcodec = [{ index = "torch", marker = "sys_platform != 'darwin'" }]
+torchaudio = [{ index = "torch-test", marker = "sys_platform != 'darwin'" }]
 
 [[tool.uv.index]]
 name = "torch"

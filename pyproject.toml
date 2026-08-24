@@ -9,7 +9,7 @@ no-build-isolation-package = ["ltx-kernels"]
 # libcudnn_engines_tensor_ir; the system/apt cuDNN is 9.21.1 and that soname
 # then resolves from /usr/lib, causing CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH.
 # Force a wheel that ships tensor_ir and matches the host cuDNN series.
-override-dependencies = ["nvidia-cudnn-cu13==9.21.1.3"]
+override-dependencies = ["nvidia-cudnn-cu13==9.21.1.3; sys_platform == 'linux'"]
 
 [tool.uv.workspace]
 members = ["packages/*"]

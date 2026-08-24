@@ -37,8 +37,9 @@ natten = [
 ]
 
 [tool.uv.sources]
-torch = { index = "torch" }
-torchaudio = { index = "torch-test" }
+# macOS/Apple Silicon: the cu132 indexes ship no darwin wheels, so fall back to PyPI there.
+torch = [{ index = "torch", marker = "sys_platform != 'darwin'" }]
+torchaudio = [{ index = "torch-test", marker = "sys_platform != 'darwin'" }]
 natten = { index = "natten" }
 
 [[tool.uv.index]]
