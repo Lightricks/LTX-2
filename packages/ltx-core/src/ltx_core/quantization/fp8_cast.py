@@ -201,6 +201,9 @@ class UpcastWithStochasticRounding(ModuleOps):
         )
 
 
+_FP8_TRITON_OK = torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 9)
+
+
 def fuse_cast_fp8_weight(
     delta_bf16: torch.Tensor,
     weight_fp8: torch.Tensor,
@@ -212,7 +215,7 @@ def fuse_cast_fp8_weight(
     """
     if delta_bf16.dtype != torch.bfloat16:
         raise ValueError(f"delta_bf16 must be bfloat16, got {delta_bf16.dtype}")
-    if str(weight_fp8.device).startswith("cuda") and TRITON_AVAILABLE:
+    if str(weight_fp8.device).startswith("cuda") and TRITON_AVAILABLE and _FP8_TRITON_OK:
         fused_add_round_launch(delta_bf16, weight_fp8, seed=0)
     else:
         delta_bf16.add_(weight_fp8.to(dtype=torch.bfloat16))
