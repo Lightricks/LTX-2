@@ -239,6 +239,7 @@ if __name__ == "__main__":
         distilled_lora_strength_stage_2=args.distilled_lora_strength_stage_2,
         compilation_config=args.compile,
         diffvae_optimization=args.diffvae_optimization,
+        quantization=args.quantization_builder,
     )
     try:
         for _ in controller.stream(
