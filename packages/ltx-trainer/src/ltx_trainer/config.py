@@ -118,11 +118,26 @@ class ReferenceConditionConfig(ConfigBaseModel):
     downscale_factor: int = Field(default=1, ge=1)
     temporal_scale_factor: int = Field(default=1, ge=1)
     include_in_output: bool = False
+    # Must mirror the training-side ReferenceConditionConfig, otherwise validation
+    # samples the model under a geometry it was never trained on.
+    layout: Literal["overlap", "st_drc", "sidecar", "virtual_sidecar", "strata"] = "overlap"
+    strata_slot: Literal["ltm", "stm"] | None = None
+    strata_f_lim: int = Field(default=128, ge=4)
+    source_phase: bool = False
+    source_id: int = Field(default=2, ge=1)
+    phase_scale: float = Field(default=1.0, ge=0.0)
+    sidecar_margin_pixels: float = Field(default=0.0, ge=0.0)
+    slot_embedding: bool = False
+    slot_index: int | None = Field(default=None, ge=0)
 
     @model_validator(mode="after")
     def validate_exactly_one_modality(self) -> "ReferenceConditionConfig":
         if (self.video is None) == (self.audio is None):
             raise ValueError("Exactly one of 'video' or 'audio' must be set for reference condition")
+        if self.layout == "strata" and self.strata_slot is None:
+            raise ValueError("layout='strata' requires strata_slot ('ltm' or 'stm')")
+        if self.audio is not None and (self.layout != "overlap" or self.source_phase):
+            raise ValueError("Reference layout and source_phase apply to video references only")
         return self
 
 
@@ -351,9 +366,69 @@ class OptimizationConfig(ConfigBaseModel):
         description="Maximum gradient norm for clipping",
     )
 
-    optimizer_type: Literal["adamw", "adamw8bit"] = Field(
+    optimizer_type: Literal["adamw", "adamw8bit", "prodigy", "automagic"] = Field(
         default="adamw",
-        description="Type of optimizer to use for training",
+        description=(
+            "Optimizer. 'prodigy' estimates its own step size and expects learning_rate: 1.0 "
+            "(needs the optional 'prodigy' extra). 'automagic' adapts one learning rate per "
+            "parameter group from the sign polarity of its own updates, so learning_rate is a "
+            "starting point rather than a target."
+        ),
+    )
+
+    automagic_polarity_history: int = Field(
+        default=8,
+        ge=2,
+        le=64,
+        description=(
+            "Automagic only: sign-history window length H. Longer windows make the up/down "
+            "votes rarer and more decisive, at the cost of H/8 bytes per element and an "
+            "H-step reaction lag."
+        ),
+    )
+
+    automagic_weight_decay: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Automagic only: decoupled weight decay.",
+    )
+
+    automagic_max_lr: float | None = Field(
+        default=None,
+        gt=0.0,
+        description=(
+            "Automagic only: ceiling on the adapted rate for the main parameter group. The "
+            "optimizer raises its rate until the sign polarity of its own updates stops "
+            "agreeing, which on a large adapter can settle above what the run is stable at — "
+            "the symptom is a loss that flattens early while samples keep swinging between "
+            "behaviours from checkpoint to checkpoint. Leave unset to let it choose freely. "
+            "Small trained modules keep their own group and are not capped by this, since a "
+            "zero-initialised module legitimately needs a much higher rate to grow at all."
+        ),
+    )
+
+    automagic_fused: bool = Field(
+        default=False,
+        description=(
+            "Automagic only: fuse the update into the backward pass for lower peak VRAM. "
+            "Bypasses gradient clipping and the nan-skip, and is incompatible with "
+            "gradient accumulation > 1, so it defaults off inside this trainer."
+        ),
+    )
+
+    prodigy_d_coef: float = Field(
+        default=1.0,
+        gt=0.0,
+        description=(
+            "Prodigy only: scales how fast the estimated step size grows. Lower it (e.g. 0.5) "
+            "if the run is unstable early, raise it if adaptation is too slow."
+        ),
+    )
+
+    prodigy_weight_decay: float = Field(
+        default=0.0,
+        ge=0.0,
+        description="Prodigy only: decoupled weight decay.",
     )
 
     scheduler_type: Literal[

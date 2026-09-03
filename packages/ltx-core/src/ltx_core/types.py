@@ -265,6 +265,8 @@ class LatentState:
             frame while the rest cover 8) plus any generated keyframe slots. Selects the tokens
             that receive the model's learned keyframe absolute-position embedding; ignored
             entirely by models built without ``use_keyframes_abs_pos_embedding``.
+        segment_ids: Optional source phase values of shape (B, T). Reference conditioning
+            can assign non-zero values; target and ordinary conditioning tokens use zero.
         generated_keyframe_layout: Set when generated keyframe slots were appended; locates them.
         generated_keyframes: Populated by ``clear_conditioning`` when a layout is present: the
             denoised slot content as an unpatchified ``(B, C, K, H, W)`` latent, one latent frame
@@ -285,6 +287,7 @@ class LatentState:
     generated_keyframe_layout: GeneratedKeyframeLayout | None = None
     generated_keyframes: torch.Tensor | None = None
     frozen: bool = False
+    segment_ids: torch.Tensor | None = None
 
     def clone(self) -> "LatentState":
         return LatentState(
@@ -294,6 +297,7 @@ class LatentState:
             clean_latent=self.clean_latent.clone(),
             attention_mask=self.attention_mask.clone() if self.attention_mask is not None else None,
             keyframes_mask=self.keyframes_mask.clone() if self.keyframes_mask is not None else None,
+            segment_ids=self.segment_ids.clone() if self.segment_ids is not None else None,
             generated_keyframe_layout=self.generated_keyframe_layout,
             generated_keyframes=(self.generated_keyframes.clone() if self.generated_keyframes is not None else None),
             frozen=self.frozen,

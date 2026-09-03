@@ -173,6 +173,11 @@ class ValidationRunner:
         self._video_patchifier = VideoLatentPatchifier(patch_size=1)
         self._audio_patchifier = AudioPatchifier(patch_size=1)
 
+        # Set by the trainer when the run trains a learned reference-slot tag. Validation has
+        # to apply the same tag as training, so leaving this unset while conditions request a
+        # slot is a silent train/sample mismatch — guarded at use.
+        self._reference_slot_embedding: torch.nn.Module | None = None
+
         self._cached_embeddings = self._cache_prompt_embeddings(text_encoder_path, load_text_encoder_in_8bit)
         self._cached_media = self._encode_conditioning_media()
         self._load_decoder_components()
@@ -620,7 +625,9 @@ class ValidationRunner:
                 video_clean = video_state
             else:
                 video_state = video_tools.create_initial_state(device=device, dtype=torch.bfloat16)
-                video_state = self._apply_video_conditionings(video_state, video_tools, sample, cached_media, device)
+                video_state = self._apply_video_conditionings(
+                    video_state, video_tools, sample, cached_media, device, self._reference_slot_embedding
+                )
                 video_clean = video_state
                 video_state = noiser(video_state, noise_scale=1.0)
 
@@ -691,6 +698,7 @@ class ValidationRunner:
         sample: ValidationSample,
         cached_media: CachedSampleMedia,
         device: torch.device,
+        slot_embedding: torch.nn.Module | None = None,
     ) -> LatentState:
         """Apply all video-targeting conditionings from the sample's conditions list."""
         for cond_idx, cond in enumerate(sample.conditions):
@@ -717,6 +725,15 @@ class ValidationRunner:
                     downscale_factor=cond.downscale_factor,
                     temporal_scale_factor=cond.temporal_scale_factor,
                     strength=1.0,
+                    layout=cond.layout,
+                    strata_slot=cond.strata_slot,
+                    strata_f_lim=cond.strata_f_lim,
+                    source_phase=cond.source_phase,
+                    source_id=cond.source_id,
+                    phase_scale=cond.phase_scale,
+                    sidecar_margin_pixels=cond.sidecar_margin_pixels,
+                    slot_embedding=_require_slot_embedding(slot_embedding) if cond.slot_embedding else None,
+                    slot_index=cond.slot_index,
                 ).apply_to(state, tools)
 
             elif cond.type == "mask":
@@ -821,11 +838,22 @@ class ValidationRunner:
                 return cached_media.conditions[cond_idx]
         raise ValueError(f"No cached media found for condition type '{condition_type}'")
 
+    def set_reference_slot_embedding(self, module: torch.nn.Module | None) -> None:
+        """Share the trained reference-slot tag so validation conditions can apply it."""
+        self._reference_slot_embedding = module
+
     @staticmethod
     def _apply_reference_side_by_side(
         video_output: Tensor, sample: ValidationSample, cached_media: CachedSampleMedia
     ) -> Tensor:
-        """Concatenate reference video pixels side-by-side with generated output if requested."""
+        """Concatenate reference video pixels side-by-side with generated output if requested.
+
+        Panels are laid out left-to-right in config order, with the generated output last, so a
+        multi-reference sample reads as ``[ref[0] | ref[1] | ... | output]``. Prepending each
+        reference to the accumulated result instead would reverse them, which silently
+        misattributes which ``source_id`` produced what.
+        """
+        panels: list[Tensor] = []
         for cond_idx, cond in enumerate(sample.conditions):
             if cond.type == "reference" and cond.include_in_output:
                 media = cached_media.conditions.get(cond_idx)
@@ -845,7 +873,9 @@ class ValidationRunner:
                         else:
                             indices = torch.linspace(0, ref_frames - 1, output_frames).round().long()
                         ref_pixels = ref_pixels[:, indices]
-                    video_output = _concatenate_videos_side_by_side(ref_pixels, video_output)
+                    panels.append(ref_pixels)
+        for ref_pixels in reversed(panels):
+            video_output = _concatenate_videos_side_by_side(ref_pixels, video_output)
         return video_output
 
     # ------------------------------------------------------------------
@@ -1417,6 +1447,21 @@ def _build_spatial_crop_mask(
     spatial_mask[ly1:ly2, lx1:lx2] = 1.0
 
     return spatial_mask.unsqueeze(0).unsqueeze(0).expand(1, frames, -1, -1)  # [1, F, H, W]
+
+
+def _require_slot_embedding(module: torch.nn.Module | None) -> torch.nn.Module:
+    """Return the trained slot tag, refusing to sample without one.
+
+    Falling back to "no tag" would produce validation samples that look plausible but were
+    generated under different conditioning than training used — a silent mismatch, so it is
+    made loud instead.
+    """
+    if module is None:
+        raise RuntimeError(
+            "A validation condition sets slot_embedding=true but no slot embedding was provided "
+            "to the ValidationRunner; samples would not match training."
+        )
+    return module
 
 
 def _concatenate_videos_side_by_side(left_video: Tensor, right_video: Tensor) -> Tensor:

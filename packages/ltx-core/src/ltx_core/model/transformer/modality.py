@@ -45,6 +45,10 @@ class Modality:
             that receive the model's learned keyframe absolute-position embedding. ``None`` means
             no token is marked, which is also the effective behaviour of every model built without
             ``use_keyframes_abs_pos_embedding``.
+        segment_ids: Optional source phase value per token, shape ``(B, T)``. Zero denotes
+            target tokens. Non-zero reference values compose an independent rotary phase with
+            the spatial-temporal RoPE, so several references can share the target's coordinates
+            and still be told apart. ``None`` keeps the upstream positional path byte-identical.
     """
 
     latent: (
@@ -61,6 +65,7 @@ class Modality:
     context_mask: torch.Tensor | None = None
     attention_mask: torch.Tensor | None = None
     keyframes_mask: torch.Tensor | None = None  # Shape: (B, T, 1), non-zero on single-pixel-frame latents
+    segment_ids: torch.Tensor | None = None  # Shape: (B, T), optional source-phase values
 
     def split(self, sizes: list[int]) -> list[Modality]:
         """Split along the batch dimension into chunks of the given sizes."""
@@ -70,7 +75,7 @@ class Modality:
             value = getattr(self, f.name)
             if isinstance(value, torch.Tensor):
                 split_fields[f.name] = list(value.split(sizes, dim=0))
-            elif value is None or isinstance(value, bool):
+            elif value is None or isinstance(value, (bool, tuple)):
                 split_fields[f.name] = [value] * n
             else:
                 raise TypeError(f"Cannot split field {f.name!r}: unsupported type {type(value)}")

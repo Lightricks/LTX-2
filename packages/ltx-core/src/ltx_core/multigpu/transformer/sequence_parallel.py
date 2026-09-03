@@ -91,6 +91,11 @@ def pad_modality_for_uniform_sharding(
         mask_pad = torch.zeros(mask_pad_shape, dtype=keyframes_mask.dtype, device=keyframes_mask.device)
         keyframes_mask = torch.cat([keyframes_mask, mask_pad], dim=1)
 
+    segment_ids = modality.segment_ids
+    if segment_ids is not None:
+        segment_pad = torch.zeros(b, pad, dtype=segment_ids.dtype, device=segment_ids.device)
+        segment_ids = torch.cat([segment_ids, segment_pad], dim=1)
+
     if modality.attention_mask is None:
         # Key-only padding mask in the canonical [0, 1] form: 1 on valid keys,
         # 0 on padded keys. Shape (1, 1, T_padded) broadcasts across batch and
@@ -117,6 +122,7 @@ def pad_modality_for_uniform_sharding(
         positions=positions,
         attention_mask=attention_mask,
         keyframes_mask=keyframes_mask,
+        segment_ids=segment_ids,
     )
     return padded, t_orig
 
@@ -171,12 +177,17 @@ def tile_modality_for_rank(
     if modality.keyframes_mask is not None:
         tiled_keyframes_mask = modality.keyframes_mask[:, start:end]
 
+    tiled_segment_ids = None
+    if modality.segment_ids is not None:
+        tiled_segment_ids = modality.segment_ids[:, start:end]
+
     tiled_modality = replace(
         modality,
         latent=tiled_latent,
         timesteps=tiled_timesteps,
         positions=tiled_positions,
         keyframes_mask=tiled_keyframes_mask,
+        segment_ids=tiled_segment_ids,
     )
 
     return tiled_modality, token_counts

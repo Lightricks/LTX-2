@@ -111,6 +111,7 @@ class LatentTools(Protocol):
             clean_latent=clean_latent,
             attention_mask=None,
             keyframes_mask=None,
+            segment_ids=None,
             generated_keyframe_layout=latent_state.generated_keyframe_layout,
             generated_keyframes=generated_keyframes,
             frozen=latent_state.frozen,

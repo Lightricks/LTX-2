@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from ltx_core.conditioning.mask_utils import extend_keyframes_mask, update_attention_mask
+from ltx_core.conditioning.reference_layout import extend_segment_ids
 from ltx_core.tools import LatentTools
 from ltx_core.types import LatentState
 
@@ -59,6 +60,9 @@ class AudioConditionByReferenceLatent:
             # Audio states carry no keyframe marker, so this resolves to None; called anyway to keep
             # the invariant that every appending conditioning item extends the per-token fields.
             keyframes_mask=extend_keyframes_mask(latent_state, tokens.shape[1], marked=False),
+            segment_ids=extend_segment_ids(
+                latent_state.segment_ids, latent_state.denoise_mask, tokens.shape[1]
+            ),
             generated_keyframe_layout=latent_state.generated_keyframe_layout,
             generated_keyframes=latent_state.generated_keyframes,
             frozen=latent_state.frozen,

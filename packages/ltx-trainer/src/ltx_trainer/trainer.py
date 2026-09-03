@@ -20,7 +20,7 @@ from peft.utils import ModulesToSaveWrapper
 from pydantic import BaseModel
 from safetensors.torch import load_file, save_file
 from torch import Tensor
-from torch.optim import AdamW
+from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import (
     CosineAnnealingLR,
     CosineAnnealingWarmRestarts,
@@ -271,7 +271,8 @@ class LtxvTrainer:
                     self._accelerator.wait_for_everyone()
 
                     # Update progress and log metrics
-                    current_lr = self._optimizer.param_groups[0]["lr"]
+                    optimizer = getattr(self._optimizer, "optimizer", self._optimizer)
+                    current_lr, per_group_lrs = self._current_learning_rates(optimizer)
                     step_time = (time.time() - step_start_time) * cfg.optimization.gradient_accumulation_steps
                     step_loss = output.loss.detach().mean().item()
 
@@ -289,6 +290,13 @@ class LtxvTrainer:
                         metrics = {
                             "train/loss": step_loss,
                             "train/learning_rate": current_lr,
+                            # Per group as well: with a separate group for a small trained module
+                            # the groups diverge by design, and a single number hides it.
+                            **{
+                                f"train/learning_rate_group_{i}": lr
+                                for i, lr in enumerate(per_group_lrs)
+                                if len(per_group_lrs) > 1
+                            },
                             "train/step_time": step_time,
                             "train/global_step": self._global_step,
                         }
@@ -459,8 +467,36 @@ class LtxvTrainer:
         else:
             raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
 
+        self._attach_reference_slot_embedding()
+
         self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
         logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
+
+    def _attach_reference_slot_embedding(self) -> None:
+        """Attach the strategy's learned reference-slot tag to the transformer, if configured.
+
+        It lives on the transformer rather than beside it so that the existing machinery picks
+        it up for free: parameter collection below, Accelerate's device placement and state-dict
+        gathering, and the checkpoint save path. Kept in float32 — it is ~40k parameters, and a
+        bf16 master weight is not worth the risk on a module whose whole job is to encode a small
+        integer distinctly.
+        """
+        slot_embedding = getattr(self._training_strategy, "reference_slot_embedding", None)
+        if slot_embedding is None:
+            return
+
+        slot_embedding = slot_embedding.to(device=self._accelerator.device, dtype=torch.float32)
+        slot_embedding.requires_grad_(True)
+        self._transformer.reference_slot_embedding = slot_embedding
+        # The strategy applies it during the forward pass, so both references must be the same
+        # object — re-assign in case ``.to()`` returned a copy.
+        self._training_strategy.reference_slot_embedding = slot_embedding
+        self._validation_runner.set_reference_slot_embedding(slot_embedding)
+
+        logger.info(
+            f"Reference slot embedding enabled: {sum(p.numel() for p in slot_embedding.parameters()):,} "
+            "trainable parameters added alongside the adapter"
+        )
 
     def _init_timestep_sampler(self) -> None:
         """Initialize the timestep sampler based on the config."""
@@ -510,6 +546,36 @@ class LtxvTrainer:
 
         logger.info("✅ Full model checkpoint loaded successfully")
 
+    def _restore_reference_slot_embedding(self, state_dict: dict[str, Tensor]) -> dict[str, Tensor]:
+        """Pull the slot embedding out of a checkpoint into the module, returning the rest.
+
+        Returns the state dict with those keys removed so PEFT only sees adapter weights.
+        """
+        prefix = "reference_slot_embedding."
+        slot_state = {k[len(prefix) :]: v for k, v in state_dict.items() if k.startswith(prefix)}
+        remainder = {k: v for k, v in state_dict.items() if not k.startswith(prefix)}
+
+        module = getattr(self._transformer, "reference_slot_embedding", None)
+        if module is None:
+            if slot_state:
+                logger.warning(
+                    "⚠️ Checkpoint carries a reference slot embedding but this run has none "
+                    "configured; its tag will be ignored."
+                )
+            return remainder
+
+        if not slot_state:
+            logger.warning(
+                "⚠️ This run trains a reference slot embedding but the checkpoint has none — "
+                "it will start from its zero init rather than resuming."
+            )
+            return remainder
+
+        device = next(module.parameters()).device
+        module.load_state_dict({k: v.to(device=device, dtype=torch.float32) for k, v in slot_state.items()})
+        logger.info("✅ Reference slot embedding restored from checkpoint")
+        return remainder
+
     def _load_lora_checkpoint(self, checkpoint_path: Path) -> None:
         """Load LoRA checkpoint with DDP/FSDP compatibility."""
         state_dict = load_file(checkpoint_path)
@@ -517,6 +583,12 @@ class LtxvTrainer:
         # Adjust layer names to match internal format.
         # (Weights are saved in ComfyUI-compatible format, with "diffusion_model." prefix)
         state_dict = {k.replace("diffusion_model.", "", 1): v for k, v in state_dict.items()}
+
+        # Modules trained alongside the adapter have to be restored explicitly: PEFT ignores
+        # keys it does not recognise, so resuming would silently reset them to their init —
+        # for the zero-initialised slot embedding, that means resuming with no tag at all while
+        # the run reports a successful load.
+        state_dict = self._restore_reference_slot_embedding(state_dict)
 
         # Load LoRA weights and verify all weights were loaded
         base_model = self._transformer.get_base_model()
@@ -701,21 +773,135 @@ class LtxvTrainer:
             if isinstance(module, (BaseTunerLayer, ModulesToSaveWrapper)):
                 module.reset_lora_parameters(adapter_name="default", init_lora_weights=True)
 
+    @staticmethod
+    def _current_learning_rates(optimizer: Optimizer) -> tuple[float, list[float]]:
+        """The rate to plot, plus one entry per parameter group.
+
+        Self-adapting optimizers (Automagic) keep the live rate in their own state rather than on
+        the param group, so reading the group logs a constant and hides whether adaptation
+        happened at all. Their average is taken across *groups*, unweighted — which is fine with
+        one group and misleading with two, since a group holding a thousandth of the parameters
+        then accounts for half the reported number. So the headline value is the group holding the
+        most parameters (the adapter), and every group is reported alongside it.
+        """
+        if hasattr(optimizer, "get_learning_rates"):
+            group_lrs = [float(lr) for lr in optimizer.get_learning_rates()]
+        else:
+            group_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+        if not group_lrs:
+            return 0.0, []
+
+        sizes = [sum(p.numel() for p in group["params"]) for group in optimizer.param_groups]
+        headline = group_lrs[max(range(len(sizes)), key=sizes.__getitem__)] if sizes else group_lrs[0]
+        return headline, group_lrs
+
+    def _optimizer_param_groups(self) -> list[dict[str, Any]] | list[torch.nn.Parameter]:
+        """Split the reference slot embedding into its own parameter group.
+
+        It is a few tens of thousands of parameters next to hundreds of millions of adapter
+        weights, and it starts from a zero-initialised output while the adapter starts at its
+        working scale — the two want different step sizes. Sharing one group also breaks
+        self-tuning optimizers specifically: Automagic pools its sign-polarity vote per group,
+        so a module holding well under a thousandth of the parameters has no say in the rate
+        it is trained at.
+        """
+        slot_embedding = getattr(self._transformer, "reference_slot_embedding", None)
+        if slot_embedding is None:
+            return self._trainable_params
+
+        slot_params = set(slot_embedding.parameters())
+        rest = [p for p in self._trainable_params if p not in slot_params]
+
+        adapter_group: dict[str, Any] = {"params": rest}
+        # The ceiling applies to the adapter only. The slot embedding starts at a zero output
+        # and has to climb to be heard at all, so capping it at a rate tuned for hundreds of
+        # millions of mature weights would keep it silent.
+        max_lr = self._config.optimization.automagic_max_lr
+        if max_lr is not None:
+            adapter_group["max_lr"] = max_lr
+
+        return [
+            adapter_group,
+            {"params": [p for p in slot_embedding.parameters() if p.requires_grad]},
+        ]
+
     def _init_optimizer(self) -> None:
         """Initialize the optimizer and learning rate scheduler."""
         opt_cfg = self._config.optimization
 
         lr = opt_cfg.learning_rate
+        # Grouped view for the optimizer only. ``_trainable_params`` stays a flat list because
+        # gradient clipping iterates it directly.
+        params = self._optimizer_param_groups()
         if opt_cfg.optimizer_type == "adamw":
-            optimizer = AdamW(self._trainable_params, lr=lr)
+            optimizer = AdamW(params, lr=lr)
         elif opt_cfg.optimizer_type == "adamw8bit":
             # noinspection PyUnresolvedReferences
             from bitsandbytes.optim import AdamW8bit  # noqa: PLC0415
 
-            optimizer = AdamW8bit(self._trainable_params, lr=lr)
+            optimizer = AdamW8bit(params, lr=lr)
+        elif opt_cfg.optimizer_type == "prodigy":
+            try:
+                from prodigyopt import Prodigy  # noqa: PLC0415
+            except ImportError as exc:  # pragma: no cover - depends on optional extra
+                raise ImportError(
+                    "optimizer_type='prodigy' requires the optional dependency: "
+                    "install it with `uv sync --extra prodigy` (or `pip install prodigyopt`)."
+                ) from exc
+
+            # Prodigy estimates the step size itself; lr is a multiplier on that estimate and
+            # is meant to stay at 1.0. A config carrying a small AdamW-style lr (1e-5) would
+            # scale Prodigy's estimate down by that factor and effectively stall training.
+            if lr != 1.0:
+                logger.warning(
+                    "optimizer_type='prodigy' with learning_rate=%s: Prodigy adapts the step "
+                    "size itself and expects learning_rate=1.0, which is used as a multiplier. "
+                    "Set learning_rate: 1.0 unless you are deliberately scaling it.",
+                    lr,
+                )
+            optimizer = Prodigy(
+                params,
+                lr=lr,
+                weight_decay=opt_cfg.prodigy_weight_decay,
+                d_coef=opt_cfg.prodigy_d_coef,
+                use_bias_correction=True,
+                safeguard_warmup=True,
+            )
+        elif opt_cfg.optimizer_type == "automagic":
+            from ltx_trainer.optimizers import Automagic3  # noqa: PLC0415
+
+            # Automagic adapts the lr itself; the configured value is only where it starts.
+            # fused=True would bypass accelerate's clipping and cannot see accumulated
+            # gradients, so it is refused when accumulation is on.
+            if opt_cfg.automagic_fused and opt_cfg.gradient_accumulation_steps > 1:
+                raise ValueError(
+                    "optimizer_type='automagic' with automagic_fused=true is incompatible with "
+                    "gradient_accumulation_steps > 1 (the fused update runs inside backward, "
+                    "before gradients finish accumulating)."
+                )
+            logger.info(
+                "Automagic: starting lr %s is a launch point — the optimizer adapts it from "
+                "the pooled sign-polarity vote.",
+                lr,
+            )
+            optimizer = Automagic3(
+                params,
+                lr=lr,
+                weight_decay=opt_cfg.automagic_weight_decay,
+                polarity_history=opt_cfg.automagic_polarity_history,
+                fused=opt_cfg.automagic_fused,
+            )
         else:
             raise ValueError(f"Unknown optimizer type: {opt_cfg.optimizer_type}")
 
+        if opt_cfg.optimizer_type == "automagic" and opt_cfg.scheduler_type != "constant":
+            # Automagic owns the learning rate: it adapts state["lr"] per parameter and never
+            # reads param_groups["lr"], so a scheduler would drive a value nothing consumes.
+            logger.warning(
+                "optimizer_type='automagic' ignores the LR scheduler (scheduler_type=%s); "
+                "the optimizer adapts its own rate.",
+                opt_cfg.scheduler_type,
+            )
         lr_scheduler = self._create_scheduler(optimizer)
 
         # noinspection PyTypeChecker
@@ -966,6 +1152,14 @@ class LtxvTrainer:
 
             # Convert to ComfyUI-compatible format (add "diffusion_model." prefix)
             state_dict = {f"diffusion_model.{k}": v for k, v in state_dict.items()}
+
+            # get_peft_model_state_dict returns adapter weights only, so any module trained
+            # alongside the adapter has to be merged back in explicitly — otherwise it trains
+            # for the whole run and is silently absent from every checkpoint.
+            slot_embedding = getattr(self._transformer, "reference_slot_embedding", None)
+            if slot_embedding is not None:
+                for key, value in slot_embedding.state_dict().items():
+                    state_dict[f"diffusion_model.reference_slot_embedding.{key}"] = value
 
         # Determine save precision
         save_dtype = torch.bfloat16 if self._config.checkpoints.precision == "bfloat16" else torch.float32

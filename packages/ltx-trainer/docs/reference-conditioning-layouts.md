@@ -1,0 +1,411 @@
+# Reference conditioning: RoPE layouts and source phase
+
+`FlexibleStrategy`'s `reference` condition concatenates clean reference latents to the target
+sequence (the IC-LoRA recipe). By default the reference reuses the target's RoPE coordinates,
+so the model can only tell source from target implicitly — clean vs noisy tokens, plus
+concatenation order.
+
+This page documents two optional mechanisms that make that distinction explicit:
+
+- **`layout`** — *where* the reference sits in the RoPE coordinate grid.
+- **`source_phase`** — an independent rotary tag per source, composed with the positional RoPE.
+
+Both are **off by default**. A config that does not opt in produces byte-identical behaviour to
+upstream: `layout="overlap"` returns the reference positions unchanged, and a `segment_ids`
+field that is all-zero (or `None`) is an exact no-op in the rotary maths.
+
+## References
+
+| Layout / mechanism | Source |
+|---|---|
+| `st_drc` | ST-DRC — [arXiv:2606.02441](https://arxiv.org/abs/2606.02441) |
+| `strata` | Strata-RoPE, UnityShots — [arXiv:2606.21661](https://arxiv.org/abs/2606.21661) |
+| `overlap` + `source_phase` | Not from a paper — added here (see below) |
+| `sidecar` | Not from a paper — added here |
+
+## Background
+
+The `st_drc` layout implements the coordinate separation described in **ST-DRC**
+([arXiv:2606.02441](https://arxiv.org/abs/2606.02441)): the reference block is shifted past the
+target's extent on every axis, so source and target occupy disjoint regions of the coordinate
+space and cannot collide positionally.
+
+**`overlap` + `source_phase` is not from that paper — it is an addition made here.** Instead of
+moving the reference away from the target, it keeps the reference on the *same* coordinates and
+separates the sources with an independent rotary phase. In practice this has trained
+noticeably better than the literal coordinate shift, across several weeks of runs on identity
+transfer, head-swap and Face-ID style tasks. It has been used on **both LTX-2.3 and LTX 2.5** —
+the mechanism is positional, so it does not depend on the text-encoder or feature-extractor
+differences between versions.
+
+**Recommended default: `layout: overlap` with `source_phase: true`.** Start there. The other
+layouts are available for cases where you specifically want disjoint coordinates.
+
+### Released example
+
+[**Alissonerdx/LTX-Best-Face-ID**](https://huggingface.co/Alissonerdx/LTX-Best-Face-ID) is a
+public identity-transfer LoRA for LTX-2.3 trained with this recipe — `layout: overlap`,
+`source_phase: true`, `source_id: 1`. The repository includes the LoRA, the character-sheet
+variant, the reference sheets used, and the prompt format, so the configuration below can be
+checked against a working artefact rather than taken on faith.
+
+## Layouts
+
+| `layout` | What it does | Notes |
+|---|---|---|
+| `overlap` | Reference reuses the target's coordinates. | Upstream behaviour. **Recommended**, combined with `source_phase`. |
+| `st_drc` | Shifts the reference past the target's extent on **every** axis (T, H, W). | The literal ST-DRC construction. |
+| `sidecar` | Parks the reference as a panel to the right of the target, vertically centred, spanning the clip temporally. | `virtual_sidecar` is an accepted alias. `sidecar_margin_pixels` sets the gap. |
+| `strata` | Shifts **only** the temporal axis to an absolute band; H/W keep overlapping the target. | Multi-shot memory slots, not general reference conditioning. Requires `strata_slot` (`ltm` or `stm`). |
+
+`strata` follows Strata-RoPE from **UnityShots** ([arXiv:2606.21661](https://arxiv.org/abs/2606.21661)),
+which was designed for a narrower problem than the other layouts: keeping a subject consistent
+across **multiple shots**. Short- and long-term memory slots sit on fixed absolute temporal
+bands near `strata_f_lim`, far from the current shot's own range, so the rotary attenuates
+cross-band interaction by distance. If you are conditioning on a single reference, this is not
+the layout you want — use `overlap`.
+
+The paper's `f_lim=128` is a large distance; on LTX's short latent-frame counts that can
+attenuate a reference to near-zero influence, which is why `strata_f_lim` is configurable —
+lower it to keep the band close enough to still condition.
+
+## Source phase
+
+With `source_phase: true`, reference tokens receive a rotary phase of `source_id * phase_scale`,
+composed with the ordinary spatiotemporal RoPE. Target tokens always carry source `0`, which is
+an exact no-op, so the target's positional encoding is untouched.
+
+The phase is norm-preserving (it rotates the RoPE frequencies rather than scaling them), and it
+is independent of the positional axes — so a reference can share the target's exact coordinates
+and still be unambiguously identifiable.
+
+```yaml
+conditions:
+  - type: reference
+    latents_dir: reference_latents
+    layout: overlap        # keep the target's coordinates
+    source_phase: true     # separate the sources by rotary phase instead
+    source_id: 2           # target is always 0
+    phase_scale: 1.0
+```
+
+### Multiple references
+
+Distinct `source_id` values give distinct phases, so several references can share the target's
+coordinates and remain separable — a second reference at `source_id: 3`, a third at `4`, and so
+on. Configure one `reference` condition per source:
+
+```yaml
+conditions:
+  - type: reference
+    latents_dir: reference_a_latents
+    layout: overlap
+    source_phase: true
+    source_id: 2
+  - type: reference
+    latents_dir: reference_b_latents
+    layout: overlap
+    source_phase: true
+    source_id: 3
+```
+
+Preprocess one column per reference. `process_dataset.py` accepts numbered reference columns
+and writes each to its own latents directory:
+
+| Dataset column | Output directory |
+|---|---|
+| `reference_video` | `reference_latents` |
+| `reference_video_0` | `reference_latents_0` |
+| `reference_video_1` | `reference_latents_1` |
+
+```csv
+video,reference_video_0,reference_video_1,caption
+target.mp4,ref_a.png,ref_b.png,"..."
+```
+
+Plain `reference_video` is unchanged, so single-reference datasets keep working exactly as
+before.
+
+### Binding prompt tags to sources
+
+The layout and the phase make the references *separable*. They do not tell the model **which
+reference is which** — that a particular source is "the woman" and another is "the jacket".
+
+Nothing in this code ties a prompt tag to a `source_id`. The correspondence is a **dataset
+convention**: it exists only if every caption in the training set uses the same tags in the same
+order as the conditions in the config, so the model can learn the association. Get the ordering
+inconsistent across the dataset and no binding forms, however well-separated the tokens are.
+
+The convention that has been used here is a bracketed tag per source, numbered to match the
+condition order:
+
+```yaml
+conditions:
+  - type: reference          # <Image 1>
+    latents_dir: reference_latents_0
+    source_id: 1
+  - type: reference          # <Image 2>
+    latents_dir: reference_latents_1
+    source_id: 2
+```
+
+```text
+<Image 1> is the woman. <Image 2> is the man. In a rustic kitchen, the man in a casual
+apron and the woman in a flour-dusted dress share a playful moment baking.
+```
+
+Two details matter in practice:
+
+- **Declare, then use.** Open the caption by stating what each tag *is*, then refer back to the
+  tags in the scene description. A tag that only ever appears inside prose has to carry both jobs
+  at once, which is a harder association to learn.
+- **The tag is baked into the text embedding.** Captions are encoded during preprocessing, so the
+  tags must be present *before* `process_captions.py` runs. Adding them later means re-encoding.
+
+At inference the same tags must appear in the prompt, in the same order as the conditions, or the
+model sees a convention it was never trained on.
+
+Nothing depends on the `<Image N>` spelling in particular — any consistent marker works, and the
+numbering does not have to equal the `source_id`. What matters is that the mapping from tag to
+condition position is identical in training and at sampling.
+
+With a **single** reference this is unnecessary: there is nothing to disambiguate, and plain
+captions are what the released single-reference recipe uses.
+
+> **Recommended numbering.** Start references at `source_id: 1` and count up. The field defaults
+> to `2` for backwards compatibility, which makes it tempting to number a second reference `3`
+> and leave both sources further from the target than they need to be.
+
+> **Validated scope.** Two configurations have been trained to production checkpoints:
+>
+> - **One reference** at `source_id: 1` — the Face-ID recipe.
+> - **Two references with different roles** at `source_id: 1` and `2` — the head-swap recipe,
+>   where source 1 is a motion/pose guide video and source 2 is the identity reference.
+>
+> Read that second case carefully before relying on it. The configuration used distinct ids and
+> the resulting checkpoint works, but **no ablation was run with both references on the same
+> id**, so it is not established that the distinct phases were load-bearing there: the two
+> sources also differ in content (a motion guide versus a portrait), which the model can use on
+> its own.
+>
+> Note also what the phase is *not* needed for. A reference is already separated from the target
+> by being clean (`denoise_mask = 0`) regardless of layout — that distinction does not require a
+> phase. The phase earns its place when two **references** must be told apart from each other.
+>
+> The case that would actually establish it — two references of the *same* role, e.g. two
+> distinct characters composed into one scene, separable only by phase — has not been
+> demonstrated. Treat it as open.
+
+## Learned slot embedding
+
+`source_phase` tags a reference positionally, by rotating its RoPE frequencies. That makes the
+tokens *separable*, but a rotary phase on a source axis is not a signal the base model was
+pretrained to read — an adapter has to learn to exploit it from scratch.
+
+The slot embedding takes the other route. Each reference's slot index is Fourier-featurised and
+passed through a small MLP, producing a vector that is **added to that reference's tokens** in
+feature space, where attention can use it directly:
+
+```yaml
+training_strategy:
+  name: flexible
+  reference_slot_embedding:      # trains the module
+    num_frequencies: 16
+    hidden_dim: 256
+  video:
+    conditions:
+      - type: reference
+        latents_dir: reference_latents_0
+        source_id: 1
+        slot_embedding: true     # tags this reference
+      - type: reference
+        latents_dir: reference_latents_1
+        source_id: 2
+        slot_embedding: true
+```
+
+`slot_index` defaults to `source_id`; set it explicitly to decouple the two. The module costs
+about **41k parameters** and its last layer is zero-initialised, so a run that enables it starts
+byte-identical to one that does not and departs only as the tag learns. The two mechanisms are
+independent and can be combined — the phase separates positionally, the slot tags in feature
+space.
+
+Mirror the fields on validation conditions, as with every other option here. The runner raises
+rather than sampling untagged if the module is missing, since that mismatch is otherwise silent.
+
+### Checkpoint layout
+
+The module is trained alongside the adapter and saved into the same file under
+`diffusion_model.reference_slot_embedding.*`, with its hyperparameters in the safetensors
+metadata so an inference pipeline can rebuild it from the checkpoint alone.
+
+Parameter names, shapes and defaults follow the layout this technique is conventionally published
+with — `fourier_mlp` with 16 frequencies, hidden 256 and output 128 — which keeps checkpoints
+portable across implementations that use it.
+
+Worth knowing when comparing approaches: a feature-space tag is not the only way to keep several
+references apart, and not always the cheapest. Placing them at distinct positions on the
+**native** temporal axis — a reference per latent frame, or offsets outside the target's own
+range — uses a coordinate the base model already understands, with no extra parameters at all. If
+your references can be packed that way, start there and reach for a learned tag only if they
+cannot.
+
+> **Status.** This implementation is new and has **not** yet been trained to a production
+> checkpoint here — unlike `overlap` + `source_phase`, which has. Treat it as a mechanism offered
+> on the strength of the construction, not as a recipe validated in this repository.
+
+## Reference augmentation
+
+Reference conditioning has a degenerate solution the objective does not discourage on its own.
+When a reference shares content with the target — the same subject, the same clothing, often the
+same source photograph — reproducing it wholesale already scores well, and scores well from the
+very first steps, while learning to compose several references into a new scene pays off much
+later. Training can settle on copying one reference and discarding the rest, and it will look
+like the model is ignoring your conditioning when in fact it is exploiting it.
+
+`augment_noise` removes the shortcut by making the reference un-copyable:
+
+```yaml
+conditions:
+  - type: reference
+    latents_dir: reference_latents
+    augment_noise: 0.3     # fraction of the reference's own std; 0.0 disables
+```
+
+A copied noisy reference is a noisy prediction, which the loss penalises, so the content has to
+be re-synthesised rather than passed through. The noise is scaled by the reference's own standard
+deviation, so the setting means the same thing regardless of how the VAE scales its latents.
+
+It applies **during training only**. References are clean at inference, and validation samples the
+model the way it will actually be used.
+
+| Value | Effect |
+|---|---|
+| `0.15` | Barely visible; flat regions pick up faint texture. Rarely enough to matter. |
+| `0.3` | Flat regions become grainy while subjects, faces and patterns stay intact. A good starting point. |
+| `0.5` | Heavy grain; content still legible. Use when copying persists at lower values. |
+
+Noise lands hardest on smooth regions, which are exactly the ones that are cheapest to copy, and
+leaves textured detail — the part that carries identity — largely intact.
+
+Two related levers, if copying persists: the per-condition `probability`, which drops a reference
+outright on some steps so the model cannot assume any single one is present; and pixel-space
+augmentation (crop, flip, colour jitter) at preprocessing time, which is stronger but requires
+re-encoding the reference latents.
+
+> **Check your captions too.** If a dataset describes two references identically — `<Image 1> is
+> the woman. <Image 2> is the woman.` — then no augmentation can help, because nothing in the
+> input says which is which. Those samples actively teach that the tags carry no information. See
+> [binding prompt tags to sources](#binding-prompt-tags-to-sources).
+
+## Extending: auxiliary losses on the reference
+
+The layouts and the source phase only decide *where* the reference sits and *how* it is
+tagged. They do not add any pressure on the model to actually preserve what the reference
+shows — the flow-matching objective alone has to carry that.
+
+For identity-style tasks this is often the missing piece, and it composes cleanly with the
+mechanisms here: because reference tokens are separable (by coordinates under `st_drc` /
+`sidecar`, or by source phase under `overlap`), it is straightforward to decode the generated
+region and score it against the reference with an auxiliary term. Some directions people have
+found useful:
+
+- **Face embedding loss** (ArcFace / InsightFace-style): cosine distance between the reference
+  face embedding and the generated one. Effective when the reference is a person and identity
+  drift is the failure mode.
+- **Appearance / feature loss** (DINOv2, DINOv3, SigLIP): cosine or L2 on pooled features,
+  which constrains general appearance rather than facial identity — useful for objects,
+  clothing and non-human subjects where a face model does not apply.
+- **Region-restricted variants**: apply either of the above only inside a mask (a detected
+  face box, a segmented subject) so the term does not fight the prompt over background.
+
+Two practical notes if you build one. Auxiliary losses on a diffusion objective usually need
+the prediction converted to an `x0` estimate before decoding, which is only meaningful at low
+sigma — gating the term by timestep avoids paying for a decode on samples where the estimate is
+mostly noise. And the weight matters more than the choice of network: too high and the model
+optimises the embedding metric at the expense of prompt adherence.
+
+This trainer does not ship such a loss; `FlexibleStrategy.compute_loss` is the place to add
+one, and the reference latents are already on the batch under the condition's `latents_dir`.
+
+## Keeping training and inference aligned
+
+The layout and phase are geometry, not weights. A checkpoint trained with a given layout must be
+sampled with the **same** layout, or the model sees a coordinate frame it never saw in training.
+
+Three call sites share one implementation
+(`ltx_core.conditioning.reference_layout`) so they cannot drift:
+
+| Path | Where |
+|---|---|
+| Training | `FlexibleStrategy._apply_reference_condition` |
+| Validation during training | `ValidationRunner`, via the same fields on the validation condition |
+| Inference | `VideoConditionByReferenceLatent` (ltx-core) |
+
+Validation conditions therefore mirror the training fields:
+
+```yaml
+validation:
+  samples:
+    - prompt: "..."
+      conditions:
+        - type: reference
+          video: /path/to/reference.mp4
+          layout: overlap
+          source_phase: true
+          source_id: 2
+```
+
+## ComfyUI
+
+`VideoConditionByReferenceLatent` carries the full parameter set, so any pipeline built on
+ltx-core inherits the behaviour. There are currently **no official LTX ComfyUI nodes exposing
+`layout` / `source_phase`**, so a LoRA trained with these options needs a node that sets them —
+today that means the community BFS nodes (`ltx_identity_overlap`), which reimplement the same
+geometry. Adding official nodes would remove that dependency, and is the natural follow-up to
+this PR.
+
+### Reference sizing
+
+One detail that matters in practice and has no training-side equivalent: how the reference image
+is resized before encoding. The BFS node exposes three modes, and the right one depends on what
+the checkpoint was trained with:
+
+| Mode | Behaviour | When to use |
+|---|---|---|
+| `match_target` | Centre-crop then resize the reference to the output's pixel size. | Reference resolution never mattered (e.g. single face crops). Discards whatever is outside the centre when aspect ratios differ. |
+| `match_target_letterbox` | Same target pixel size, but fits the whole reference inside it, preserving aspect ratio and padding. | Mismatched aspect ratios where nothing may be cut — e.g. a landscape composite sheet driving a portrait output. |
+| `native_resolution` | Encode the reference at its own size, rounded to a multiple of 32, independent of the output. | Checkpoints trained on a **fixed reference resolution bucket** that differs from the output's bucket. |
+
+If a checkpoint was trained with references in their own fixed bucket, sampling it with
+`match_target` silently changes the reference's token count and grid extent, and identity
+transfer degrades. Match the training-time preprocessing.
+
+The BFS node also accepts a *batch* of reference images, assigning `source_id + index` to each —
+the inference-side counterpart of the multi-reference configuration above (and likewise
+untested here beyond the single-reference case).
+
+## Backwards compatibility
+
+- `layout` defaults to `overlap` and `source_phase` to `false`, so existing configs are unchanged.
+- `apply_reference_layout` returns the input tensor for `overlap`.
+- `extend_segment_ids` returns `None` when there is nothing to tag, preserving the exact
+  upstream fast path through the rotary code.
+- Source `0` is an algebraic no-op in `apply_segment_phase_to_freqs_cis`.
+
+## Config reference
+
+| Field | Default | Meaning |
+|---|---|---|
+| `layout` | `overlap` | `overlap`, `st_drc`, `sidecar` (alias `virtual_sidecar`), `strata` |
+| `source_phase` | `false` | Enable the per-source rotary tag |
+| `source_id` | `2` | Source index for this reference; target is always `0` |
+| `phase_scale` | `1.0` | Multiplier on the source phase |
+| `augment_noise` | `0.0` | Training-only noise on this reference, as a fraction of its own std |
+| `slot_embedding` | `false` | Add the learned per-slot tag to this reference |
+| `slot_index` | `null` | Index fed to the slot embedding; defaults to `source_id` |
+| `sidecar_margin_pixels` | `0.0` | Gap between target and sidecar panel |
+| `strata_slot` | `null` | `ltm` or `stm`; required by `layout: strata` |
+| `strata_f_lim` | `128` | Ceiling of the absolute Strata-RoPE bands |
+
+Video references only — the fields are rejected on an audio reference.

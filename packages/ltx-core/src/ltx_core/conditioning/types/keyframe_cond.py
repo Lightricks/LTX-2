@@ -3,6 +3,7 @@ import torch
 from ltx_core.components.patchifiers import get_pixel_coords
 from ltx_core.conditioning.item import ConditioningItem
 from ltx_core.conditioning.mask_utils import extend_keyframes_mask, update_attention_mask
+from ltx_core.conditioning.reference_layout import extend_segment_ids
 from ltx_core.tools import VideoLatentTools
 from ltx_core.types import LatentState, VideoLatentShape
 
@@ -84,6 +85,9 @@ class VideoConditionByKeyframeIndex(ConditioningItem):
             # Given keyframe content is ordinary image guidance, not a generated keyframe slot, so
             # it carries no keyframe marker.
             keyframes_mask=extend_keyframes_mask(latent_state, tokens.shape[1], marked=False),
+            segment_ids=extend_segment_ids(
+                latent_state.segment_ids, latent_state.denoise_mask, tokens.shape[1]
+            ),
             generated_keyframe_layout=latent_state.generated_keyframe_layout,
             generated_keyframes=latent_state.generated_keyframes,
             frozen=latent_state.frozen,

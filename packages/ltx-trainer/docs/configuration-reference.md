@@ -284,7 +284,9 @@ optimization:
   batch_size: 1                        # Batch size per GPU
   gradient_accumulation_steps: 1       # Steps to accumulate gradients
   max_grad_norm: 1.0                   # Gradient clipping threshold
-  optimizer_type: "adamw"              # "adamw" or "adamw8bit"
+  optimizer_type: "adamw"              # "adamw", "adamw8bit" or "prodigy"
+  # prodigy_d_coef: 1.0                # prodigy only: step-size growth rate
+  # prodigy_weight_decay: 0.0          # prodigy only: decoupled weight decay
   scheduler_type: "linear"             # Scheduler type
   scheduler_params: { }                # Additional scheduler parameters
   enable_gradient_checkpointing: true  # Memory optimization
