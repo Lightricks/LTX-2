@@ -447,6 +447,13 @@ def main() -> None:
             "(height//2, width//2). Useful for faster iteration or when GPU memory is limited."
         ),
     )
+    parser.add_argument(
+        "--stage-2-sigmas",
+        type=float,
+        nargs="+",
+        default=None,
+        metavar="SIGMA"
+    )
     args = parser.parse_args()
 
     # Load mask video if provided via --conditioning-attention-mask
