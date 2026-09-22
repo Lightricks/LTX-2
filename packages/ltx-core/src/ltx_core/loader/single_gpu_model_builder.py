@@ -298,6 +298,7 @@ class SingleGPUModelBuilder(Generic[ModelType], ModelBuilderProtocol[ModelType],
 
         uninitialized = _check_uninitialized(meta_model)
         if uninitialized:
-            logger.warning(f"Uninitialized parameters or buffers: {uninitialized}")
-            return meta_model
+            raise RuntimeError(
+                f"Checkpoint {self._model_path!r} left uninitialized parameters or buffers: {uninitialized}"
+            )
         return to_device(meta_model, device)
