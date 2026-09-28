@@ -582,6 +582,7 @@ class ICLoraPipeline:
                 f"(resolution_divisor=1), got {stages[-1].resolution_divisor}"
             )
 
+    @torch.inference_mode()
     def __call__(  # noqa: PLR0913
         self,
         prompt: str,
