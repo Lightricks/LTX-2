@@ -148,6 +148,7 @@ class A2VidPipelineTwoStage:
             diffvae_optimization=diffvae_optimization,
         )
 
+    @torch.inference_mode()
     def __call__(  # noqa: PLR0913
         self,
         prompt: str,

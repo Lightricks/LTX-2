@@ -523,6 +523,7 @@ class DFRPipeline:
             fps=fps,
         )
 
+    @torch.inference_mode()
     def __call__(  # noqa: PLR0912, PLR0913, PLR0915
         self,
         prompt: str,
