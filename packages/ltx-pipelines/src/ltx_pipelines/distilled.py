@@ -184,6 +184,7 @@ class DistilledPipeline:
             ),
         }
 
+    @torch.inference_mode()
     def __call__(  # noqa: PLR0913
         self,
         prompt: str,

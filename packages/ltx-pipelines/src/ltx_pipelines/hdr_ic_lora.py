@@ -349,6 +349,7 @@ class HDRICLoraPipeline:
         """Reference video downscale factor from HDR LoRA config."""
         return self._hdr_config.reference_downscale_factor if self._hdr_config is not None else 1
 
+    @torch.inference_mode()
     def __call__(  # noqa: PLR0913
         self,
         seed: int,

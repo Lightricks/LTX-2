@@ -143,6 +143,7 @@ class KeyframeInterpolationPipeline:
             alloc_trim_strategy=alloc_trim_strategy,
         )
 
+    @torch.inference_mode()
     def __call__(  # noqa: PLR0913
         self,
         prompt: str,
