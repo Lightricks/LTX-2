@@ -151,6 +151,7 @@ class RetakePipeline:
     #  Public entry point                                                     #
     # --------------------------------------------------------------------- #
 
+    @torch.inference_mode()
     def __call__(  # noqa: PLR0913
         self,
         video_path: str,
