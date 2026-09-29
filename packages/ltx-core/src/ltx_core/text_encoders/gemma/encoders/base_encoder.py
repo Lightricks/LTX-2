@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import functools
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
 import torch
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import PreTrainedModel, ProcessorMixin
 
 from ltx_core.loader.module_ops import ModuleOps
@@ -16,6 +18,9 @@ from ltx_core.text_encoders.gemma.gemma_assets import (
     build_gemma_processor,
 )
 from ltx_core.text_encoders.gemma.tokenizer import LTXGemmaTokenizer, PaddingSide
+
+# SDPA backends whose forward pass is reproducible call-to-call on CUDA (cuDNN is not).
+_REPRODUCIBLE_SDPA_BACKENDS = [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
 
 # Sampling decoding for the Gemma 3 self-enhance path.
 GEMMA3_ENHANCE_GENERATION_KWARGS: dict[str, Any] = {"do_sample": True, "temperature": 0.7, "max_new_tokens": 512}
@@ -114,8 +119,12 @@ class LTXGemmaTextEncoder(torch.nn.Module, Disposable):
             gen_kwargs["max_new_tokens"] = max_new_tokens
 
         # fork_rng device pinning is only supported for CUDA; MPS/CPU fork CPU RNG only.
-        fork_devices = [self.model.device] if self.model.device.type == "cuda" else []
-        with torch.inference_mode(), torch.random.fork_rng(devices=fork_devices):
+        on_cuda = self.model.device.type == "cuda"
+        fork_devices = [self.model.device] if on_cuda else []
+        # cuDNN SDPA is not reproducible call-to-call, so a seeded sampling run could return a
+        # different prompt on every call. Keep generation on the reproducible SDPA backends.
+        attention_ctx = sdpa_kernel(_REPRODUCIBLE_SDPA_BACKENDS) if on_cuda else nullcontext()
+        with torch.inference_mode(), torch.random.fork_rng(devices=fork_devices), attention_ctx:
             torch.manual_seed(seed)
             outputs = self.model.generate(**model_inputs, **gen_kwargs)
             generated_ids = outputs[0][len(model_inputs.input_ids[0]) :]
