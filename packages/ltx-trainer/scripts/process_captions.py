@@ -36,6 +36,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 from transformers.utils.logging import disable_progress_bar
 
 from ltx_trainer import logger
+from ltx_trainer.datasets import trim_prompt_latents
 from ltx_trainer.model_loader import embedding_weight_paths, load_embeddings_processor, load_text_encoder
 
 # Disable tokenizers parallelism to avoid warnings
@@ -348,11 +349,14 @@ def compute_captions_embeddings(  # noqa: PLR0913
                     output_dir_path.mkdir(parents=True, exist_ok=True)
 
                     embedding_data = {
-                        "video_prompt_embeds": video_prompt_embeds[0].cpu().contiguous(),
-                        "prompt_attention_mask": prompt_attention_mask[0].cpu().contiguous(),
+                        "video_prompt_embeds": video_prompt_embeds[0],
+                        "prompt_attention_mask": prompt_attention_mask[0],
                     }
                     if audio_prompt_embeds is not None:
-                        embedding_data["audio_prompt_embeds"] = audio_prompt_embeds[0].cpu().contiguous()
+                        embedding_data["audio_prompt_embeds"] = audio_prompt_embeds[0]
+                    # The encode above stays padded to 1024, so values are unchanged; only the real tokens are
+                    # stored (most of the 1024 rows are padding), and PrecomputedDataset pads them back on load.
+                    embedding_data = {k: v.cpu() for k, v in trim_prompt_latents(embedding_data).items()}
 
                     output_file = output_path / output_rel_path
                     _atomic_save(embedding_data, output_file)
