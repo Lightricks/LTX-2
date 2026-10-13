@@ -122,6 +122,7 @@ class T2AOneStagePipeline:
         ctx_p, ctx_n = self.prompt_encoder(
             [prompt, negative_prompt],
             enhance_first_prompt=enhance_prompt,
+            enhance_prompt_seed=seed,
             enhance_static_cache=enhance_static_cache,
             enhance_prompt_image=None,
         )

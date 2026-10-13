@@ -220,6 +220,7 @@ class TI2VidTwoStagesHQPipeline:
         ctx_p, ctx_n = self.prompt_encoder(
             [prompt, negative_prompt],
             enhance_first_prompt=enhance_prompt,
+            enhance_prompt_seed=seed,
             enhance_static_cache=enhance_static_cache,
             enhance_prompt_image=images[0][0] if len(images) > 0 else None,
         )

@@ -260,6 +260,7 @@ class RetakePipeline:
         contexts = self.prompt_encoder(
             prompts_to_encode,
             enhance_first_prompt=enhance_prompt,
+            enhance_prompt_seed=seed,
             enhance_static_cache=enhance_static_cache,
         )
 
