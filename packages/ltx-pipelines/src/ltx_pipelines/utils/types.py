@@ -189,7 +189,10 @@ class OffloadMode(Enum):
     """Weight offloading strategy.
     Controls where model weights reside during inference:
     - ``NONE``: All weights on GPU (no streaming). Fastest inference,
-      requires enough VRAM for the full model (~28 GB for LTX-2).
+      requires enough VRAM for the full model (~28 GB for the 19B LTX-2 in
+      bf16; LTX-2.5 with its text encoder and VAEs resident does not fit an
+      80 GB GPU in bf16, so pair it with quantization, offloading or
+      multi-GPU).
     - ``CPU``: Weights pinned in CPU RAM, streamed layer-by-layer to a
       small GPU buffer. First pass reads from disk; subsequent passes
       reuse the CPU cache. Requires ~36 GB RAM + ~5 GB VRAM.
