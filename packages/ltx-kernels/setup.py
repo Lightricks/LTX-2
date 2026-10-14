@@ -5,8 +5,16 @@ from pathlib import Path
 
 
 def _prefer_pip_cuda_home() -> None:
-    """Point CUDA_HOME at pip nvidia-cuda-nvcc when unset (match torch's CUDA)."""
-    if os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH"):
+    """Point CUDA_HOME at pip nvidia-cuda-nvcc so the build matches torch's CUDA.
+
+    An explicit ``CUDA_HOME`` is honoured as-is. ``CUDA_PATH`` alone is not: some distros
+    export it globally (Arch/CachyOS set ``CUDA_PATH=/opt/cuda``), and letting it win would
+    silently build against a system toolkit whose minor version can differ from the pinned
+    ``nvidia-cuda-nvcc`` / ``nvidia-cuda-cccl`` wheels, which CCCL rejects with "CUDA compiler
+    and CUDA toolkit headers are incompatible". If the pip toolkit is not installed,
+    ``CUDA_PATH`` is left alone for torch's cpp_extension to fall back on.
+    """
+    if os.environ.get("CUDA_HOME"):
         return
     try:
         from importlib.metadata import PackageNotFoundError, distribution  # noqa: PLC0415
@@ -17,6 +25,7 @@ def _prefer_pip_cuda_home() -> None:
     for candidate in (root / "nvidia" / "cu13", root / "nvidia" / "cuda_nvcc"):
         if (candidate / "bin" / "nvcc").is_file():
             os.environ["CUDA_HOME"] = str(candidate)
+            os.environ["CUDA_PATH"] = str(candidate)
             path = os.environ.get("PATH", "")
             bin_dir = str(candidate / "bin")
             if bin_dir not in path.split(os.pathsep):
