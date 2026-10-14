@@ -248,6 +248,11 @@ the results. Block 3 (connectors) is applied during training via
   `prompt_attention_mask`
 - **Legacy format** (from old `_preprocess_text()`): saves `prompt_embeds`, `prompt_attention_mask`
 
+`process_captions.py` stores only the real tokens of each caption (`trim_prompt_latents()` in `datasets.py`); the
+encode itself still pads to 1024, so values are unchanged. `PrecomputedDataset` left-pads them back to 1024 on load
+(`pad_prompt_latents()`). The connector needs exactly 1024 tokens but overwrites every pad row with a learnable
+register, so the result is bit-exact, and older 1024-token caches load unchanged.
+
 The trainer handles both formats in `_training_step()`: if `video_prompt_embeds` is present, it uses the new format;
 otherwise, it duplicates `prompt_embeds` for both modalities (mirroring V1 behavior).
 
