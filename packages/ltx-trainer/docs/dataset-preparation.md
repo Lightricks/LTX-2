@@ -157,6 +157,50 @@ The checkpoint metadata validates that the checkpoint and Gemma root are a compa
 are skipped by default and are not automatically re-encoded. Use the checkpoint's supplied metadata rather than
 adding a version flag.
 
+### Caption embedding size
+
+Each caption is still encoded padded to 1024 tokens, but only its real tokens are stored. `process_captions.py`
+keeps the last `mask.sum()` rows, because padding is on the left, and `PrecomputedDataset` pads them back to 1024 on
+load. The connector replaces every pad row with a learnable register. What the model sees is therefore bit-identical
+to a full 1024-token file, and caches written before this change still load as they are.
+
+For example, one LTX 2.5 dataset holds 108,056 captions, with a median of 242 real tokens and a 95th percentile of 367.
+Its caption latents went from 1,267.4 GiB to 310.0 GiB (−75.5%), or 12.59 MB to 3.08 MB per file. A set of 268,382
+shorter LTX-2.3 captions, with a median of 126 tokens, went from 3,147.9 GiB to 417.6 GiB (−86.7%). The saving
+depends on how much shorter your captions are than 1024 tokens.
+
+Both sets were checked after trimming, 376,438 files in all. Padding each trimmed file back gave exactly the
+stored mask and real-token rows. We also ran 254 of them, against their originals, through the real LTX 2.5 and
+LTX-2.3 embeddings processors, the same `create_embeddings` call the trainer makes. The embeddings were
+bit-equal, with 0 mismatches.
+
+Loading gets faster wherever disk or network is the limit. We timed 2,000 of those captions through
+`PrecomputedDataset` and a `DataLoader` with batch size 4, on a disk that reads about 205 MB/s:
+
+| | 1024-token files | trimmed files |
+| --- | --- | --- |
+| Batch with a cold page cache | 245.5 ms | 60.4 ms (4.1× faster) |
+| Batch with a cold page cache, 16 workers | 245.9 ms | 61.0 ms (4.0× faster) |
+| Batch with a warm page cache, 16 workers | 8.1 ms | 8.4 ms (no change) |
+| Copying the 2,000 files from cloud storage | 135.9 s | 60.7 s (2.2× faster) |
+
+With the files already in memory there is no difference.
+
+To shrink an existing cache without re-encoding:
+
+```python
+from pathlib import Path
+import torch
+from ltx_trainer.datasets import trim_prompt_latents
+
+for p in Path("/path/to/.precomputed/conditions").rglob("*.pt"):
+    d = torch.load(p, weights_only=True)
+    if d["prompt_attention_mask"].shape[-1] == 1024 and not d["prompt_attention_mask"].all():
+        tmp = p.with_suffix(".tmp")
+        torch.save(trim_prompt_latents(d), tmp)
+        tmp.replace(p)
+```
+
 ### 📊 Dataset Format
 
 The trainer supports videos, single images, or a mix of both in the same dataset.

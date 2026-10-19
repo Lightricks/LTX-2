@@ -6,10 +6,42 @@ from einops import rearrange
 from torch import Tensor
 from torch.utils.data import Dataset
 
+from ltx_core.text_encoders.gemma.gemma_assets import TOKENIZER_MAX_LENGTH
 from ltx_trainer import logger
 
 # Constants for precomputed data directories
 PRECOMPUTED_DIR_NAME = ".precomputed"
+
+PROMPT_EMBED_KEYS = ("video_prompt_embeds", "audio_prompt_embeds", "prompt_embeds")
+
+
+def trim_prompt_latents(cond: dict) -> dict:
+    """Keep only the real tokens of a caption latent, the last mask.sum() rows (padding is on the left). Most of a
+    1024-token caption latent is padding, and the connector overwrites every pad row with a learnable register, so
+    the pad rows carry nothing. A length that is a multiple of 128 keeps one pad row, so code without
+    pad_prompt_latents fails the connector's seq_len % 128 assert instead of silently running on a shorter
+    sequence. clone() so torch.save writes just the slice, not the whole 1024-row storage behind the view."""
+    m = cond["prompt_attention_mask"]
+    n = int(m.sum())
+    assert n > 0, "empty mask"
+    assert bool(m[..., -n:].all()), "mask is not a left-padded run of real tokens"
+    k = min(n + (n % 128 == 0), m.shape[-1])
+    out = {key: v[..., -k:, :].clone() if key in PROMPT_EMBED_KEYS else v for key, v in cond.items()}
+    out["prompt_attention_mask"] = m[..., -k:].clone()
+    return out
+
+
+def pad_prompt_latents(cond: dict) -> dict:
+    """Left-pad a trimmed caption latent back to the tokenizer's 1024 tokens. The length is part of the model input
+    (the connector tiles its registers over it and RoPE spans it); the pad values are not, because the connector
+    overwrites every pad row, so zero rows give bit-identical embeddings. No-op on a full 1024-token file."""
+    k = TOKENIZER_MAX_LENGTH - cond["prompt_attention_mask"].shape[-1]
+    if k > 0:
+        for key in PROMPT_EMBED_KEYS:
+            if key in cond:
+                cond[key] = torch.nn.functional.pad(cond[key], (0, 0, k, 0))
+        cond["prompt_attention_mask"] = torch.nn.functional.pad(cond["prompt_attention_mask"], (k, 0))
+    return cond
 
 
 class DummyDataset(Dataset):
@@ -269,6 +301,8 @@ class PrecomputedDataset(Dataset):
                 # Normalize video latent format if this is a latent source
                 if "latent" in dir_name.lower():
                     data = self._normalize_video_latents(data)
+                if "prompt_attention_mask" in data:  # caption latents may be stored trimmed
+                    data = pad_prompt_latents(data)
 
                 result[output_key] = data
             except Exception as e:
