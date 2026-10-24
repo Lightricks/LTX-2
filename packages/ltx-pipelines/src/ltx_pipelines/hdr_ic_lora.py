@@ -226,6 +226,7 @@ class HDRICLoraPipeline:
 
         logger.info("[HDR IC-LoRA] ACEScct ready (vae_dtype=%s)", self.vae_dtype)
 
+    @torch.inference_mode()
     def __call__(
         self,
         video: VideoInput | EXRVideoInput,

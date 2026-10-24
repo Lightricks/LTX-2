@@ -327,6 +327,7 @@ class A2VidPipelineTwoStage:
 
         return make
 
+    @torch.inference_mode()
     def __call__(  # noqa: PLR0913
         self,
         prompt: str,

@@ -149,6 +149,7 @@ class PromptEncoder:
             )
         return gpu_model(self._build_text_encoder(), alloc_trim_strategy=self._alloc_trim_strategy)
 
+    @torch.inference_mode()
     def __call__(
         self,
         prompts: list[str],
