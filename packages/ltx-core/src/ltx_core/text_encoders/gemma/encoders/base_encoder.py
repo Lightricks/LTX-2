@@ -236,8 +236,10 @@ def build_gemma_tokenizer(assets: GemmaAssets) -> LTXGemmaTokenizer:
     )
 
 
-def module_ops_from_gemma_root(gemma_root: str) -> tuple[ModuleOps, ...]:
-    assets = GemmaAssets.load(gemma_root)
+def module_ops_from_gemma_root(gemma_root: str, *, assets: GemmaAssets | None = None) -> tuple[ModuleOps, ...]:
+    """Return asset operations, reusing already-loaded assets when supplied."""
+    if assets is None:
+        assets = GemmaAssets.load(gemma_root)
 
     def load_tokenizer(module: LTXGemmaTextEncoder) -> LTXGemmaTextEncoder:
         module.tokenizer = build_gemma_tokenizer(assets)

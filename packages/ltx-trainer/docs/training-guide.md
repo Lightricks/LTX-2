@@ -1,215 +1,160 @@
 # Training Guide
 
-This guide covers how to run training jobs, from basic single-GPU training to advanced distributed setups and automatic
-model uploads.
+Launch, distribute, monitor, and resume training. Commands assume `packages/ltx-trainer` as the working directory.
+Prepare your [dataset](dataset-preparation.md) and [config](configuration-reference.md) first.
 
 ## ⚡ Basic Training (Single GPU)
-
-After preprocessing your dataset and preparing a configuration file, you can start training using the trainer script:
 
 ```bash
 uv run python scripts/train.py configs/t2v_lora.yaml
 ```
 
-The trainer will:
+The trainer checks the config and, when available, the saved preprocessing settings before loading models.
+During training it generates **validation samples** at configured intervals so you can see what the model is learning
+and catch overfitting. It also saves **checkpoints** that you can use for inference or to continue training.
+Try a small dataset and a few hundred steps before a long run. Use `--disable-progress-bars` to hide terminal progress bars.
 
-1. **Load your configuration** and validate all parameters
-2. **Initialize models** and apply optimizations
-3. **Run the training loop** with progress tracking
-4. **Generate validation videos** (if configured)
-5. **Save the trained weights** in your output directory
+For the built-in strategy, a training **step** means one completed parameter update. With gradient accumulation,
+several batches contribute to that update before the step counter advances.
 
 ### Agent-Assisted Training
 
-If your environment supports repository skills, the
-[`train-model`](../../../.claude/skills/train-model/SKILL.md) skill provides an end-to-end
-orchestrator for this package. It asks what you want the model to learn, maps that intent to
-one of the documented [training modes](training-modes.md), probes your filesystem and GPU,
-prepares/preprocesses the dataset, writes a run-specific config, launches training, and
-monitors the job. It uses the trainer docs as its source of truth and stops for approval before
-captioning, preprocessing, or starting expensive training work.
+In environments with repository skills, [`/train`](../../../.claude/skills/train/SKILL.md) guides mode selection,
+hardware/data checks, preprocessing, launch, and monitoring. It follows these docs and requests approval before
+captioning, preprocessing, or expensive training work.
 
 ### Output Files
 
-**For LoRA training:**
+The trainer writes under `output_dir`:
 
-- `checkpoints/lora_weights_step_00000.safetensors` - LoRA checkpoint weights, with the current step in the filename
-- `training_config.yaml` - Copy of training configuration
-- `samples/` - Generated validation samples (if enabled)
-- `checkpoints/training_state_step_00000.pt` - Optional resume state, depending on `checkpoints.save_training_state`
+```text
+output_dir/
+├── training_config.yaml          # Resolved training configuration
+├── samples/                      # Validation media, if enabled
+│   └── step_000100_1.mp4          # step_<step>_<sample index>.{mp4,png,wav}
+└── checkpoints/
+    └── step_00100/               # One directory per saved step
+        ├── weights.safetensors   # LoRA adapters or full transformer weights
+        ├── state.pt              # Optional resume state
+        └── metadata.json         # Step, W&B run id, resume fingerprint, format version
+```
 
-**For full model fine-tuning:**
+The trainer first writes a temporary checkpoint directory, then renames it when complete. This prevents an interrupted
+save from appearing as a usable checkpoint. `state.pt` and `metadata.json` are present together when resume state is enabled.
 
-- `checkpoints/model_weights_step_00000.safetensors` - Full model checkpoint weights, with the current step in the filename
-- `training_config.yaml` - Copy of training configuration
-- `samples/` - Generated validation samples (if enabled)
-- `checkpoints/training_state_step_00000.pt` - Optional resume state, depending on `checkpoints.save_training_state`
+> [!IMPORTANT]
+> **Save interval:** `checkpoints.interval: null` disables intermediate saves; a final checkpoint is still saved on
+> normal completion. Set a positive interval to save checkpoints during the run for recovery after interruptions.
+
+### Resume Training
+
+Weights contain what the model has learned. Training state also tracks the step, the learning-rate schedule, and
+optionally the optimizer's running statistics. Restoring that state lets you continue the run rather than start a new
+one from the saved weights. RNG means random-number-generator state.
+
+Set `checkpoints.load_checkpoint` to a run's `output_dir`, its `checkpoints/` directory (selects the latest checkpoint),
+or a specific `step_NNNNN/` directory. The saved `checkpoints.save_training_state` setting determines what resumes:
+
+| Saved state | Restored behavior |
+|-------------|-------------------|
+| `"full"` | Weights, step, scheduler, RNG, and optimizer on single GPU/DDP. |
+| `"minimal"` | Weights, step, scheduler, and RNG; optimizer starts fresh. |
+| `"off"` | Weights only; no `state.pt` or `metadata.json`, so the training state and step counter cannot resume. |
+
+> [!NOTE]
+> **Resume limits:** FSDP full saves omit optimizer state and warn; the optimizer starts fresh on resume.
+> RNG state is restored only in single-process runs; multi-process runs do not restore each process's RNG state.
+
+For example, merge this into the run config to continue a checkpoint at step 1,000 for another 500 steps:
+
+```yaml
+checkpoints:
+  load_checkpoint: "outputs/my_run/checkpoints/step_01000"
+optimization:
+  steps: 1500  # Total target step, not additional steps
+```
+
+> [!WARNING]
+> **Confirm resume in the logs:** Look for **“Resuming training from step …”** to verify that the step counter was restored.
+>
+> - Pointing directly at `weights.safetensors`, or setting `checkpoints.no_resume: true`, loads weights and starts at step 0.
+> - Missing training state or incompatible resume metadata also falls back to saved weights at step 0.
+> - A missing checkpoint path or empty directory warns and starts from the base model.
+
+Use the **directory** when you intend to continue a run. Older flat checkpoint layouts are rejected. See
+[checkpoint fields](configuration-reference.md#checkpointsconfig-checkpoints) for save cadence, retention, and precision.
 
 ## 🖥️ Distributed / Multi-GPU Training
 
-We use Hugging Face 🤗 [Accelerate](https://huggingface.co/docs/accelerate/index) for multi-GPU DDP and FSDP.
+The trainer uses [Accelerate](https://huggingface.co/docs/accelerate/index) to run one process per GPU. Choose how the
+model is distributed:
 
-### Configure Accelerate
+- **DDP (Distributed Data Parallel)** keeps a full model copy on each GPU and splits batches across them.
+- **FSDP (Fully Sharded Data Parallel)** splits model state across GPUs to reduce memory per GPU.
+  Each GPU still needs enough memory for its local computation.
 
-Run the interactive wizard once to set up your environment (DDP / FSDP, GPU count, etc.):
+Start with one of the supplied profiles; the compile variants also enable `torch.compile`:
+
+| Profile | Config |
+|---------|--------|
+| DDP | [ddp.yaml](../configs/accelerate/ddp.yaml) |
+| DDP + `torch.compile` | [ddp_compile.yaml](../configs/accelerate/ddp_compile.yaml) |
+| FSDP | [fsdp.yaml](../configs/accelerate/fsdp.yaml) |
+| FSDP + `torch.compile` | [fsdp_compile.yaml](../configs/accelerate/fsdp_compile.yaml) |
+
+Launch with a profile, visible GPUs, and a matching process count:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 \
+uv run accelerate launch --config_file configs/accelerate/ddp.yaml --num_processes 2 \
+  scripts/train.py configs/t2v_lora.yaml
+```
+
+Use another config from the table for FSDP or compilation. Without `--num_processes`, the profile's process count
+applies; `CUDA_VISIBLE_DEVICES` selects available devices and should agree with that count. Compile profiles use
+Inductor via Accelerate's `dynamo_config`; FSDP profiles auto-wrap `BasicAVTransformerBlock`.
+
+Effective global batch size is `optimization.batch_size × gradient_accumulation_steps × num_processes`.
+For example, batch size 1 with 4 accumulation batches on 2 GPUs gives an effective batch of **8 samples per update**.
+Accumulation processes those batches in sequence, allowing a larger effective batch without holding them all in memory.
+
+### Use a Default Accelerate Profile
+
+Alternatively, run the interactive wizard once:
 
 ```bash
 uv run accelerate config
 ```
 
-This stores your preferences in `~/.cache/huggingface/accelerate/default_config.yaml`.
-
-### Use the Provided Accelerate Configs (Recommended)
-
-We include ready-to-use Accelerate config files in `configs/accelerate/`:
-
-- [ddp.yaml](../configs/accelerate/ddp.yaml) — Standard DDP
-- [ddp_compile.yaml](../configs/accelerate/ddp_compile.yaml) — DDP with `torch.compile` (Inductor)
-- [fsdp.yaml](../configs/accelerate/fsdp.yaml) — Standard FSDP (auto-wraps `BasicAVTransformerBlock`)
-- [fsdp_compile.yaml](../configs/accelerate/fsdp_compile.yaml) — FSDP with `torch.compile` (Inductor)
-
-Launch with a specific config using `--config_file`:
+It writes `~/.cache/huggingface/accelerate/default_config.yaml`. Launch without `--config_file` to use it:
 
 ```bash
-# DDP (2 GPUs shown as example)
-CUDA_VISIBLE_DEVICES=0,1 \
-uv run accelerate launch --config_file configs/accelerate/ddp.yaml \
-  scripts/train.py configs/t2v_lora.yaml
-
-# DDP + torch.compile
-CUDA_VISIBLE_DEVICES=0,1 \
-uv run accelerate launch --config_file configs/accelerate/ddp_compile.yaml \
-  scripts/train.py configs/t2v_lora.yaml
-
-# FSDP (4 GPUs shown as example)
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-uv run accelerate launch --config_file configs/accelerate/fsdp.yaml \
-  scripts/train.py configs/t2v_lora.yaml
-
-# FSDP + torch.compile
-CUDA_VISIBLE_DEVICES=0,1,2,3 \
-uv run accelerate launch --config_file configs/accelerate/fsdp_compile.yaml \
-  scripts/train.py configs/t2v_lora.yaml
-```
-
-**Notes:**
-
-- The number of processes is taken from the Accelerate config (`num_processes`). Override with `--num_processes X` or
-  restrict GPUs with `CUDA_VISIBLE_DEVICES`.
-- The compile variants enable `torch.compile` with the Inductor backend via Accelerate's `dynamo_config`.
-- FSDP configs auto-wrap the transformer blocks (`fsdp_transformer_layer_cls_to_wrap: BasicAVTransformerBlock`).
-
-### Launch with Your Default Accelerate Config
-
-If you prefer to use your default Accelerate profile:
-
-```bash
-# Use settings from your default accelerate config
 uv run accelerate launch scripts/train.py configs/t2v_lora.yaml
-
-# Override number of processes on the fly (e.g., 2 GPUs)
-uv run accelerate launch --num_processes 2 scripts/train.py configs/t2v_lora.yaml
-
-# Select specific GPUs
-CUDA_VISIBLE_DEVICES=0,1 uv run accelerate launch scripts/train.py configs/t2v_lora.yaml
 ```
 
-> [!TIP]
-> You can disable the in-terminal progress bars with `--disable-progress-bars` flag in the trainer CLI if desired.
-
-### Benefits of Distributed Training
-
-- **Faster training**: Distribute workload across multiple GPUs
-- **Larger effective batch sizes**: Combine gradients from multiple GPUs
-- **Memory efficiency**: Each GPU handles a portion of the batch
-
-> [!NOTE]
-> Distributed training requires that all GPUs have sufficient memory for the model and batch size. The effective batch
-> size becomes `batch_size × num_processes`.
-
-## 🤗 Pushing Models to Hugging Face Hub
-
-You can automatically push your trained models to the Hugging Face Hub by adding the following to your configuration:
-
-```yaml
-hub:
-  push_to_hub: true
-  hub_model_id: "your-username/your-model-name"
-```
-
-### Prerequisites
-
-Before pushing, make sure you:
-
-1. **Have a Hugging Face account** - Sign up at [huggingface.co](https://huggingface.co)
-2. **Are logged in** via `huggingface-cli login` or have set the `HUGGING_FACE_HUB_TOKEN` environment variable
-3. **Have write access** to the specified repository (it will be created if it doesn't exist)
-
-### Login Options
-
-**Option 1: Interactive login**
-
-```bash
-uv run huggingface-cli login
-```
-
-**Option 2: Environment variable**
-
-```bash
-export HUGGING_FACE_HUB_TOKEN="your_token_here"
-```
-
-### What Gets Uploaded
-
-The trainer will automatically:
-
-- **Create a model card** with training details and sample outputs
-- **Upload model weights**
-- **Push sample videos as GIFs** in the model card
-- **Include training configuration and prompts**
+The same `--num_processes` override and `CUDA_VISIBLE_DEVICES` selection apply.
 
 ## 📊 Weights & Biases Logging
 
-Enable experiment tracking with W&B by adding to your configuration:
+Enable W&B to track loss, learning rate, validation media, configuration, and progress in one run dashboard:
 
 ```yaml
 wandb:
   enabled: true
   project: "ltx-2-trainer"
-  entity: null  # Your W&B username or team
-  tags: [ "ltx2", "lora" ]
+  entity: null  # Your W&B username or team; null uses the default account
+  tags: ["ltx2", "lora"]
   log_validation_videos: true
 ```
 
-This will log:
-
-- Training loss and learning rate
-- Validation videos
-- Model configuration
-- Training progress
+Use consistent validation prompts to compare checkpoints.
 
 ## 🚀 Next Steps
 
 After training completes:
 
-- **Run inference with your trained LoRA** - The [`ltx-pipelines`](../../ltx-pipelines/) package provides
-  production-ready inference
-  pipelines that support loading custom LoRAs. Available pipelines include text-to-video, image-to-video,
-  IC-LoRA video-to-video, and more. See the [`ltx-pipelines`](../../ltx-pipelines/) package for usage details.
-- **Test your model** with validation prompts
-- **Iterate and improve** based on validation results
-- **Share your results** by pushing to Hugging Face Hub
-
-## 💡 Tips for Successful Training
-
-- **Start small**: Begin with a small dataset and a few hundred steps to verify everything works
-- **Monitor validation**: Keep an eye on validation samples to catch overfitting
-- **Adjust learning rate**: Lower learning rates often produce better results
-- **Use gradient checkpointing**: Essential for training with limited GPU memory
-- **Save checkpoints**: Regular checkpoints help recover from interruptions
-
-## Need Help?
-
-If you encounter issues during training, see the [Troubleshooting Guide](troubleshooting.md).
-
-Join our [Discord community](https://discord.gg/ltxplatform) for real-time help!
+- Review your samples and refine [validation prompts and settings](configuration-reference.md#validation-content)
+  to compare checkpoints and catch overfitting.
+- Run your trained weights with a suitable [inference pipeline](training-modes.md#-using-trained-models-for-inference).
+- Use [Troubleshooting](troubleshooting.md) to address failures, memory issues, or poor validation outputs.
+- Share results or discuss your run on the [community Discord](https://discord.gg/ltxplatform).

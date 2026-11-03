@@ -9,12 +9,9 @@ from __future__ import annotations
 import re
 
 import torch
-from ltx_kernels import nvfp4
 from torch import nn
 
-from ltx_core.loader.module_ops import ModuleOps
-from ltx_core.loader.sd_ops import KeyValueOperationResult, SDOps
-from ltx_core.model.transformer import LTXModel
+from ltx_core.quantization.nvfp4.kernels import require_nvfp4
 from ltx_core.quantization.nvfp4.linear import NVFP4Linear
 from ltx_core.quantization.nvfp4.types import ActScale
 
@@ -44,6 +41,11 @@ def _is_ltx2_fv_nvfp4_layer(name: str) -> bool:
     return _LAYER_PATTERN.match(name) is not None
 
 
+def scale_shape(rows: int, width: int) -> tuple[int, int]:
+    """Return the cuBLAS-tiled NVFP4 block-scale shape for a 1x16 operand."""
+    return ((rows + 127) // 128 * 128, ((width // 16) + 3) // 4 * 4)
+
+
 def quantize_bf16_weight_to_nvfp4(
     weight: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -55,37 +57,13 @@ def quantize_bf16_weight_to_nvfp4(
     elif w.dtype != torch.bfloat16:
         w = w.to(dtype=torch.bfloat16)
 
+    nvfp4 = require_nvfp4()
     decode = nvfp4.per_tensor_decode_scale(w)
     weight_fp4, weight_scale = nvfp4.quantize_nvfp4(w, decode)
     return (
         weight_fp4.to(device=orig_device),
         weight_scale.to(device=orig_device),
         decode.to(device=orig_device),
-    )
-
-
-def build_convert_sd_ops() -> SDOps:
-    """Quantize FV-allowlisted ``.weight`` tensors to NVFP4 at load; emit scale companions."""
-
-    def _on_weight(key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
-        if not _is_ltx2_fv_nvfp4_layer(key.removesuffix(".weight")):
-            return [KeyValueOperationResult(key, value)]
-        if value.dim() != 2 or value.dtype not in (torch.bfloat16, torch.float16, torch.float32):
-            return [KeyValueOperationResult(key, value)]
-
-        weight_fp4, weight_scale, alpha = quantize_bf16_weight_to_nvfp4(value)
-        scale_key = key.replace(".weight", ".weight_scale")
-        scale_2_key = key.replace(".weight", ".weight_scale_2")
-        return [
-            KeyValueOperationResult(key, weight_fp4),
-            KeyValueOperationResult(scale_key, weight_scale),
-            KeyValueOperationResult(scale_2_key, alpha),
-        ]
-
-    return SDOps("NVFP4_CONVERT_WEIGHTS").with_kv_operation(
-        key_prefix="transformer_blocks.",
-        key_suffix=".weight",
-        operation=_on_weight,
     )
 
 
@@ -111,16 +89,3 @@ def swap_convert_linears(
     for parent, attr_name, linear in replacements:
         setattr(parent, attr_name, NVFP4Linear.from_linear(linear, act_scale=act_scale))
     return model
-
-
-def get_convert_module_ops(
-    *,
-    act_scale: ActScale = ActScale.FIXED_1,
-) -> tuple[ModuleOps, ...]:
-    return (
-        ModuleOps(
-            name="nvfp4_convert_swap",
-            matcher=lambda model: isinstance(model, LTXModel),
-            mutator=lambda model: swap_convert_linears(model, act_scale=act_scale),
-        ),
-    )

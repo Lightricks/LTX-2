@@ -88,3 +88,5 @@ wandb/
 # Binary files
 *.o
 *.so
+gpu-queue-output/
+.gpu-queue-download-*/

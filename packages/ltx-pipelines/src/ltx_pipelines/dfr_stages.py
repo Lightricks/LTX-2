@@ -186,10 +186,7 @@ def _prepare_stage1_specs(
 ) -> _PreparedDenoise:
     video_fps = conditioning_fps(video_shape.fps)
     video_latent = create_initial_video_latent(
-        width=video_shape.width,
-        height=video_shape.height,
-        frames=video_shape.frames,
-        fps=video_fps,
+        pixel_shape=video_shape._replace(fps=video_fps),
         device=device,
         dtype=dtype,
         scale_factors=scale_factors,
@@ -321,7 +318,7 @@ def denoise_stage1(  # noqa: PLR0913
         scale_factors=stage.video_scale_factors,
     )
     video_state, audio_state = stage(
-        denoiser=SimpleDenoiser(video_context, audio_context),
+        denoiser=SimpleDenoiser(),
         sigmas=sigmas,
         noiser=noiser,
         modalities=VideoAudio(video=prepared.video, audio=prepared.audio),
@@ -381,7 +378,7 @@ def denoise_stage2(  # noqa: PLR0913
         dtype=dtype,
     )
     video_state, audio_state = stage(
-        denoiser=SimpleDenoiser(video_context, audio_context),
+        denoiser=SimpleDenoiser(),
         sigmas=sigmas,
         noiser=noiser,
         modalities=VideoAudio(video=prepared.video, audio=prepared.audio),
@@ -655,7 +652,7 @@ def _denoise_temporal_tile(  # noqa: PLR0913
     )
     denoise = prepared.denoise
     tile_state, _ = stage(
-        denoiser=SimpleDenoiser(video_context, audio_context),
+        denoiser=SimpleDenoiser(),
         sigmas=sigmas,
         noiser=noiser,
         modalities=VideoAudio(video=denoise.video, audio=denoise.audio),
@@ -974,8 +971,6 @@ def _execute_tiled_spatial_denoise(
     latent: torch.Tensor,
     tiling: TileCountConfig,
     sigmas: torch.Tensor,
-    video_context: torch.Tensor,
-    audio_context: torch.Tensor,
     seed: int,
     device: torch.device,
     loop: Callable[..., tuple[LatentState | None, LatentState | None]] | None = None,
@@ -998,7 +993,7 @@ def _execute_tiled_spatial_denoise(
         tiling.width,
     )
     video_state, _ = tiled_stage(
-        denoiser=SimpleDenoiser(video_context, audio_context),
+        denoiser=SimpleDenoiser(),
         sigmas=sigmas.to(dtype=torch.float32),
         noiser=GaussianNoiser(generator=torch.Generator(device=device).manual_seed(seed + 2000)),
         modalities=VideoAudio(video=prepared.video, audio=prepared.audio),
@@ -1051,79 +1046,73 @@ def _run_epilogue_windows(  # noqa: PLR0913
         width=DimensionTilingConfig(epilogue_tile_count(int(latent.shape[4])), EPILOGUE_SPATIAL_OVERLAP),
     )
     scale_factors = stage.video_scale_factors
-    # One transformer for every window and tile instead of a build per tile.
-    with stage.resident():
-        for index, window in enumerate(windows):
-            prepared_window = _prepare_epilogue_window_specs(
-                index=index,
-                num_windows=len(windows),
-                window=window,
-                prefix=prefixes[index],
-                latent=latent,
-                guide=guide,
-                plane_at=keyframes,
-                window_images=window_images[index],
-                keyframes=keyframes,
-                opening_plane=opening_plane,
-                previous=previous,
-                downscale_factor=downscale_factor,
-                canvas=canvas,
-                audio_latent=audio_latent,
-                source_duration=source_duration,
+    for index, window in enumerate(windows):
+        prepared_window = _prepare_epilogue_window_specs(
+            index=index,
+            num_windows=len(windows),
+            window=window,
+            prefix=prefixes[index],
+            latent=latent,
+            guide=guide,
+            plane_at=keyframes,
+            window_images=window_images[index],
+            keyframes=keyframes,
+            opening_plane=opening_plane,
+            previous=previous,
+            downscale_factor=downscale_factor,
+            canvas=canvas,
+            audio_latent=audio_latent,
+            source_duration=source_duration,
+            video_context=video_context,
+            audio_context=audio_context,
+            noise_scale=float(coarse_sigmas[0].item()),
+            temporal_scale=temporal_scale,
+            scale_factors=scale_factors,
+            device=device,
+            dtype=dtype,
+        )
+        window_latent = _execute_tiled_spatial_denoise(
+            stage,
+            prepared=prepared_window.denoise,
+            latent=prepared_window.window_latent,
+            tiling=tiling,
+            sigmas=coarse_sigmas,
+            seed=seed + 100 * index,
+            device=device,
+            loop=loop,
+        )
+        if fine_sigmas is not None:
+            audio_latent_in = prepared_window.denoise.audio.latent
+            if audio_latent_in is None:
+                raise RuntimeError("Epilogue window prepared no audio latent")
+            fine_prepared = _prepare_tiled_spatial_denoise_specs(
+                latent=window_latent,
+                conditionings=list(prepared_window.denoise.video.conditionings),
                 video_context=video_context,
                 audio_context=audio_context,
-                noise_scale=float(coarse_sigmas[0].item()),
-                temporal_scale=temporal_scale,
+                audio_latent=audio_latent_in,
+                fps=prepared_window.denoise.canvas.fps,
                 scale_factors=scale_factors,
                 device=device,
                 dtype=dtype,
+                noise_scale=0.0,
             )
             window_latent = _execute_tiled_spatial_denoise(
                 stage,
-                prepared=prepared_window.denoise,
-                latent=prepared_window.window_latent,
+                prepared=fine_prepared,
+                latent=window_latent,
                 tiling=tiling,
-                sigmas=coarse_sigmas,
-                video_context=video_context,
-                audio_context=audio_context,
+                sigmas=fine_sigmas,
                 seed=seed + 100 * index,
                 device=device,
                 loop=loop,
             )
-            if fine_sigmas is not None:
-                audio_latent_in = prepared_window.denoise.audio.latent
-                if audio_latent_in is None:
-                    raise RuntimeError("Epilogue window prepared no audio latent")
-                fine_prepared = _prepare_tiled_spatial_denoise_specs(
-                    latent=window_latent,
-                    conditionings=list(prepared_window.denoise.video.conditionings),
-                    video_context=video_context,
-                    audio_context=audio_context,
-                    audio_latent=audio_latent_in,
-                    fps=prepared_window.denoise.canvas.fps,
-                    scale_factors=scale_factors,
-                    device=device,
-                    dtype=dtype,
-                    noise_scale=0.0,
-                )
-                window_latent = _execute_tiled_spatial_denoise(
-                    stage,
-                    prepared=fine_prepared,
-                    latent=window_latent,
-                    tiling=tiling,
-                    sigmas=fine_sigmas,
-                    video_context=video_context,
-                    audio_context=audio_context,
-                    seed=seed + 100 * index,
-                    device=device,
-                    loop=loop,
-                )
-            prefix = prepared_window.prefix
-            previous = (
-                prefix.video_start_cell - 1 if prefix else prepared_window.interval_start,
-                window_latent.detach(),
-            )
-            stitched.append(window_latent[:, :, prepared_window.pinned_cells :])
+        prefix = prepared_window.prefix
+        previous = (
+            prefix.video_start_cell - 1 if prefix else prepared_window.interval_start,
+            window_latent.detach(),
+        )
+        stitched.append(window_latent[:, :, prepared_window.pinned_cells :])
     return torch.cat(stitched, dim=2)
 
 

@@ -543,7 +543,7 @@ class VocoderWithBWE(nn.Module, Disposable):
         self.output_sampling_rate = output_sampling_rate
         self.hop_length = hop_length
         # Compute the resampler on CPU so the sinc filter is materialized even when
-        # the model is constructed on meta device (SingleGPUModelBuilder pattern).
+        # the model is constructed on the meta device by the unit builder.
         # The filter is not stored in the checkpoint (persistent=False).
         with torch.device("cpu"):
             self.resampler = UpSample1d(

@@ -2,7 +2,8 @@
 
 Model downloads for LTX-2.3. Each checkpoint below is a single file bundling the
 transformer, the video and audio VAEs, and the text projection; the Gemma text encoder is
-downloaded separately (listed below).
+downloaded separately (listed below) and stays under Google's license. These checkpoints are
+under the [LTX-2 Community License](LICENSE-2).
 
 Every pipeline in this repository runs on these checkpoints. If you want LTX-2.5 instead, start
 from the [Quick Start](README.md#-quick-start) -- its weights are split per component and are not

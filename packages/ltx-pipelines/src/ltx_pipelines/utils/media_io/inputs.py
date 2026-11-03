@@ -1,4 +1,4 @@
-"""Ingest handles for HDR IC-LoRA: MP4/MOV vs an EXR-frame folder."""
+"""Ingest handles for media files: MP4/MOV video, EXR-frame folders, and audio."""
 
 from __future__ import annotations
 
@@ -23,3 +23,11 @@ class EXRVideoInput:
     dir: Path
     color_space: EXRColorSpace
     frame_rate: float
+
+
+@dataclass(frozen=True, slots=True)
+class AudioInput:
+    """Audio file, or the audio track of a video, read from ``start_time`` seconds."""
+
+    path: Path
+    start_time: float = 0.0

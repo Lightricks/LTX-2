@@ -1,5 +1,6 @@
                   LTX-2.x Community License Agreement
                      License date: August 11, 2026
+                     As amended: October 29, 2026
 
 
    By downloading, using, accessing or distributing any portion or
@@ -16,7 +17,7 @@
           documentation, tutorials, examples, configuration files and
           other materials made available by Licensor together with the
           LTX-2.x model weights and parameters, in each case as
-          distributed by Licensor.
+          distributed by Licensor, but excluding the Apache Code.
 
       1.3 "Control" means the direct or indirect ownership of more than
           fifty percent (50%) of the voting securities or other
@@ -42,7 +43,10 @@
           parameters, or checkpoints derived from LTX-2.x; (ii)
           derivative model architectures that incorporate or are based
           upon LTX-2.x's architecture; and (iii) any modified or
-          extended versions of the Complementary Materials.
+          extended versions of the Complementary Materials. Derivatives
+          of LTX-2.x do not include the Apache Code or any
+          modification of it, which are governed solely by the Apache
+          License.
 
       1.6 "Entity" means any individual, corporation, partnership,
           limited liability company, or other legal entity. For purposes
@@ -71,9 +75,10 @@
           enabling code, accompanying source code, scripts, and all
           other elements of the foregoing distributed and made publicly
           available by LTX (including, for example, at
-          https://github.com/Lightricks/LTX-2). This license is
-          applicable to all LTX-2.5 versions released since August 11,
-          2026, and all future releases of LTX-2.x under this license.
+          https://github.com/Lightricks/LTX-2, but excluding the
+          Apache Code). This license is applicable to all LTX-2.5
+          versions released since August 11, 2026, and all future
+          releases of LTX-2.x under this license.
 
       1.10 "Output" means the results of operating LTX-2.x as embodied
            in informational content resulting therefrom.
@@ -84,6 +89,16 @@
            LTX-2.x for whichever purpose and in any field of use,
            including usage of LTX-2.x in an end-use application - e.g.
            chatbot, translator, image generator.
+
+      1.12 "Apache Code" means the source code made available by
+           Licensor that (a) loads and runs LTX-2.x for inference or (b)
+           trains or fine-tunes LTX-2.x, consisting solely of
+           https://github.com/lightricks/ltx-2 and identified by
+           Licensor as licensed under the Apache License. The Apache Code does not include trained
+           model weights, parameters, or any other element of LTX-2.x.
+
+      1.13 "Apache License" means the Apache License, Version 2.0
+           (https://www.apache.org/licenses/LICENSE-2.0).
 
    2. Grant of License.
 
@@ -148,6 +163,16 @@
           LTX-2.x created or used pursuant to this Section 2.2 remain
           subject to the terms of this Agreement, including Section 1.5.
 
+      2.3 Apache Code. The Apache Code is not licensed under this
+          Agreement. It is licensed to you separately under the Apache
+          License, and nothing in this Agreement limits your rights in
+          the Apache Code under the Apache License. The Apache License
+          grants no right in LTX-2.x. Any use of LTX-2.x, including use
+          together with the Apache Code or any modified version of it
+          (for example, to run, train or fine-tune LTX-2.x), remains
+          subject to this Agreement, including Sections 2, 4 and 6 and
+          Attachment A.
+
    3. Distribution and Redistribution. You may host for third parties
       remote access purposes (e.g. software-as-a-service), reproduce and
       distribute copies of LTX-2.x or Derivatives of LTX-2.x thereof in
@@ -168,8 +193,8 @@
           Derivatives of LTX-2.x a copy of this Agreement, including all
           attachments and use policies. Any Derivative of LTX-2.x (as
           defined in Section 1.5, including but not limited to
-          fine-tuned weights, modified training code, models trained on
-          Outputs, or any other derivative) must be distributed
+          fine-tuned weights, models trained on Outputs, or any other
+          derivative) must be distributed
           exclusively under the terms of this Agreement, subject to
           Section 3.6, with a complete copy of this Agreement included;
 
@@ -259,8 +284,10 @@
       disable, alter, or circumvent, any safety or security measures,
       disclosures, metadata, watermarking, content provenance, latent
       disclosure, or other transparency features or functionalities
-      included or embedded within LTX-2.x or any Derivative of LTX-2.x,
-      or applied to any Output, in furtherance of AI Regulations,
+      included or embedded within LTX-2.x or any Derivative of LTX-2.x
+      (including where implemented in the Apache Code or any
+      other software through which LTX-2.x is run), or applied to any
+      Output, in furtherance of AI Regulations,
       including any capability of LTX-2.x to include latent disclosures
       in Outputs, and you shall include equivalent obligations in any
       agreement governing your distribution of LTX-2.x or any Derivative

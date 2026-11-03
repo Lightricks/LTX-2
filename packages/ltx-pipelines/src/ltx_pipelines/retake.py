@@ -10,7 +10,7 @@ from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.conditioning.types.noise_mask_cond import TemporalRegionMask
 from ltx_core.loader import LoraPathStrengthAndSDOps
-from ltx_core.loader.registry import Registry
+from ltx_core.loader.registry import ModelRegistry
 from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig, get_video_chunks_number
 from ltx_core.model.video_vae.transformer import DiffVAEMode
@@ -38,7 +38,6 @@ from ltx_pipelines.utils.helpers import (
     create_initial_audio_latent,
     ensure_tiling_config,
     get_device,
-    tiling_scale_factors_for_vae,
     video_latent_from_file,
 )
 from ltx_pipelines.utils.media_io import (
@@ -84,7 +83,7 @@ class RetakePipeline:
         loras: list[LoraPathStrengthAndSDOps],
         device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
-        registry: Registry | None = None,
+        registry: ModelRegistry | None = None,
         distilled: bool = True,
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
@@ -94,6 +93,7 @@ class RetakePipeline:
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
+        registry = registry or ModelRegistry()
         self.distilled = distilled
         if not distilled:
             self._scheduler = LTX2Scheduler()
@@ -222,10 +222,8 @@ class RetakePipeline:
 
         output_shape = get_videostream_metadata(video_path, fps=fps)
 
-        scale_factors = tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path)
         tiling_config = ensure_tiling_config(
             tiling_config,
-            scale_factors=scale_factors,
             vae_checkpoint_path=self.video_decoder.checkpoint_path,
             video_shape=VideoPixelShape(
                 batch=1,
@@ -236,6 +234,7 @@ class RetakePipeline:
             ),
             diffvae_optimization=self.video_decoder.diffvae_optimization,
             device=self.device,
+            vae_dtype=vae_dtype,
         )
 
         initial_video_latent = self.image_conditioner(
@@ -300,10 +299,7 @@ class RetakePipeline:
         sigmas = sigmas.to(dtype=torch.float32, device=self.device)
 
         if self.distilled:
-            denoiser = SimpleDenoiser(
-                v_context=v_context_p,
-                a_context=a_context_p,
-            )
+            denoiser = SimpleDenoiser()
         else:
             v_context_n, a_context_n = contexts[1].video_encoding, contexts[1].audio_encoding
             video_guider = MultiModalGuider(
@@ -315,8 +311,6 @@ class RetakePipeline:
                 negative_context=a_context_n,
             )
             denoiser = GuidedDenoiser(
-                v_context=v_context_p,
-                a_context=a_context_p,
                 video_guider=video_guider,
                 audio_guider=audio_guider,
             )

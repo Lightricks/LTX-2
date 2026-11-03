@@ -46,12 +46,13 @@ from ltx_pipelines.multigpu.vae_builders import DistributedDecoderBuilder
 from ltx_core.tiling import TileCountConfig, DimensionTilingConfig
 
 DistributedDecoderBuilder(
-    inner: BuilderProtocol,        # the block's single-GPU decoder builder
+    inner: SimpleBuilder,          # the block's decoder builder
     queue: Queue,                  # spawn-context mp.Queue, shared across ranks (CUDA IPC)
     vae_group: dist.ProcessGroup,  # self.groups.vae_group
     vae_tiling: TileCountConfig,   # inter-GPU split
     driver_rank: int,              # rank that collects + assembles (usually 0)
-    registry: Registry,
+    registry: ModelRegistry,
+    num_temporal_batches: int | None = None,
 )
 ```
 

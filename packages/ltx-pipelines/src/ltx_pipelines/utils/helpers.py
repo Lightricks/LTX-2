@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Sequence
 from dataclasses import replace
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import torch
@@ -13,7 +15,7 @@ from ltx_core.conditioning import (
     VideoGeneratedKeyframeSlots,
 )
 from ltx_core.devices import activation_budget_bytes, cleanup_accelerator_memory, get_preferred_device
-from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
+from ltx_core.loader.checkpoint import CheckpointReader
 from ltx_core.model.audio_vae import encode_audio
 from ltx_core.model.transformer import Modality, TokenTimesteps
 from ltx_core.model.video_vae import AutoTiling, TileSizeConfig, TilingConfig, VideoEncoder
@@ -68,16 +70,12 @@ def cleanup_memory() -> None:
 
 def create_initial_video_latent(
     *,
-    width: int,
-    height: int,
-    frames: int,
-    fps: float,
+    pixel_shape: VideoPixelShape,
     device: torch.device,
     dtype: torch.dtype,
     scale_factors: SpatioTemporalScaleFactors,
 ) -> torch.Tensor:
-    """Allocate a zero video latent from pixel ``width`` / ``height`` / ``frames``."""
-    pixel_shape = VideoPixelShape(batch=1, frames=frames, height=height, width=width, fps=fps)
+    """Allocate a zero video latent for ``pixel_shape``."""
     shape = VideoLatentShape.from_pixel_shape(pixel_shape, scale_factors=scale_factors)
     return torch.zeros(*shape.to_torch_shape(), device=device, dtype=dtype)
 
@@ -106,10 +104,7 @@ def create_initial_audio_latent(
 
 def create_initial_av_latents(
     *,
-    width: int,
-    height: int,
-    frames: int,
-    fps: float,
+    pixel_shape: VideoPixelShape,
     device: torch.device,
     dtype: torch.dtype,
     video_scale_factors: SpatioTemporalScaleFactors,
@@ -119,15 +114,14 @@ def create_initial_av_latents(
     follows the video canvas those factors produce.
     """
     video_latent = create_initial_video_latent(
-        width=width,
-        height=height,
-        frames=frames,
-        fps=fps,
+        pixel_shape=pixel_shape,
         device=device,
         dtype=dtype,
         scale_factors=video_scale_factors,
     )
-    return video_latent, create_initial_audio_latent(video_latent, fps=fps, video_scale_factors=video_scale_factors)
+    return video_latent, create_initial_audio_latent(
+        video_latent, fps=pixel_shape.fps, video_scale_factors=video_scale_factors
+    )
 
 
 # Historical Conv VAE ``TilingConfig.default()`` spatial long-side + temporal chunk
@@ -140,7 +134,8 @@ def tiling_scale_factors_for_vae(vae_checkpoint_path: str) -> SpatioTemporalScal
     """Scale factors decode will pass to ``to_splitters`` for this checkpoint."""
     if not is_diffusion_video_vae(vae_checkpoint_path):
         return VIDEO_SCALE_FACTORS
-    metadata = SafetensorsModelStateDictLoader().metadata(vae_checkpoint_path)
+    with CheckpointReader.open((Path(vae_checkpoint_path),)) as reader:
+        metadata = reader.read_checkpoint_metadata()
     vae_config = metadata.get("config", {}).get("vae", {})
     return diffvae_tiling_geometry_from_vae_config(vae_config)["pixel_scale"]
 
@@ -155,6 +150,7 @@ def tiling_config_for_vae(
     device: torch.device | None = None,
     free_bytes: int | None = None,
     keyframes: bool = False,
+    vae_dtype: torch.dtype = torch.bfloat16,
 ) -> TilingConfig:
     """Decode tiling for pipelines.
     Conv VAE: aspect-coupled long-side 768/64 + temporal 80/24.
@@ -172,10 +168,11 @@ def tiling_config_for_vae(
             frames=_CONV_AUTO_FRAMES,
         )
 
-    metadata = SafetensorsModelStateDictLoader().metadata(vae_checkpoint_path)
+    with CheckpointReader.open((Path(vae_checkpoint_path),)) as reader:
+        metadata = reader.read_checkpoint_metadata()
     vae_config = metadata.get("config", {}).get("vae", {})
     geometry = diffvae_tiling_geometry_from_vae_config(vae_config)
-    model_bytes = estimate_diffusion_decoder_weight_bytes(vae_checkpoint_path)
+    model_bytes = estimate_diffusion_decoder_weight_bytes(vae_checkpoint_path, dtype=vae_dtype)
 
     resolved_device = device if device is not None else get_device()
     if free_bytes is None:
@@ -189,6 +186,7 @@ def tiling_config_for_vae(
         mode=diffvae_optimization,
         free_bytes=free_bytes,
         model_bytes=model_bytes,
+        dtype=vae_dtype,
         keyframes=keyframes,
         joint_sdpa_materializes=keyframes and joint_sdpa_materializes_scores(resolved_device),
     )
@@ -197,17 +195,17 @@ def tiling_config_for_vae(
 def ensure_tiling_config(
     tiling_config: TilingConfig | AutoTiling | None,
     *,
-    scale_factors: SpatioTemporalScaleFactors,
     video_shape: VideoPixelShape,
     vae_checkpoint_path: str,
     diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
     device: torch.device | None = None,
     free_bytes: int | None = None,
     keyframes: bool = False,
+    vae_dtype: torch.dtype = torch.bfloat16,
 ) -> TilingConfig | None:
     """Resolve pipeline tiling: ``AUTO_TILING`` → recommend; ``None`` → untiled; else validate.
-    ``scale_factors`` must be the same factors decode will pass to ``to_splitters``
-    (from :func:`tiling_scale_factors_for_vae`). Call only after ``video_shape.frames`` is known.
+    Scale factors for explicit-config validation come from :func:`tiling_scale_factors_for_vae`
+    on ``vae_checkpoint_path``. Call only after ``video_shape.frames`` is known.
     Pass ``keyframes=True`` when the decode will use the keyframe-aware VAE path.
     """
     if tiling_config is None:
@@ -222,8 +220,9 @@ def ensure_tiling_config(
             device=device,
             free_bytes=free_bytes,
             keyframes=keyframes,
+            vae_dtype=vae_dtype,
         )
-    tiling_config.validate(scale_factors, video_shape)
+    tiling_config.validate(tiling_scale_factors_for_vae(vae_checkpoint_path), video_shape)
     return tiling_config
 
 
@@ -614,6 +613,16 @@ def snap_frames_to_grid(frames: int, scale_factors: SpatioTemporalScaleFactors =
         raise ValueError(f"frames must be >= 1, got {frames}")
     time_scale = scale_factors.time
     return ((frames - 1) // time_scale) * time_scale + 1
+
+
+def round_up_frames_to_grid(frames: int, scale_factors: SpatioTemporalScaleFactors = VIDEO_SCALE_FACTORS) -> int:
+    """Round ``frames`` up to the nearest ``k * scale_factors.time + 1``.
+    Already-legal counts are returned unchanged, so callers pad by ``0..scale_factors.time - 1`` frames.
+    """
+    if frames < 1:
+        raise ValueError(f"frames must be >= 1, got {frames}")
+    time_scale = scale_factors.time
+    return math.ceil((frames - 1) / time_scale) * time_scale + 1
 
 
 def seconds_to_clamped_num_frames(

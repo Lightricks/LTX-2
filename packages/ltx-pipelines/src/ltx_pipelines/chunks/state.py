@@ -8,7 +8,6 @@ from dataclasses import dataclass
 import torch
 
 from ltx_core.conditioning import ConditioningItem
-from ltx_core.types import Audio
 from ltx_pipelines.chunks.layout import ChunkLayout
 
 
@@ -76,16 +75,3 @@ class Chunk:
     make_audio_conditionings: MakeAudioConditionings = _empty_conditionings
     generated_keyframes: GeneratedKeyframes | None = None
     incoming_keyframes: GeneratedKeyframes | None = None
-
-
-@dataclass(frozen=True)
-class DecodedChunk:
-    """Contiguous decoded output segment for progressive encode.
-    Attributes:
-        video: Pixel frames after dropping or blending stitch overlap. One input chunk
-            may produce separate body and blended-tail segments to keep buffering bounded.
-        audio: Vocoded (or muxed source) audio matching this video segment, or ``None``.
-    """
-
-    video: torch.Tensor
-    audio: Audio | None = None

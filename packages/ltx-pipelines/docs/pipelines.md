@@ -81,6 +81,17 @@ Transformer tiling is opt-in and is **not extra stages**. Without `--tile`, 1080
 
 **Python.** `ICLoraPipeline(stages=...)` takes a sequence of `ICLoraStageConfig`. Consecutive stages must keep the same `resolution_divisor` or drop by exactly 2x, and the last stage must be divisor 1. That is how you run more than two stages (same-res repeats or `4 -> 2 -> 1`). The CLI does not expose that ladder.
 
+**`--audio-path` and `--refine-audio`.** `--audio-path` is optional. With it, the audio (or the audio track of a video) is read from `--audio-start-time` for `--num-frames / --frame-rate` seconds, encoded once, and held frozen as clean target audio in stage 1. Audio shorter than the clip raises an error. `--refine-audio` (default on) lets stages 2+ denoise the stage-1 audio; `--no-refine-audio` keeps it frozen. In Python, pass `audio=AudioInput(path, start_time)` and `refine_audio=` to `ICLoraPipeline.__call__`.
+
+| Audio source | `refine_audio` | Stage 1 audio | Stage 2+ audio | Output audio |
+|---|---|---|---|---|
+| none | `True` (default) | generated | refined | VAE decode |
+| none | `False` | generated | frozen | VAE decode |
+| given | `False` | frozen source | frozen source | source waveform |
+| given | `True` | frozen source | refined | VAE decode |
+
+With a source and a single stage (`--skip-stage-2`), no stage denoises audio, so the output carries the source waveform regardless of `refine_audio`.
+
 **Note:** Distilled checkpoint only. Pass the IC-LoRA with `--lora`.
 
 ```bash
@@ -112,11 +123,17 @@ python -m ltx_pipelines.ic_lora \
     ... \
     --height 3840 --width 2176 --tile --tile-height 576 --tile-width 1024 --stage-2-ic-lora \
     --output-path out.mp4
+
+# Keep the input audio (frozen in both stages; the output carries the source waveform)
+python -m ltx_pipelines.ic_lora \
+    ... \
+    --audio-path path/to/speech.wav --no-refine-audio \
+    --output-path out.mp4
 ```
 
-**Extra CLI arguments:** `--video-conditioning` (required), `--conditioning-attention-mask`, `--skip-stage-2`, `--stage-2-ic-lora`, `--tile`, `--tile-height`, `--tile-width`, `--chunked` or `--chunk-pixel-frames` / `--chunk-carry-frames` for long clips, and `--chunk-blend-frames` for decoded seam crossfade length (same windowing as Distilled and Dub-It).
+**Extra CLI arguments:** `--video-conditioning` (required), `--conditioning-attention-mask`, `--skip-stage-2`, `--stage-2-ic-lora`, `--tile`, `--tile-height`, `--tile-width`, `--chunked` or `--chunk-pixel-frames` / `--chunk-carry-frames` for long clips, and `--chunk-blend-frames` for decoded seam crossfade length (same windowing as Distilled and Dub-It), `--audio-path`, `--audio-start-time`, `--refine-audio` / `--no-refine-audio`.
 
-**Python.** ``stream_chunks()`` returns ``(Iterator[DecodedChunk], num_frames, tiling_config)``. Pass ``chunk_config`` to ``__call__`` or ``stream_chunks()``; ``chunk_config=None`` is one window over the snapped clip (today's one-shot path). Temporal chunks are the outer loop; each stage still runs per-step spatial tiling when ``--tile`` or ``ICLoraStageConfig.tiling`` is set, so runtime scales roughly with ``temporal_chunks x spatial_tiles x denoising_steps``.
+**Python.** ``stream_chunks()`` returns ``(Iterator[PlaybackSegment], num_frames, tiling_config)``. Pass ``chunk_config`` to ``__call__`` or ``stream_chunks()``; ``chunk_config=None`` is one window over the snapped clip (today's one-shot path). Temporal chunks are the outer loop; each stage still runs per-step spatial tiling when ``--tile`` or ``ICLoraStageConfig.tiling`` is set, so runtime scales roughly with ``temporal_chunks x spatial_tiles x denoising_steps``.
 
 **Use when:** Video-to-video transformations, image-to-video with strong control, or when you have reference videos to guide generation.
 

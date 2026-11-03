@@ -6,7 +6,7 @@ from rich.logging import RichHandler
 
 # Get the process rank
 IS_MULTI_GPU = os.environ.get("LOCAL_RANK") is not None
-RANK = int(os.environ.get("LOCAL_RANK", "0"))
+RANK = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
 
 # Configure with Rich
 logging.basicConfig(

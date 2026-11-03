@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import torch
 
@@ -10,7 +11,8 @@ from ltx_core.duration_head import (
     DurationHeadConfigurator,
 )
 from ltx_core.loader import SDOps
-from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
+from ltx_core.loader.mapping import build_mapping
+from ltx_core.loader.simple_builder import SimpleBuilder
 from ltx_core.model.model_protocol import ModelConfigurator
 from ltx_pipelines.utils.helpers import seconds_to_clamped_num_frames
 from ltx_pipelines.utils.types import AutoDuration
@@ -44,27 +46,23 @@ class DurationPredictor:
         """Build a predictor from a checkpoint path, or ``None`` if unavailable.
         Returns ``None`` when ``checkpoint_path`` is ``None`` (split pack without a
         duration-head file), or when the file has no DurationHead weights (pre-2.5 /
-        gemma3 monoliths). The underlying loader uses ``strict=False``, so a missing
-        head does not raise -- it silently leaves parameters on the meta device;
-        checked here so callers get ``None`` instead of a predictor that would crash
-        later.
-        No registry: the head is a few MB, so there's no benefit to caching its weights or
-        shell across pipeline instances the way the large transformer/VAE builders do.
+        gemma3 monoliths). Checkpoint-key selection detects an entirely missing
+        head before building it. A partially present head fails the loader's
+        model-key check.
+        The head uses a local builder registry; it is small enough that sharing
+        its weights or shell across pipeline instances is unnecessary.
         """
         if checkpoint_path is None:
             return None
-        builder = Builder(
-            model_path=checkpoint_path,
-            model_class_configurator=model_configurator,
-            model_sd_ops=model_sd_ops,
-        )
-        head = builder.build(device=device, dtype=dtype).eval()
-        if any(param.is_meta for param in head.parameters()):
+        path = Path(checkpoint_path)
+        mapping = build_mapping((path,), (model_sd_ops,))
+        if not mapping.tensor_mapping.destination_metadata:
             logger.info(
                 "No DurationHead weights found in %s; auto-duration prediction unavailable.",
                 checkpoint_path,
             )
             return None
+        head = SimpleBuilder(model_configurator, (path,), (model_sd_ops,)).build(device=device, dtype=dtype).eval()
         return cls(head)
 
     def __call__(

@@ -37,12 +37,12 @@ class EnsureTilingConfig(Protocol):
         tiling_config: TilingConfig | AutoTiling | None,
         *,
         video_shape: VideoPixelShape,
-        scale_factors: SpatioTemporalScaleFactors,
         vae_checkpoint_path: str,
         diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
         device: torch.device | None = None,
         free_bytes: int | None = None,
         keyframes: bool = False,
+        vae_dtype: torch.dtype = torch.bfloat16,
     ) -> TilingConfig | None: ...
 
 
@@ -110,23 +110,23 @@ def dist_auto_tiling(
         tiling_config: TilingConfig | AutoTiling | None,
         *,
         video_shape: VideoPixelShape,
-        scale_factors: SpatioTemporalScaleFactors,
         vae_checkpoint_path: str,
         diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
         device: torch.device | None = None,
         free_bytes: int | None = None,
         keyframes: bool = False,
+        vae_dtype: torch.dtype = torch.bfloat16,
     ) -> TilingConfig | None:
         def plan(shape: VideoPixelShape, budget: int | None) -> TilingConfig | None:
             return ensure(
                 tiling_config,
                 video_shape=shape,
-                scale_factors=scale_factors,
                 vae_checkpoint_path=vae_checkpoint_path,
                 diffvae_optimization=diffvae_optimization,
                 device=device,
                 free_bytes=budget,
                 keyframes=keyframes,
+                vae_dtype=vae_dtype,
             )
 
         if not isinstance(tiling_config, AutoTiling) or free_bytes is not None:

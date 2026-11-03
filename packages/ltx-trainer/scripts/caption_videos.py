@@ -26,8 +26,6 @@ Advanced usage:
     caption_videos.py videos_dir/ --enable-thinking
 """
 
-import csv
-import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from enum import Enum
 from pathlib import Path
@@ -51,6 +49,7 @@ from ltx_trainer.captioning import (
     MediaCaptioningModel,
     create_captioner,
 )
+from ltx_trainer.dataset_metadata import read_rows, write_rows
 
 VIDEO_EXTENSIONS = ["mp4", "avi", "mov", "mkv", "webm"]
 IMAGE_EXTENSIONS = ["jpg", "jpeg", "png"]
@@ -219,6 +218,16 @@ def _get_media_files(
         raise typer.Exit(code=1)
 
 
+def _captions_to_rows(captions: dict[str, str]) -> list[dict[str, str]]:
+    """Convert a ``{media_path: caption}`` map to dataset rows (caption + media_path columns)."""
+    return [{"caption": caption, "media_path": media_path} for media_path, caption in captions.items()]
+
+
+def _rows_to_captions(rows: list[dict]) -> dict[str, str]:
+    """Convert dataset rows back to a ``{media_path: caption}`` map (rows missing either key skipped)."""
+    return {row["media_path"]: row["caption"] for row in rows if "caption" in row and "media_path" in row}
+
+
 def _save_captions(
     captions: dict[str, str],
     output_path: Path,
@@ -252,36 +261,15 @@ def _save_captions(
             console.print(f"[bold green]✓[/] Captions saved to [cyan]{captions_file}[/]")
             console.print(f"[bold green]✓[/] Media paths saved to [cyan]{paths_file}[/]")
 
-        case OutputFormat.CSV:
-            with output_path.open("w", encoding="utf-8", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(["caption", "media_path"])
-                for media_path, caption in captions.items():
-                    writer.writerow([caption, media_path])
-
-            console.print(f"[bold green]✓[/] Captions saved to [cyan]{output_path}[/]")
-
-        case OutputFormat.JSON:
-            # Format as list of dictionaries with caption and media_path keys
-            json_data = [{"caption": caption, "media_path": media_path} for media_path, caption in captions.items()]
-
-            with output_path.open("w", encoding="utf-8") as f:
-                json.dump(json_data, f, indent=2, ensure_ascii=False)
-
-            console.print(f"[bold green]✓[/] Captions saved to [cyan]{output_path}[/]")
-
-        case OutputFormat.JSONL:
-            with output_path.open("w", encoding="utf-8") as f:
-                for media_path, caption in captions.items():
-                    f.write(json.dumps({"caption": caption, "media_path": media_path}, ensure_ascii=False) + "\n")
-
+        case OutputFormat.CSV | OutputFormat.JSON | OutputFormat.JSONL:
+            write_rows(output_path, _captions_to_rows(captions))
             console.print(f"[bold green]✓[/] Captions saved to [cyan]{output_path}[/]")
 
         case _:
             raise ValueError(f"Unsupported output format: {format_type}")
 
 
-def _load_existing_captions(  # noqa: PLR0912
+def _load_existing_captions(
     output_path: Path,
     format_type: OutputFormat,
 ) -> dict[str, str]:
@@ -313,29 +301,8 @@ def _load_existing_captions(  # noqa: PLR0912
                     if len(captions) == len(paths):
                         existing_captions = dict(zip(paths, captions, strict=False))
 
-            case OutputFormat.CSV:
-                with output_path.open("r", encoding="utf-8", newline="") as f:
-                    reader = csv.reader(f)
-                    # Skip header
-                    next(reader, None)
-                    for row in reader:
-                        if len(row) >= 2:
-                            caption, media_path = row[0], row[1]
-                            existing_captions[media_path] = caption
-
-            case OutputFormat.JSON:
-                with output_path.open("r", encoding="utf-8") as f:
-                    json_data = json.load(f)
-                    for item in json_data:
-                        if "caption" in item and "media_path" in item:
-                            existing_captions[item["media_path"]] = item["caption"]
-
-            case OutputFormat.JSONL:
-                with output_path.open("r", encoding="utf-8") as f:
-                    for line in f:
-                        item = json.loads(line)
-                        if "caption" in item and "media_path" in item:
-                            existing_captions[item["media_path"]] = item["caption"]
+            case OutputFormat.CSV | OutputFormat.JSON | OutputFormat.JSONL:
+                existing_captions = _rows_to_captions(read_rows(output_path))
 
             case _:
                 raise ValueError(f"Unsupported output format: {format_type}")

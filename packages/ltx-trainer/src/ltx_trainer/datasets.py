@@ -165,7 +165,11 @@ class PrecomputedDataset(Dataset):
         if not self.data_sources:
             raise ValueError("No data sources configured")
 
-        data_key = "latents" if "latents" in self.data_sources else next(iter(self.data_sources.keys()))
+        data_key = (
+            "latents"
+            if "latents" in self.data_sources
+            else next((name for name in self.data_sources if name != "conditions"), next(iter(self.data_sources)))
+        )
         data_path = self.source_paths[data_key]
 
         # Pass 1: Glob all sources in parallel, build full-path sets
@@ -191,9 +195,8 @@ class PrecomputedDataset(Dataset):
         data_files.sort()
 
         # Build path sets for non-primary sources
-        other_path_sets = {
-            dir_name: path_set for dir_name, (_, path_set) in glob_results.items() if dir_name != data_key
-        }
+        path_sets = {dir_name: path_set for dir_name, (_, path_set) in glob_results.items()}
+        other_path_sets = {dir_name: paths for dir_name, paths in path_sets.items() if dir_name != data_key}
 
         # Pass 2: For each primary file, check if expected paths exist in other sources' sets
         sample_files: dict[str, list[Path]] = {output_key: [] for output_key in self.data_sources.values()}
@@ -205,14 +208,14 @@ class PrecomputedDataset(Dataset):
             # Check all other sources via set lookup (O(1) per source, no stat calls)
             all_exist = True
             for dir_name, path_set in other_path_sets.items():
-                expected = self._get_expected_file_path(dir_name, data_file, rel_path)
+                expected = self._get_expected_file_path(dir_name, data_file, rel_path, path_set)
                 if str(expected) not in path_set:
                     logger.debug(f"Skipping {data_file.name}: no matching {dir_name} file at {expected}")
                     all_exist = False
                     break
 
             if all_exist:
-                self._fill_sample_data_files(data_file, rel_path, sample_files)
+                self._fill_sample_data_files(data_file, rel_path, sample_files, path_sets)
                 valid_count += 1
 
         skipped = len(data_files) - valid_count
@@ -221,20 +224,30 @@ class PrecomputedDataset(Dataset):
 
         return sample_files
 
-    def _get_expected_file_path(self, dir_name: str, data_file: Path, rel_path: Path) -> Path:
+    def _get_expected_file_path(self, dir_name: str, data_file: Path, rel_path: Path, existing_paths: set[str]) -> Path:
         """Get the expected file path for a given data source."""
         source_path = self.source_paths[dir_name]
 
         # For conditions, handle legacy naming where latent_X.pt maps to condition_X.pt
-        if dir_name == "conditions" and data_file.name.startswith("latent_"):
-            return source_path / f"condition_{data_file.stem[7:]}.pt"
+        if (
+            dir_name == "conditions"
+            and data_file.name.startswith("latent_")
+            and str(source_path / rel_path) not in existing_paths
+        ):
+            return source_path / rel_path.with_name(f"condition_{data_file.stem[7:]}.pt")
 
         return source_path / rel_path
 
-    def _fill_sample_data_files(self, data_file: Path, rel_path: Path, sample_files: dict[str, list[Path]]) -> None:
+    def _fill_sample_data_files(
+        self,
+        data_file: Path,
+        rel_path: Path,
+        sample_files: dict[str, list[Path]],
+        path_sets: dict[str, set[str]],
+    ) -> None:
         """Add a valid sample to the sample_files tracking."""
         for dir_name, output_key in self.data_sources.items():
-            expected_path = self._get_expected_file_path(dir_name, data_file, rel_path)
+            expected_path = self._get_expected_file_path(dir_name, data_file, rel_path, path_sets[dir_name])
             sample_files[output_key].append(expected_path.relative_to(self.source_paths[dir_name]))
 
     def _validate_setup(self) -> None:
@@ -267,7 +280,7 @@ class PrecomputedDataset(Dataset):
                 data = torch.load(file_path, map_location="cpu", weights_only=True)
 
                 # Normalize video latent format if this is a latent source
-                if "latent" in dir_name.lower():
+                if isinstance(data, dict) and "latents" in data and "height" in data and "width" in data:
                     data = self._normalize_video_latents(data)
 
                 result[output_key] = data

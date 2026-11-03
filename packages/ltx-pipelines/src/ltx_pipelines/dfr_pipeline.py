@@ -13,7 +13,7 @@ import torch
 from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.loader import LoraPathStrengthAndSDOps
-from ltx_core.loader.registry import Registry
+from ltx_core.loader.registry import ModelRegistry
 from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae import (
     AUTO_TILING,
@@ -22,8 +22,8 @@ from ltx_core.model.video_vae import (
     get_video_chunks_number,
 )
 from ltx_core.model.video_vae.transformer import DiffVAEMode
-from ltx_core.quantization import QuantizationPolicy, fp8_cast_fuse_rule
-from ltx_core.quantization.fp8_cast import supports_fp8_gemm, with_rowwise_fp8_gemm
+from ltx_core.quantization import QuantizationPolicy
+from ltx_core.quantization.fp8_cast import FP8_CAST_UNIT_FUSE_RULE, supports_fp8_gemm, with_rowwise_fp8_gemm
 from ltx_core.types import VIDEO_SCALE_FACTORS, VideoPixelShape
 from ltx_pipelines.dfr_helpers.layout import resolve_canvas
 from ltx_pipelines.dfr_helpers.ops import (
@@ -70,7 +70,6 @@ from ltx_pipelines.utils.helpers import (
     decode_keyframes_from_slots,
     ensure_tiling_config,
     get_device,
-    tiling_scale_factors_for_vae,
 )
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.model_paths import ModelPaths
@@ -121,7 +120,7 @@ class DFRPipeline:
         temporal_upsampler_path: str | None = None,
         device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
-        registry: Registry | None = None,
+        registry: ModelRegistry | None = None,
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
@@ -130,6 +129,7 @@ class DFRPipeline:
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
+        registry = registry or ModelRegistry()
         self._user_loras = tuple(loras)
         if not detailing_lora:
             raise ValueError("detailing_lora is required")
@@ -165,6 +165,8 @@ class DFRPipeline:
             compilation_config=compilation_config,
             offload_mode=offload_mode,
             alloc_trim_strategy=alloc_trim_strategy,
+            # Every pass, tile and window shares one transformer allocation; the detailing LoRA switches in place.
+            active_weights={},
         )
         self.stage_detailing = self.stage.with_loras((*stage_loras, *self._detailing_lora))
         self.upsampler = VideoUpsampler(
@@ -252,7 +254,7 @@ class DFRPipeline:
         """
         stage = self.stage_detailing
         policy = stage.quantization
-        if policy is None or policy.fuse_rule is not fp8_cast_fuse_rule or not supports_fp8_gemm(self.device):
+        if policy is None or policy.fuse_rule is not FP8_CAST_UNIT_FUSE_RULE or not supports_fp8_gemm(self.device):
             return stage
         return stage.with_quantization(with_rowwise_fp8_gemm(policy))
 
@@ -321,58 +323,59 @@ class DFRPipeline:
         stage_1_w, stage_1_h = width // spatial_div, height // spatial_div
         stage_2_w, stage_2_h = width // (spatial_div // 2), height // (spatial_div // 2)
 
-        # --- Stage 1: half-res (or quarter-res) base + keyframe slots -------------------
-        stage_1 = denoise_stage1(
-            stage=self.stage,
-            image_conditioner=self.image_conditioner,
-            images=images,
-            video_shape=VideoPixelShape(batch=1, frames=num_frames, height=stage_1_h, width=stage_1_w, fps=frame_rate),
-            positions=positions,
-            video_context=video_context,
-            audio_context=audio_context,
-            sigmas=stage_1_sigmas,
-            noiser=noiser,
-            device=self.device,
-            dtype=dtype,
-            **self._sampler_kwargs(seed, ANCESTRAL_NOISE_SEED_OFFSET),
-        )
-        audio_latent = stage_1.audio_state.latent.detach().clone()
+        try:
+            # --- Stage 1: half-res (or quarter-res) base + keyframe slots -------------------
+            stage_1 = denoise_stage1(
+                stage=self.stage,
+                image_conditioner=self.image_conditioner,
+                images=images,
+                video_shape=VideoPixelShape(
+                    batch=1, frames=num_frames, height=stage_1_h, width=stage_1_w, fps=frame_rate
+                ),
+                positions=positions,
+                video_context=video_context,
+                audio_context=audio_context,
+                sigmas=stage_1_sigmas,
+                noiser=noiser,
+                device=self.device,
+                dtype=dtype,
+                **self._sampler_kwargs(seed, ANCESTRAL_NOISE_SEED_OFFSET),
+            )
+            audio_latent = stage_1.audio_state.latent.detach().clone()
 
-        # --- Stage 2: spatial detailing ------------------------------------------------
-        video_shape = VideoPixelShape(batch=1, frames=num_frames, height=stage_2_h, width=stage_2_w, fps=frame_rate)
-        stage_2 = denoise_stage2(
-            stage=self.stage_detailing,
-            image_conditioner=self.image_conditioner,
-            upsampler=self.upsampler,
-            images=images,
-            video_shape=video_shape,
-            keyframes=stage_1.keyframes,
-            half_res_reference=stage_1.video_state.latent[:1].detach().clone(),
-            downscale_factor=self._detailing_downscale,
-            audio_latent=audio_latent,
-            video_context=video_context,
-            audio_context=audio_context,
-            sigmas=stage_2_sigmas,
-            noiser=noiser,
-            device=self.device,
-            dtype=dtype,
-            **self._sampler_kwargs(seed, ANCESTRAL_STAGE_2_NOISE_SEED_OFFSET),
-        )
-        video_state = stage_2.video_state
-        keyframes = stage_2.keyframes
-        self._emit_stage(
-            "s2",
-            latent=video_state.latent,
-            keyframes=keyframes,
-            height=video_shape.height,
-            width=video_shape.width,
-            num_frames=video_shape.frames,
-            fps=video_shape.fps,
-        )
+            # --- Stage 2: spatial detailing ------------------------------------------------
+            video_shape = VideoPixelShape(batch=1, frames=num_frames, height=stage_2_h, width=stage_2_w, fps=frame_rate)
+            stage_2 = denoise_stage2(
+                stage=self.stage_detailing,
+                image_conditioner=self.image_conditioner,
+                upsampler=self.upsampler,
+                images=images,
+                video_shape=video_shape,
+                keyframes=stage_1.keyframes,
+                half_res_reference=stage_1.video_state.latent[:1].detach().clone(),
+                downscale_factor=self._detailing_downscale,
+                audio_latent=audio_latent,
+                video_context=video_context,
+                audio_context=audio_context,
+                sigmas=stage_2_sigmas,
+                noiser=noiser,
+                device=self.device,
+                dtype=dtype,
+                **self._sampler_kwargs(seed, ANCESTRAL_STAGE_2_NOISE_SEED_OFFSET),
+            )
+            video_state = stage_2.video_state
+            keyframes = stage_2.keyframes
+            self._emit_stage(
+                "s2",
+                latent=video_state.latent,
+                keyframes=keyframes,
+                height=video_shape.height,
+                width=video_shape.width,
+                num_frames=video_shape.frames,
+                fps=video_shape.fps,
+            )
 
-        last_window_seams: list[int] = []
-        # One transformer for every temporal tile of every round instead of a build per tile.
-        with self.stage.resident():
+            last_window_seams: list[int] = []
             for round_idx in range(1, temporal_upscalings + 1):
                 assert self.temporal_upsampler is not None
                 if not keyframes:
@@ -407,36 +410,41 @@ class DFRPipeline:
                     num_frames=video_shape.frames,
                     fps=video_shape.fps,
                 )
-        num_frames = video_shape.frames
-        current_fps = video_shape.fps
+            num_frames = video_shape.frames
+            current_fps = video_shape.fps
 
-        # --- Spatial epilogue (spatial_upscalings == 2): s2 is h/2; this pass is final H x W ---
-        if spatial_upscalings == 2:
-            epi = run_spatial_epilogue(
-                stage=self._epilogue_stage(),
-                upsampler=self.upsampler,
-                image_conditioner=self.image_conditioner,
-                video_decoder=self.video_decoder,
-                video_state=video_state,
-                keyframes=keyframes,
-                images=images,
-                video_shape=VideoPixelShape(batch=1, frames=num_frames, height=height, width=width, fps=current_fps),
-                temporal_upscalings=temporal_upscalings,
-                last_window_seams=last_window_seams,
-                video_context=video_context,
-                audio_context=audio_context,
-                audio_latent=audio_latent,
-                source_duration=source_duration,
-                sigmas=stage_2_sigmas,
-                downscale_factor=self._detailing_downscale,
-                seed=seed,
-                device=self.device,
-                dtype=dtype,
-                temporal_scale=temporal_scale,
-                **self._sampler_kwargs(seed, _EPILOGUE_ANCESTRAL_NOISE_SEED_OFFSET),
-            )
-            video_state = epi.video_state
-            keyframes = epi.keyframes
+            # --- Spatial epilogue (spatial_upscalings == 2): s2 is h/2; this pass is final H x W ---
+            if spatial_upscalings == 2:
+                epi = run_spatial_epilogue(
+                    stage=self._epilogue_stage(),
+                    upsampler=self.upsampler,
+                    image_conditioner=self.image_conditioner,
+                    video_decoder=self.video_decoder,
+                    video_state=video_state,
+                    keyframes=keyframes,
+                    images=images,
+                    video_shape=VideoPixelShape(
+                        batch=1, frames=num_frames, height=height, width=width, fps=current_fps
+                    ),
+                    temporal_upscalings=temporal_upscalings,
+                    last_window_seams=last_window_seams,
+                    video_context=video_context,
+                    audio_context=audio_context,
+                    audio_latent=audio_latent,
+                    source_duration=source_duration,
+                    sigmas=stage_2_sigmas,
+                    downscale_factor=self._detailing_downscale,
+                    seed=seed,
+                    device=self.device,
+                    dtype=dtype,
+                    temporal_scale=temporal_scale,
+                    **self._sampler_kwargs(seed, _EPILOGUE_ANCESTRAL_NOISE_SEED_OFFSET),
+                )
+                video_state = epi.video_state
+                keyframes = epi.keyframes
+        finally:
+            # The shared transformer weights are not needed for decoding.
+            self.stage.release_transformer()
 
         trimmed_latent, num_frames = trim_video_to_requested_frames(
             video_state.latent,
@@ -453,7 +461,6 @@ class DFRPipeline:
         playback_fps = frame_rate * 2**temporal_upscalings
         tiling_config = ensure_tiling_config(
             tiling_config,
-            scale_factors=tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path),
             vae_checkpoint_path=self.video_decoder.checkpoint_path,
             video_shape=VideoPixelShape(batch=1, frames=num_frames, height=height, width=width, fps=playback_fps),
             diffvae_optimization=self.video_decoder.diffvae_optimization,

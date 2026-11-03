@@ -1,12 +1,15 @@
 import hashlib
 import logging
+import math
+from functools import lru_cache
 from os import fspath
 
 import torch
 from transformers import AutoModelForImageTextToText, PretrainedConfig
 from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioAttention, Gemma4AudioRelPositionalEncoding
 
-from ltx_core.loader import KeyValueOperationResult, parse_model_version
+from ltx_core.loader import parse_model_version
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.sd_ops import SDOps
 from ltx_core.model.model_protocol import ModelConfigurator
@@ -40,10 +43,12 @@ def gemma_model_type(gemma_model_path: str) -> str:
     return gemma_model_config(gemma_model_path).get("model_type", "") or ""
 
 
+@lru_cache(maxsize=32)
 def _path_bound_configurator(cls: type, gemma_model_path: str) -> type:
-    """Subclass ``cls`` with a path-unique name so ``module_registry_key`` distinguishes HF roots.
+    """Subclass ``cls`` with a path-unique name so the shell key distinguishes HF roots.
     ``from_metadata`` loads structure from the bound path (not from safetensors metadata), so a
-    shared ``__qualname__`` would collide across different Gemma trees.
+    shared ``__qualname__`` would collide across different Gemma trees. Repeated
+    builders for one path reuse the same class and therefore the same shell key.
     """
     digest = hashlib.sha256(fspath(gemma_model_path).encode()).hexdigest()[:16]
     return type(f"{cls.__name__}_{digest}", (cls,), {"gemma_model_path": gemma_model_path})
@@ -220,10 +225,7 @@ def _with_tied_lm_head(ops: SDOps) -> SDOps:
     generation fails.
     """
     return ops.with_kv_operation(
-        operation=lambda key, value: [
-            KeyValueOperationResult(key, value),
-            KeyValueOperationResult("model.lm_head.weight", value),
-        ],
+        operation=lambda key, inputs: {key: inputs[key], "model.lm_head.weight": inputs[key]},
         key_prefix="model.model.language_model.embed_tokens.weight",
     )
 
@@ -274,7 +276,8 @@ def _build_gemma4_unified_llm_key_ops(*, comfy_flat: bool = False) -> SDOps:
     ``model.model.embed_audio.*`` in the loaded module tree. Vision patch embedder loads as
     ``embed_vision.``; its projection loads under ``embed_vision.multimodal_embedder.``.
     """
-    ops = SDOps("GEMMA4_UNIFIED_LLM_KEY_OPS").with_matching(prefix="model.")
+    layout = "comfy-flat" if comfy_flat else "hf"
+    ops = SDOps(f"GEMMA4_UNIFIED_LLM_KEY_OPS:{layout}").with_matching(prefix="model.")
     if comfy_flat:
         ops = (
             ops.with_matching(prefix="vision_model.")
@@ -309,15 +312,24 @@ def _build_gemma4_unified_llm_key_ops(*, comfy_flat: bool = False) -> SDOps:
     return _with_tied_lm_head(ops)
 
 
-def _build_gemma4_dense_llm_key_ops() -> SDOps:
+def _build_gemma4_dense_llm_key_ops(num_layers: int, num_kv_shared_layers: int) -> SDOps:
     """Checkpoint-key remapping for dense Gemma 4 instruct (e.g. gemma-4-E2B-it, model_type gemma4).
     Checkpoint keys already sit under ``model.<component>.*`` matching the HF module tree;
     LTXGemmaTextEncoder nests that HF module at ``.model``, so remap each top-level component under
     ``model.model.<component>``. (A naive ``model.`` → ``model.model.`` replace would also
     rewrite the ``model.`` substring inside ``language_model.``.)
+    The last ``num_kv_shared_layers`` decoder layers reuse an earlier layer's keys and values and
+    have no ``k_proj`` / ``v_proj`` / ``k_norm``; their checkpoint copies are excluded.
     """
+    first_shared = num_layers - num_kv_shared_layers
+    excluded = tuple(
+        f"model.model.language_model.layers.{index}.self_attn.{name}."
+        for index in range(first_shared, num_layers)
+        for name in ("k_proj", "v_proj", "k_norm")
+    )
+    name = f"GEMMA4_DENSE_LLM_KEY_OPS:kv_shared_from_{first_shared}" if excluded else "GEMMA4_DENSE_LLM_KEY_OPS"
     return _with_tied_lm_head(
-        SDOps("GEMMA4_DENSE_LLM_KEY_OPS")
+        SDOps(name, excluded_prefixes=excluded)
         .with_matching(prefix="model.")
         .with_replacement("model.language_model.", "model.model.language_model.")
         .with_replacement("model.vision_tower.", "model.model.vision_tower.")
@@ -371,13 +383,14 @@ def _populate_rotary_v5(l_model: torch.nn.Module, config: object) -> None:
         if rope_params is None:
             continue
         rope_type = rope_params["rope_type"]
-        if rope_type == "default":
-            inv_freq, attn_scaling = rope_emb.compute_default_rope_parameters(config, layer_type=layer_type)
-        else:
-            init_kwargs = {"layer_type": layer_type}
-            if layer_type == "full_attention" and rope_type == "proportional":
-                init_kwargs["head_dim_key"] = "global_head_dim"
-            inv_freq, attn_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, **init_kwargs)
+        with torch.device("cpu"):
+            if rope_type == "default":
+                inv_freq, attn_scaling = rope_emb.compute_default_rope_parameters(config, layer_type=layer_type)
+            else:
+                init_kwargs = {"layer_type": layer_type}
+                if layer_type == "full_attention" and rope_type == "proportional":
+                    init_kwargs["head_dim_key"] = "global_head_dim"
+                inv_freq, attn_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, **init_kwargs)
         rope_emb.register_buffer(f"{layer_type}_inv_freq", inv_freq, persistent=False)
         rope_emb.register_buffer(f"{layer_type}_original_inv_freq", inv_freq.clone(), persistent=False)
         setattr(rope_emb, f"{layer_type}_attention_scaling", attn_scaling)
@@ -435,24 +448,41 @@ def _create_and_populate_gemma4_dense(module: LTXGemmaTextEncoder) -> LTXGemmaTe
         if rotary.rope_type != "default"
         else rotary.compute_default_rope_parameters
     )
-    inv_freq, _ = rope_fn(rotary.config)
+    with torch.device("cpu"):
+        inv_freq, _ = rope_fn(rotary.config)
     rotary.register_buffer("inv_freq", inv_freq, persistent=False)
     rotary.register_buffer("original_inv_freq", inv_freq.clone(), persistent=False)
+
+    for submodule in module.model.model.audio_tower.modules():
+        if isinstance(submodule, Gemma4AudioRelPositionalEncoding):
+            count = submodule.hidden_size // 2
+            increment = math.log(10000.0) / max(count - 1, 1)
+            with torch.device("cpu"):
+                values = torch.exp(torch.arange(count) * -increment).unsqueeze(0).unsqueeze(0)
+            submodule.register_buffer("inv_timescales", values, persistent=False)
+        elif isinstance(submodule, Gemma4AudioAttention):
+            submodule.register_buffer(
+                "softcap", torch.tensor(submodule.attention_logits_soft_cap, device="cpu"), persistent=False
+            )
 
     return module
 
 
-def get_gemma_ops(gemma_model_path: str) -> tuple[SDOps, tuple[ModuleOps, ...]]:
+def get_gemma_ops(gemma_model_path: str, *, assets: GemmaAssets | None = None) -> tuple[SDOps, tuple[ModuleOps, ...]]:
     """Return the SDOps and the full module-ops tuple for loading a Gemma text encoder.
     The module ops are the config-derived buffer population (family-specific) followed by the
     tokenizer/processor asset loaders (family-agnostic), ready to pass straight to a Builder.
+    Already-loaded ``assets`` can be shared with a builder to avoid rereading tokenizer and config files.
     Supported ``model_type`` values:
     - ``gemma3`` — encode + enhance
     - ``gemma4_unified`` — encode only
     - ``gemma4`` — dense instruct, enhance only (same encoder/builder stack)
     """
-    asset_ops = module_ops_from_gemma_root(gemma_model_path)
-    model_type = gemma_model_type(gemma_model_path)
+    if assets is None:
+        assets = GemmaAssets.load(gemma_model_path)
+    asset_ops = module_ops_from_gemma_root(gemma_model_path, assets=assets)
+    hf_config = build_gemma_hf_config(assets)
+    model_type = hf_config.model_type
     if model_type == "gemma4_unified":
         gemma4_unified_model_ops = ModuleOps(
             name="GemmaModel",
@@ -467,7 +497,11 @@ def get_gemma_ops(gemma_model_path: str) -> tuple[SDOps, tuple[ModuleOps, ...]]:
             matcher=lambda module: isinstance(module, LTXGemmaTextEncoder),
             mutator=_create_and_populate_gemma4_dense,
         )
-        return _build_gemma4_dense_llm_key_ops(), (gemma4_dense_model_ops, *asset_ops)
+        text_config = getattr(hf_config, "text_config", hf_config)
+        key_ops = _build_gemma4_dense_llm_key_ops(
+            text_config.num_hidden_layers, getattr(text_config, "num_kv_shared_layers", 0) or 0
+        )
+        return key_ops, (gemma4_dense_model_ops, *asset_ops)
     if model_type == "gemma3":
         gemma3_model_ops = ModuleOps(
             name="GemmaModel",

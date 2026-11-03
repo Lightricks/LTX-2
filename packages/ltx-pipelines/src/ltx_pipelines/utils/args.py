@@ -1188,7 +1188,7 @@ def hdr_ic_lora_arg_parser(params: PipelineParams = LTX_2_4_PARAMS) -> argparse.
         help=(
             "One input: MP4/MOV when --input-colorspace is srgb_gamma or srgb, or a directory of "
             "*.exr frames when srgb, acescg, or acescct. "
-            "Output length matches the source (frame count must be 8k+1)."
+            "Output length matches the source; any frame count is padded to 8k+1 internally."
         ),
     )
     parser.add_argument(

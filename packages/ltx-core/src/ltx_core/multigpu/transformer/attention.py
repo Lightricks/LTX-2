@@ -25,6 +25,7 @@ class AttentionManager:
         # modules importable without the kernels installed (e.g. CPU CI test collection).
         from ltx_kernels import All2All  # noqa: PLC0415
 
+        self.group = group
         self.rank = dist.get_rank(group)
         self.world_size = dist.get_world_size(group)
         self.max_tokens = max_tokens

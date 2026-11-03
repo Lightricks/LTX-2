@@ -114,10 +114,7 @@ def generate_uniform_chunks(
         for layout in layouts:
             pixel_shape = target._replace(frames=layout.pixel_frames)
             video, initial_audio = create_initial_av_latents(
-                width=pixel_shape.width,
-                height=pixel_shape.height,
-                frames=pixel_shape.frames,
-                fps=pixel_shape.fps,
+                pixel_shape=pixel_shape,
                 device=device,
                 dtype=dtype,
                 video_scale_factors=video_scale_factors,

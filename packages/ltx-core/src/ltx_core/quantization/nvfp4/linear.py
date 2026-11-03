@@ -12,10 +12,10 @@ Parameter layout:
 from __future__ import annotations
 
 import torch
-from ltx_kernels import nvfp4
 from torch import nn
 from typing_extensions import assert_never
 
+from ltx_core.quantization.nvfp4.kernels import require_nvfp4
 from ltx_core.quantization.nvfp4.types import ActScale
 
 E4M3_MAX = 448.0
@@ -112,6 +112,7 @@ class NVFP4Linear(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        nvfp4 = require_nvfp4()
         original_shape = x.shape
         x_2d = x.reshape(-1, original_shape[-1])
         x_bf16 = x_2d if x_2d.dtype in (torch.bfloat16, torch.float16) else x_2d.to(torch.bfloat16)

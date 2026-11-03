@@ -9,7 +9,21 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
+import torch
+
+from ltx_core.loader.placement import Placement, RetentionPolicy
+from ltx_core.loader.registry import ModelRegistry
 from ltx_pipelines.multigpu.nccl_groups import NCCLGroups
+
+
+def rank_cuda_registry() -> ModelRegistry:
+    """A registry keeping clean weights and LoRA factors on this rank's CUDA device.
+    Distributed transformer builds restore adapter switches from these clean rank states.
+    Every other model built through the registry keeps its weights there too, as the
+    established multi-GPU runners did.
+    """
+    rank_device = Placement(torch.device("cuda"))
+    return ModelRegistry(placement_policy=RetentionPolicy(clean=rank_device, lora=rank_device))
 
 
 class RunnerError(Exception):

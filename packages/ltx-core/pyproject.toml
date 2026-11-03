@@ -1,8 +1,9 @@
 [project]
 name = "ltx-core"
-version = "1.5.0"
+version = "1.6.0"
 description = "Core implementation of Lightricks' LTX-2 model"
 readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = [
     "torch~=2.7",
@@ -13,7 +14,6 @@ dependencies = [
     "einops",
     "numpy",
     "colour-science",
-    "av",
     # Upper bound: transformers 5.15.0 routes config attribute access through the
     # heterogeneity layer, which raises AmbiguousGlobalPerLayerAttributeError on global
     # `config.head_dim` -- but its own gemma4_unified model code still reads it that way

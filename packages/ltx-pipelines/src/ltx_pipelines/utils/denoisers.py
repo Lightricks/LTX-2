@@ -3,10 +3,15 @@ Three implementations of the :class:`~ltx_pipelines.utils.types.Denoiser` protoc
 * :class:`SimpleDenoiser` — single transformer call, no guidance.
 * :class:`GuidedDenoiser` — static guiders, handles CFG + STG + isolated modality.
 * :class:`FactoryGuidedDenoiser` — resolves guiders per-step from sigma.
+Positive prompt embeddings are passed through the denoising loop from
+:class:`~ltx_pipelines.utils.types.ModalitySpec`. Negative context stays on guiders /
+guider factories.
 ``GuidedDenoiser`` and ``FactoryGuidedDenoiser`` share the core multi-pass
 logic via the module-level :func:`_guided_denoise` function, which batches
 all guidance passes into a single transformer call.
 """
+
+from __future__ import annotations
 
 import torch
 
@@ -198,9 +203,11 @@ def _guided_denoise(  # noqa: PLR0913,PLR0915
     uncond_v, uncond_a = r.get("uncond", (0.0, 0.0))
     ptb_v, ptb_a = r.get("ptb", (0.0, 0.0))
     mod_v, mod_a = r.get("mod", (0.0, 0.0))
+    mask_v = video_state.denoise_mask.tensor if video_state is not None else None
+    mask_a = audio_state.denoise_mask.tensor if audio_state is not None else None
 
-    denoised_video = last_denoised_video if v_skip else video_guider.calculate(cond_v, uncond_v, ptb_v, mod_v)
-    denoised_audio = last_denoised_audio if a_skip else audio_guider.calculate(cond_a, uncond_a, ptb_a, mod_a)
+    denoised_video = last_denoised_video if v_skip else video_guider.calculate(cond_v, uncond_v, ptb_v, mod_v, mask_v)
+    denoised_audio = last_denoised_audio if a_skip else audio_guider.calculate(cond_a, uncond_a, ptb_a, mod_a, mask_a)
     return VideoAudio(
         DenoisedLatentResult.result_or_none(
             denoised=denoised_video, uncond=uncond_v, cond=cond_v, ptb=ptb_v, mod=mod_v
@@ -216,14 +223,6 @@ class SimpleDenoiser:
     Passes ``None`` Modality for absent modalities.
     """
 
-    def __init__(
-        self,
-        v_context: torch.Tensor | None,
-        a_context: torch.Tensor | None,
-    ) -> None:
-        self.v_context = v_context
-        self.a_context = a_context
-
     def __call__(
         self,
         transformer: X0Model,
@@ -231,17 +230,23 @@ class SimpleDenoiser:
         audio_state: LatentState | None,
         sigmas: torch.Tensor,
         step_index: int,
+        v_context: torch.Tensor | None = None,
+        a_context: torch.Tensor | None = None,
     ) -> VideoAudio[DenoisedLatentResult]:
         # Modality.sigma is (B,); expand the scalar schedule value per modality so a rank-stable
         # sigma reaches the (compiled) block instead of a 0-d scalar that recompiles on sigma.ndim.
         sigma = sigmas[step_index]
+        if video_state is not None and v_context is None:
+            raise ValueError("v_context is required when video_state is provided")
+        if audio_state is not None and a_context is None:
+            raise ValueError("a_context is required when audio_state is provided")
         pos_video = (
-            modality_from_latent_state(video_state, self.v_context, sigma.expand(video_state.latent.shape[0]))
+            modality_from_latent_state(video_state, v_context, sigma.expand(video_state.latent.shape[0]))
             if video_state is not None
             else None
         )
         pos_audio = (
-            modality_from_latent_state(audio_state, self.a_context, sigma.expand(audio_state.latent.shape[0]))
+            modality_from_latent_state(audio_state, a_context, sigma.expand(audio_state.latent.shape[0]))
             if audio_state is not None
             else None
         )
@@ -260,14 +265,10 @@ class GuidedDenoiser:
 
     def __init__(
         self,
-        v_context: torch.Tensor | None,
-        a_context: torch.Tensor | None,
         video_guider: MultiModalGuider | None = None,
         audio_guider: MultiModalGuider | None = None,
         force_uncond_pass: bool = False,
     ) -> None:
-        self.v_context = v_context
-        self.a_context = a_context
         self.video_guider = video_guider
         self.audio_guider = audio_guider
         self.force_uncond_pass = force_uncond_pass
@@ -281,6 +282,8 @@ class GuidedDenoiser:
         audio_state: LatentState | None,
         sigmas: torch.Tensor,
         step_index: int,
+        v_context: torch.Tensor | None = None,
+        a_context: torch.Tensor | None = None,
     ) -> VideoAudio[DenoisedLatentResult]:
         guided_denoise_result_v, guided_denoise_result_a = _guided_denoise(
             transformer=transformer,
@@ -289,8 +292,8 @@ class GuidedDenoiser:
             sigma=sigmas[step_index],
             video_guider=_ensure_guider(self.video_guider),
             audio_guider=_ensure_guider(self.audio_guider),
-            v_context=self.v_context,
-            a_context=self.a_context,
+            v_context=v_context,
+            a_context=a_context,
             last_denoised_video=self._last_denoised_video,
             last_denoised_audio=self._last_denoised_audio,
             step_index=step_index,
@@ -306,14 +309,10 @@ class FactoryGuidedDenoiser:
 
     def __init__(
         self,
-        v_context: torch.Tensor | None,
-        a_context: torch.Tensor | None,
         video_guider_factory: MultiModalGuiderFactory | None = None,
         audio_guider_factory: MultiModalGuiderFactory | None = None,
         force_uncond_pass: bool = False,
     ) -> None:
-        self.v_context = v_context
-        self.a_context = a_context
         self.video_guider_factory = video_guider_factory
         self.audio_guider_factory = audio_guider_factory
         self.force_uncond_pass = force_uncond_pass
@@ -328,6 +327,8 @@ class FactoryGuidedDenoiser:
         audio_state: LatentState | None,
         sigmas: torch.Tensor,
         step_index: int,
+        v_context: torch.Tensor | None = None,
+        a_context: torch.Tensor | None = None,
     ) -> VideoAudio[DenoisedLatentResult]:
         if self._sigma_vals_cached is None:
             self._sigma_vals_cached = sigmas.detach().cpu().tolist()
@@ -349,8 +350,8 @@ class FactoryGuidedDenoiser:
             sigma=sigmas[step_index],
             video_guider=video_guider,
             audio_guider=audio_guider,
-            v_context=self.v_context,
-            a_context=self.a_context,
+            v_context=v_context,
+            a_context=a_context,
             last_denoised_video=self._last_denoised_video,
             last_denoised_audio=self._last_denoised_audio,
             step_index=step_index,

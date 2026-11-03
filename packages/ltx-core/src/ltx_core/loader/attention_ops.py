@@ -18,7 +18,7 @@ def set_attention_module_op(
 ) -> ModuleOps:
     """Build a ``ModuleOps`` that overrides the attention callables on every
     ``Attention`` submodule of a model. Applied via ``create_meta_model`` so
-    the meta model is mutated before weight loading. Matcher returns False
+    the meta model is mutated before unit weights are assigned. Matcher returns False
     for models with no ``Attention`` submodules, so the op is a no-op there.
     Either or both slots may be supplied; *None* leaves that slot untouched.
     """

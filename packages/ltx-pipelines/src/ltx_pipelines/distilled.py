@@ -9,24 +9,23 @@ from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.conditioning import ConditioningItem
 from ltx_core.loader import LoraPathStrengthAndSDOps
-from ltx_core.loader.registry import Registry
+from ltx_core.loader.registry import ModelRegistry
 from ltx_core.model.transformer import X0Model
 from ltx_core.model.transformer.compiling import CompilationConfig
-from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig, get_video_chunks_number
+from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig
 from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import LatentState, VideoPixelShape
 from ltx_pipelines.chunks import (
     Chunk,
     ChunkConfig,
-    DecodedChunk,
     MakeVideoConditionings,
+    PlaybackSegment,
     decode_chunks,
     denoise_chunks,
     generate_uniform_chunks,
     pipeline_output_from_chunks,
     spatially_upsample_chunks,
-    split_decoded_chunks,
 )
 from ltx_pipelines.chunks.conditionings import (
     assert_image_frames_in_clip,
@@ -60,9 +59,13 @@ from ltx_pipelines.utils.helpers import (
     ensure_tiling_config,
     get_device,
     snap_frames_to_grid,
-    tiling_scale_factors_for_vae,
 )
-from ltx_pipelines.utils.media_io import EXRColorSpace, encode_video, resolve_hdr_color_space, vae_dtype_for_hdr
+from ltx_pipelines.utils.media_io import (
+    EXRColorSpace,
+    encode_media_segments,
+    resolve_hdr_color_space,
+    vae_dtype_for_hdr,
+)
 from ltx_pipelines.utils.model_paths import ModelPaths
 from ltx_pipelines.utils.samplers import euler_ancestral_denoising_loop
 from ltx_pipelines.utils.types import (
@@ -109,6 +112,8 @@ def ancestral_sampler_kwargs(seed: int, dtype: torch.dtype, noise_seed_offset: i
         audio_state: LatentState | None,
         transformer: X0Model,
         denoiser: Denoiser,
+        v_context: torch.Tensor | None = None,
+        a_context: torch.Tensor | None = None,
     ) -> VideoAudio[LatentState]:
         nonlocal call_index
         result = euler_ancestral_denoising_loop(
@@ -117,6 +122,8 @@ def ancestral_sampler_kwargs(seed: int, dtype: torch.dtype, noise_seed_offset: i
             audio_state,
             transformer,
             denoiser,
+            v_context,
+            a_context,
             noise_seed=base_seed + call_index,
             model_dtype=dtype,
             eta=ANCESTRAL_ETA,
@@ -172,7 +179,7 @@ class DistilledPipeline:
         loras: list[LoraPathStrengthAndSDOps],
         device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
-        registry: Registry | None = None,
+        registry: ModelRegistry | None = None,
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
@@ -181,6 +188,7 @@ class DistilledPipeline:
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
+        registry = registry or ModelRegistry()
 
         self.prompt_encoder = PromptEncoder(
             model_paths,
@@ -294,10 +302,8 @@ class DistilledPipeline:
         if chunk_config is None:
             chunk_config = ChunkConfig(chunk_pixel_frames=resolved_num_frames, next_video_carry_frames=0)
 
-        scale_factors = tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path)
         resolved_tiling_config = ensure_tiling_config(
             tiling_config,
-            scale_factors=scale_factors,
             vae_checkpoint_path=self.video_decoder.checkpoint_path,
             video_shape=VideoPixelShape(
                 batch=1,
@@ -309,6 +315,7 @@ class DistilledPipeline:
             diffvae_optimization=self.video_decoder.diffvae_optimization,
             device=self.device,
             keyframes=decode_with_keyframes,
+            vae_dtype=vae_dtype,
         )
 
         return _DistilledRunContext(
@@ -421,7 +428,7 @@ class DistilledPipeline:
         generated_keyframes: int | Sequence[int] = 0,
         decode_with_keyframes: bool = False,
         chunk_config: ChunkConfig | None = None,
-    ) -> tuple[Iterator[DecodedChunk], int, TilingConfig]:
+    ) -> tuple[Iterator[PlaybackSegment], int, TilingConfig]:
         """Generate a video as a stream of decoded chunks for long clips.
         Each stage samples according to ``self.use_ancestral_sampler``, with its own noise-seed
         offset, exactly as in :meth:`__call__`. Within a stage the ancestral seed advances per
@@ -532,7 +539,7 @@ def main() -> None:
     )
     vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
     chunk_config = chunk_config_from_args(args)
-    chunks, num_frames, tiling_config = pipeline.stream_chunks(
+    chunks, _, _ = pipeline.stream_chunks(
         prompt=args.prompt,
         seed=args.seed,
         height=args.height,
@@ -549,25 +556,12 @@ def main() -> None:
         decode_with_keyframes=args.decode_with_keyframes,
         chunk_config=chunk_config,
     )
-    if chunk_config is not None:
-        video, audio, audio_sampling_rate = split_decoded_chunks(chunks)
-        video_chunks_number = 1
-    else:
-        result = pipeline_output_from_chunks(
-            chunks,
-            num_frames=num_frames,
-            tiling_config=tiling_config,
-        )
-        video, audio, audio_sampling_rate = result.video, result.audio, None
-        video_chunks_number = get_video_chunks_number(result.num_frames, result.tiling_config)
-    encode_video(
-        video=video,
+    encode_media_segments(
+        chunks,
         fps=args.frame_rate,
-        audio=audio,
         output_path=args.output_path,
-        video_chunks_number=video_chunks_number,
+        video_chunks_number=None,
         color_space=hdr,
-        audio_sampling_rate=audio_sampling_rate,
         video_marker=video_marker,
         audio_marker=audio_marker,
     )

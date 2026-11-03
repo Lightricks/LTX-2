@@ -1,6 +1,8 @@
+from collections.abc import Mapping
+
 import torch
 
-from ltx_core.loader.sd_ops import KeyValueOperationResult, SDOps
+from ltx_core.loader.sd_ops import SDOps
 from ltx_core.model.audio_vae.attention import AttentionType
 from ltx_core.model.audio_vae.audio_vae import AudioDecoder, AudioEncoder
 from ltx_core.model.audio_vae.causality_axis import CausalityAxis
@@ -89,19 +91,19 @@ class VocoderConfigurator(ModelConfigurator[Vocoder]):
         )
 
 
-def _strip_vocoder_prefix(key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
+def _strip_vocoder_prefix(key: str, inputs: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Strip the leading 'vocoder.' prefix exactly once.
     Uses removeprefix instead of str.replace so that BWE keys like
     'vocoder.vocoder.conv_pre' become 'vocoder.conv_pre' (not 'conv_pre').
     Works identically for legacy keys like 'vocoder.conv_pre' → 'conv_pre'.
     """
-    return [KeyValueOperationResult(key.removeprefix("vocoder."), value)]
+    return {key.removeprefix("vocoder."): inputs[key]}
 
 
 VOCODER_COMFY_KEYS_FILTER = (
     SDOps("VOCODER_COMFY_KEYS_FILTER")
     .with_matching(prefix="vocoder.")
-    .with_kv_operation(operation=_strip_vocoder_prefix, key_prefix="vocoder.")
+    .with_kv_operation(_strip_vocoder_prefix, key_prefix="vocoder.")
 )
 
 

@@ -20,26 +20,31 @@ import torch.distributed as dist
 from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_core.components.guiders import MultiModalGuiderParams
 from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDOps
-from ltx_core.loader.registry import ModelRegistry
+from ltx_core.loader.distributed_builders import (
+    AccelerateGemmaBuilder,
+    SequenceParallelBuilder,
+    TiledDataParallelBuilder,
+)
 from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.multigpu.transformer.attention import AttentionManager
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.quantization.fp8_cast import build_policy as _build_fp8_cast_policy
 from ltx_core.tiling import DimensionTilingConfig, TileCountConfig, balanced_tile_split
-from ltx_pipelines.chunks import ChunkConfig, split_decoded_chunks
+from ltx_pipelines.chunks import ChunkConfig
 from ltx_pipelines.multigpu.controller import MGPUController
-from ltx_pipelines.multigpu.gemma_builders import AccelerateGemmaBuilder
-from ltx_pipelines.multigpu.runner import MGPURunner
-from ltx_pipelines.multigpu.sp_builder import SequenceParallelBuilder
-from ltx_pipelines.multigpu.tdp_builder import TiledDataParallelBuilder
+from ltx_pipelines.multigpu.runner import MGPURunner, rank_cuda_registry
 from ltx_pipelines.multigpu.vae_builders import DistributedDecoderBuilder
-from ltx_pipelines.multigpu.weight_tracker import TransformerWeightTracker
 from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
 from ltx_pipelines.utils.args import markers_from_args
 from ltx_pipelines.utils.constants import TDP_DISTILLED_SIGMAS
 from ltx_pipelines.utils.helpers import get_device
-from ltx_pipelines.utils.media_io import EXRColorSpace, encode_video, resolve_hdr_color_space, vae_dtype_for_hdr
+from ltx_pipelines.utils.media_io import (
+    EXRColorSpace,
+    encode_media_segments,
+    resolve_hdr_color_space,
+    vae_dtype_for_hdr,
+)
 from ltx_pipelines.utils.model_paths import ModelPaths
 from ltx_pipelines.utils.types import DEFAULT_AUTO_DURATION, AutoDuration
 
@@ -73,20 +78,21 @@ class TI2VidTwoStagesRunner(MGPURunner):
             quantization() if quantization is not None else _build_fp8_cast_policy(model_paths.transformer())
         )
         distilled_lora = [LoraPathStrengthAndSDOps(distilled_lora_path, 1.0, LTXV_LORA_COMFY_RENAMING_MAP)]
-        registry = ModelRegistry()
+        unit_registry = rank_cuda_registry()
         pipeline = TI2VidTwoStagesPipeline(
             model_paths=model_paths,
             distilled_lora=distilled_lora,
             spatial_upsampler_path=spatial_upsampler_path,
             prompt_enhancer_gemma_root=prompt_enhancer_gemma_root,
             loras=[],
-            registry=registry,
+            registry=unit_registry,
             quantization=quantization_policy,
             compilation_config=compilation_config,
             alloc_trim_strategy=AllocatorTrimStrategy.DEFER,
             diffvae_optimization=diffvae_optimization,
         )
-        tracker = TransformerWeightTracker(group=self.groups.transformer_group)
+        # Every distributed transformer build of this runner rewrites one shared set of active weights.
+        active_weights: dict[str, torch.Tensor] = {}
 
         # Stage 1: sequence parallelism.
         model_cfg = pipeline.stage_1._transformer_builder.model_config().get("transformer", {})
@@ -98,10 +104,7 @@ class TI2VidTwoStagesRunner(MGPURunner):
             group=self.groups.transformer_group,
         )
         pipeline.stage_1._transformer_builder = SequenceParallelBuilder(
-            inner=pipeline.stage_1._transformer_builder,
-            attn_mgr=attn_mgr,
-            registry=registry,
-            tracker=tracker,
+            pipeline.stage_1._transformer_builder.with_registry(unit_registry), attn_mgr, dst=active_weights
         )
 
         # Stage 2: tiled data parallelism -- balanced 2D spatial grid over the group (one tile/rank).
@@ -112,34 +115,23 @@ class TI2VidTwoStagesRunner(MGPURunner):
             width=DimensionTilingConfig(num_tiles=tdp_width_tiles, overlap=5),
         )
         pipeline.stage_2._transformer_builder = TiledDataParallelBuilder(
-            inner=pipeline.stage_2._transformer_builder,
-            group=self.groups.transformer_group,
-            tiling=tdp_tiling,
-            registry=registry,
-            tracker=tracker,
+            pipeline.stage_2._transformer_builder.with_registry(unit_registry),
+            self.groups.transformer_group,
+            tdp_tiling,
+            dst=active_weights,
         )
 
         # Accelerate Gemma parallelization. Capture shared-vs-separate before replacing
         # the encode builder so a shared alias is re-bound to the new instance.
         pe = pipeline.prompt_encoder
         separate_enhancer = pe._enhancer_text_encoder_builder is not pe._text_encoder_builder
-        pe._text_encoder_builder = AccelerateGemmaBuilder(
-            gemma_root_path=model_paths.text_encoder(),
-            gemma_group=self.groups.gemma_group,
-            broadcast_group=self.groups.transformer_group,
-            registry=registry,
-            src_rank=_DRIVER_RANK,
-            dtype=pipeline.dtype,
+        pe._text_encoder_builder = AccelerateGemmaBuilder.from_root(
+            model_paths.text_encoder(), unit_registry, self.groups.gemma_group, _DRIVER_RANK
         )
         if separate_enhancer:
             assert prompt_enhancer_gemma_root is not None
-            pe._enhancer_text_encoder_builder = AccelerateGemmaBuilder(
-                gemma_root_path=prompt_enhancer_gemma_root,
-                gemma_group=self.groups.gemma_group,
-                broadcast_group=self.groups.transformer_group,
-                registry=registry,
-                src_rank=_DRIVER_RANK,
-                dtype=pipeline.dtype,
+            pe._enhancer_text_encoder_builder = AccelerateGemmaBuilder.from_root(
+                prompt_enhancer_gemma_root, unit_registry, self.groups.gemma_group, _DRIVER_RANK
             )
         else:
             pe._enhancer_text_encoder_builder = pe._text_encoder_builder
@@ -157,7 +149,7 @@ class TI2VidTwoStagesRunner(MGPURunner):
             vae_group=self.groups.vae_group,
             vae_tiling=vae_tiling,
             driver_rank=_DRIVER_RANK,
-            registry=registry,
+            registry=unit_registry,
         )
 
         self._pipeline = pipeline
@@ -224,18 +216,20 @@ class TI2VidTwoStagesRunner(MGPURunner):
                 pass
             yield None
             return
-        video, audio, audio_sampling_rate = split_decoded_chunks(chunks)
-        encode_video(
-            video=video,
-            fps=frame_rate,
-            audio=audio,
-            output_path=output_path,
-            video_chunks_number=1,
-            color_space=hdr,
-            audio_sampling_rate=audio_sampling_rate,
-            video_marker=video_marker,
-            audio_marker=audio_marker,
-        )
+        try:
+            encode_media_segments(
+                chunks,
+                fps=frame_rate,
+                output_path=output_path,
+                video_chunks_number=None,
+                color_space=hdr,
+                video_marker=video_marker,
+                audio_marker=audio_marker,
+            )
+        except ValueError as error:
+            # Encoding runs only on the driver, so its failures cannot use the
+            # recoverable ValueError path that requires every rank to exit together.
+            raise RuntimeError("media encoding failed on the driver rank") from error
         yield output_path
 
 

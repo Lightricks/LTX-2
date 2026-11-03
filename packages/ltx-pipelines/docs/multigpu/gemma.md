@@ -1,6 +1,6 @@
 # Gemma Text Encoder (Multi-GPU)
 
-**Source**: [`multigpu/gemma_builders.py`](../../src/ltx_pipelines/multigpu/gemma_builders.py), [`multigpu/bp_gemma_builder.py`](../../src/ltx_pipelines/multigpu/bp_gemma_builder.py)
+**Source**: [`ltx_core/loader/distributed_builders.py`](../../../ltx-core/src/ltx_core/loader/distributed_builders.py)
 
 Two ways to run the Gemma text encoder across the fleet. Both swap in for
 `pipeline.prompt_encoder._text_encoder_builder` and broadcast the resulting
@@ -15,34 +15,31 @@ NCCL. The source rank fuses all prompts into one Gemma call, then broadcasts eac
 output.
 
 Gemma's shards share GPUs with the other ranks, so the non-source ranks must not
-post their NCCL receives while Gemma is still running: a receive kernel spins on
+post their NCCL collectives while Gemma is still running: a receive kernel spins on
 its GPU, and the two processes then time-slice it. Each builder therefore owns a
 `BroadcastCoordinator` (`ltx_core.multigpu.broadcast`) on the default store and
 hands it to every wrapper it builds. The source rank synchronizes the devices
 holding Gemma's outputs and signals; the other ranks poll the store every 1 ms on
-the host and only then receive. `enhance_*` results are gated the same way.
-A waiting rank raises `TimeoutError` after 10 minutes (NCCL's default collective
-timeout), e.g. when the source rank failed before broadcasting. Construct the
-builders on every rank in `setup()`, in the same order and before any job runs:
-each builder's store key comes from its construction order.
+the host and only then join the collective. This gates the build and encode
+agreements, each output broadcast and the `enhance_*` results. A waiting rank
+raises `TimeoutError` after 10 minutes (NCCL's default collective timeout), e.g.
+when the source rank failed before signaling. Construct the builders on every rank
+in `setup()`, in the same order and before any job runs: each builder's store key
+comes from its construction order, and copies of a builder keep its coordinator.
 
-The first `build()` loads Gemma via `load_gemma_with_device_map` (directory
-`from_pretrained(device_map="auto")`, or single-file TE with the same balanced
-placement) and caches the full state dict (including non-persistent buffers) in
-the registry; later builds recreate the model from cache and reinstall the
-dispatch hooks — no disk I/O.
+The first `build()` loads Gemma on the CPU through its `SimpleBuilder`, computes a
+balanced device map and dispatches it. The builder keeps that encoder and its
+device-mapped weights: after the wrapper's `dispose`, a later build reassigns the
+weights to the same dispatched encoder — no disk I/O and no new dispatch.
 
 ```python
-from ltx_pipelines.multigpu.gemma_builders import AccelerateGemmaBuilder
+from ltx_core.loader.distributed_builders import AccelerateGemmaBuilder
 
-AccelerateGemmaBuilder(
-    gemma_root_path: str,                       # HF gemma dir OR split TE .safetensors
-    gemma_group: dist.ProcessGroup | None,      # self.groups.gemma_group
-    broadcast_group: dist.ProcessGroup | None,  # self.groups.transformer_group
-    registry: Registry,
-    *,
-    src_rank: int,                              # rank that loads + encodes (usually 0)
-    dtype: torch.dtype = torch.bfloat16,
+AccelerateGemmaBuilder.from_root(
+    root: str | Path,              # HF gemma dir OR split TE .safetensors
+    registry: ModelRegistry,
+    group: dist.ProcessGroup,      # self.groups.gemma_group
+    src_rank: int,                 # rank that loads + encodes (usually 0)
 )
 ```
 
@@ -55,27 +52,17 @@ separate enhancer still comes from `--prompt-enhancer-gemma-root` when set (may
 be `None` when enhance shares the encode checkpoint).
 
 ```python
-from ltx_pipelines.multigpu.gemma_builders import AccelerateGemmaBuilder
+from ltx_core.loader.distributed_builders import AccelerateGemmaBuilder
 
 pe = pipeline.prompt_encoder
 # Shared enhance aliases the encode builder; capture that before replacing encode.
 separate_enhancer = pe._enhancer_text_encoder_builder is not pe._text_encoder_builder
-pe._text_encoder_builder = AccelerateGemmaBuilder(
-    gemma_root_path=model_paths.text_encoder(),
-    gemma_group=self.groups.gemma_group,
-    broadcast_group=self.groups.transformer_group,
-    registry=registry,
-    src_rank=0,
-    dtype=pipeline.dtype,
+pe._text_encoder_builder = AccelerateGemmaBuilder.from_root(
+    model_paths.text_encoder(), registry, self.groups.gemma_group, 0
 )
 if separate_enhancer:
-    pe._enhancer_text_encoder_builder = AccelerateGemmaBuilder(
-        gemma_root_path=prompt_enhancer_gemma_root,
-        gemma_group=self.groups.gemma_group,
-        broadcast_group=self.groups.transformer_group,
-        registry=registry,
-        src_rank=0,
-        dtype=pipeline.dtype,
+    pe._enhancer_text_encoder_builder = AccelerateGemmaBuilder.from_root(
+        prompt_enhancer_gemma_root, registry, self.groups.gemma_group, 0
     )
 else:
     pe._enhancer_text_encoder_builder = pe._text_encoder_builder
@@ -89,23 +76,19 @@ shared enhance stays one residency. Enhance goes through `AccelerateGemmaWrapper
 
 ## `BatchParallelGemmaBuilder` (replicated — data-parallel over prompts)
 
-Every rank materialises a **full** `GemmaTextEncoder` on its own GPU via the standard
-`SingleGPUModelBuilder` path (no Accelerate, no `device_map`, no per-layer dispatch
-hooks). The wrapper (`BatchParallelGemmaWrapper`) then **partitions the prompt list
+Every rank materialises a **full** `GemmaTextEncoder` on its own GPU via its
+`SimpleBuilder` (no Accelerate, no `device_map`, no per-layer dispatch hooks). The wrapper (`BatchParallelGemmaWrapper`) then **partitions the prompt list
 across ranks** in `encode` and broadcasts each prompt's output, so the forwards run
 concurrently on different GPUs. Non-deterministic prompt enhancement
 (`enhance_t2v` / `enhance_i2v`) is routed through a single `src_rank`.
 
 ```python
-from ltx_pipelines.multigpu.bp_gemma_builder import BatchParallelGemmaBuilder
+from ltx_core.loader.distributed_builders import BatchParallelGemmaBuilder
 
 BatchParallelGemmaBuilder(
-    gemma_root_path: str,  # HF gemma dir OR split TE .safetensors (same as Accelerate path)
-    broadcast_group: dist.ProcessGroup | None,
-    registry: Registry,
-    *,
+    base: SimpleBuilder,           # e.g. gemma3_builder(root) / gemma4_builder(root)
+    group: dist.ProcessGroup,
     src_rank: int,
-    dtype: torch.dtype = torch.bfloat16,
 )
 ```
 

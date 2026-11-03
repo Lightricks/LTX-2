@@ -9,7 +9,7 @@ from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.conditioning import VideoGeneratedKeyframeSlots
 from ltx_core.loader import LoraPathStrengthAndSDOps
-from ltx_core.loader.registry import Registry
+from ltx_core.loader.registry import ModelRegistry
 from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig, get_video_chunks_number
 from ltx_core.model.video_vae.transformer import DiffVAEMode
@@ -47,7 +47,6 @@ from ltx_pipelines.utils.helpers import (
     get_device,
     image_conditionings,
     resolve_generated_keyframes,
-    tiling_scale_factors_for_vae,
 )
 from ltx_pipelines.utils.media_io import (
     EXRColorSpace,
@@ -90,7 +89,7 @@ class TI2VidTwoStagesHQPipeline:
         loras: tuple[LoraPathStrengthAndSDOps, ...],
         device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
-        registry: Registry | None = None,
+        registry: ModelRegistry | None = None,
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
@@ -99,6 +98,7 @@ class TI2VidTwoStagesHQPipeline:
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
+        registry = registry or ModelRegistry()
         self._scheduler = LTX2Scheduler()
 
         distilled_lora_stage_1 = LoraPathStrengthAndSDOps(
@@ -236,15 +236,14 @@ class TI2VidTwoStagesHQPipeline:
             frame_rate=frame_rate,
         )
 
-        scale_factors = tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path)
         tiling_config = ensure_tiling_config(
             tiling_config,
-            scale_factors=scale_factors,
             vae_checkpoint_path=self.video_decoder.checkpoint_path,
             video_shape=VideoPixelShape(batch=1, frames=num_frames, height=height, width=width, fps=frame_rate),
             diffvae_optimization=self.video_decoder.diffvae_optimization,
             device=self.device,
             keyframes=decode_with_keyframes,
+            vae_dtype=vae_dtype,
         )
 
         keyframe_positions = resolve_generated_keyframes(generated_keyframes, num_frames)
@@ -280,18 +279,13 @@ class TI2VidTwoStagesHQPipeline:
         sigmas = stage_1_sigmas.to(dtype=torch.float32, device=self.device)
 
         video_latent, audio_latent = create_initial_av_latents(
-            width=stage_1_output_shape.width,
-            height=stage_1_output_shape.height,
-            frames=num_frames,
-            fps=frame_rate,
+            pixel_shape=stage_1_output_shape,
             device=self.device,
             dtype=self.dtype,
             video_scale_factors=self.stage_1.video_scale_factors,
         )
         video_state, audio_state = self.stage_1(
             denoiser=GuidedDenoiser(
-                v_context=v_context_p,
-                a_context=a_context_p,
                 video_guider=MultiModalGuider(
                     params=video_guider_params,
                     negative_context=v_context_n,
@@ -348,7 +342,7 @@ class TI2VidTwoStagesHQPipeline:
         # Stage 2 refines video only; discard its audio. On the multi-GPU path stage-2 audio
         # runs under partial tiled/TDP video context, so the full-context stage-1 audio is kept.
         video_state, _ = self.stage_2(
-            denoiser=SimpleDenoiser(v_context=v_context_p, a_context=a_context_p),
+            denoiser=SimpleDenoiser(),
             sigmas=stage_2_sigmas,
             noiser=noiser,
             modalities=VideoAudio(

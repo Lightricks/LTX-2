@@ -1,6 +1,6 @@
 [build-system]
 requires = [
-  "setuptools>=61",
+  "setuptools>=77",
   "wheel",
   "torch",
 ]
@@ -8,7 +8,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ltx-kernels"
-version = "1.5.0"
+version = "1.6.0"
+license = "Apache-2.0"
 dependencies = [
     "torch",
     "triton>=3.0",

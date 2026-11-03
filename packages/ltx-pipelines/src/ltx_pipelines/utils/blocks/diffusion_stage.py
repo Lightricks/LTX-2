@@ -3,26 +3,28 @@ from __future__ import annotations
 import copy
 import logging
 from collections.abc import Callable, Iterator, Sequence
-from contextlib import AbstractContextManager, ExitStack, contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import replace
+from pathlib import Path
 
 import torch
 
 from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_core.batch_split import BatchSplitAdapter
-from ltx_core.block_streaming import DISK_CPU_SLOTS, StreamingModelBuilder
 from ltx_core.components.noisers import Noiser
 from ltx_core.components.patchifiers import AudioPatchifier, VideoLatentPatchifier
 from ltx_core.conditioning import ConditioningItem, VideoGeneratedKeyframeSlots
+from ltx_core.devices import synchronize_device
 from ltx_core.loader import SDOps
 from ltx_core.loader.attention_ops import set_attention_module_op
-from ltx_core.loader.fuse_loras import bf16_fuse_rule
+from ltx_core.loader.distributed_builders import SequenceParallelBuilder, TiledDataParallelBuilder
 from ltx_core.loader.helpers import to_device
-from ltx_core.loader.module_ops import ModuleOps
-from ltx_core.loader.primitives import LoraPathStrengthAndSDOps, ModelBuilderProtocol
-from ltx_core.loader.registry import ModelRegistry, Registry
-from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
-from ltx_core.model.model_protocol import LTXModelProtocol, ModelConfigurator
+from ltx_core.loader.lora_request import LoraPathStrengthAndSDOps
+from ltx_core.loader.model_builder import ModelBuilder
+from ltx_core.loader.registry import ModelRegistry
+from ltx_core.loader.simple_builder import LoRARequest, SimpleBuilder
+from ltx_core.loader.streaming_builder import StreamingBuilder, StreamingConfig
+from ltx_core.model.model_protocol import ModelConfigurator
 from ltx_core.model.transformer import (
     LTXV_MODEL_COMFY_RENAMING_MAP,
     LTXModelConfigurator,
@@ -31,10 +33,11 @@ from ltx_core.model.transformer import (
 from ltx_core.model.transformer.attention import AttentionCallable, AttentionFunction
 from ltx_core.model.transformer.compiling import (
     CompilationConfig,
-    build_compile_transformer_op,
-    modify_sd_ops_for_compilation,
+    compose_compilation,
 )
-from ltx_core.quantization import QuantizationPolicy, fp8_cast_fuse_rule
+from ltx_core.model.transformer.model_configurator import transformer_checkpoint_selection_ops
+from ltx_core.quantization import QuantizationPolicy
+from ltx_core.quantization.policy import compose_quantization
 from ltx_core.tools import AudioLatentTools, LatentTools, VideoLatentTools
 from ltx_core.types import (
     VIDEO_SCALE_FACTORS,
@@ -45,7 +48,11 @@ from ltx_core.types import (
     VideoLatentShape,
 )
 from ltx_pipelines.utils.gpu_model import gpu_model
-from ltx_pipelines.utils.helpers import assert_stage_supports_generated_keyframes, create_noised_state
+from ltx_pipelines.utils.helpers import (
+    assert_stage_supports_generated_keyframes,
+    cleanup_memory,
+    create_noised_state,
+)
 from ltx_pipelines.utils.samplers import euler_denoising_loop
 from ltx_pipelines.utils.streaming_model import streaming_model
 from ltx_pipelines.utils.types import Denoiser, ModalitySpec, OffloadMode, VideoAudio
@@ -62,18 +69,8 @@ DenoisingLoop = Callable[..., VideoAudio[LatentState]]
 __all__ = ["DenoisingLoop", "DiffusionStage", "ModelWrapper", "RecordingDiffusionStage"]
 
 
-class _ResidentTransformer:
-    """The transformer a :meth:`DiffusionStage.resident` block holds: built by its first call, released at its end."""
-
-    def __init__(self) -> None:
-        self.model: X0Model | None = None
-        self.active = True
-        self.lifetime = ExitStack()
-
-    def release(self) -> None:
-        self.active = False
-        self.model = None
-        self.lifetime.close()
+def _unit_lora_request(lora: LoraPathStrengthAndSDOps) -> LoRARequest:
+    return LoRARequest((Path(lora.path),), lora.strength, (lora.sd_ops,))
 
 
 class DiffusionStage:
@@ -81,13 +78,16 @@ class DiffusionStage:
     Under ``AllocatorTrimStrategy.DEFER`` a builder whose weights the registry keeps GPU-resident
     (``keeps_gpu_resident_weights``) leaves its build assigned instead: every build reassigns those
     weights, so a dispose would release no memory.
+    Stages given one ``active_weights`` dict share one transformer allocation: the first build fills it, and
+    later builds, also of copies made with ``with_loras`` and similar, reuse the registry's bound model or rewrite
+    only the weights an adapter switch touches. Those builds stay assigned until :meth:`release_transformer`.
     Replaces the manual build-transformer / ``del transformer`` pattern that
     every pipeline previously repeated.
     """
 
     def __init__(
         self,
-        transformer_builder: ModelBuilderProtocol[LTXModelProtocol],
+        transformer_builder: ModelBuilder,
         dtype: torch.dtype,
         device: torch.device,
         *,
@@ -95,14 +95,15 @@ class DiffusionStage:
         compilation_config: CompilationConfig | None = None,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
         scale_factors: SpatioTemporalScaleFactors = VIDEO_SCALE_FACTORS,
+        active_weights: dict[str, torch.Tensor] | None = None,
     ) -> None:
         """Construct a stage from a single pre-built transformer ``builder``.
         Holds only that builder plus build-time configuration (dtype, device,
         quantization, compilation). Turning a checkpoint path + LoRA set into a
-        builder -- and choosing a :class:`StreamingModelBuilder` when offloading --
+        builder -- and choosing a :class:`StreamingBuilder` when offloading --
         lives in :meth:`from_checkpoint`, which is how pipelines normally create a
-        stage. A :class:`StreamingModelBuilder` selects the block-streaming build
-        path; any other builder uses the standard (all-on-GPU) path.
+        stage. A :class:`StreamingBuilder` streams units; a :class:`SimpleBuilder`
+        loads them for an ordinary full-model build.
         ``quantization`` and ``compilation_config`` are applied lazily by
         :meth:`_prepared_builder` on both the standard and streaming paths.
         ``scale_factors`` are the video VAE's spatiotemporal downscaling factors,
@@ -116,7 +117,7 @@ class DiffusionStage:
         self._alloc_trim_strategy = alloc_trim_strategy
         self.video_scale_factors = scale_factors
         self._model_wrapper: ModelWrapper | None = None
-        self._resident: _ResidentTransformer | None = None
+        self._active_weights = active_weights
 
     @classmethod
     def from_checkpoint(  # noqa: PLR0913
@@ -126,34 +127,36 @@ class DiffusionStage:
         device: torch.device,
         loras: tuple[LoraPathStrengthAndSDOps, ...] = (),
         quantization: QuantizationPolicy | None = None,
-        registry: Registry | None = None,
+        registry: ModelRegistry | None = None,
         compilation_config: CompilationConfig | None = None,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
         offload_mode: OffloadMode = OffloadMode.NONE,
         model_configurator: type[ModelConfigurator] = LTXModelConfigurator,
         model_sd_ops: SDOps = LTXV_MODEL_COMFY_RENAMING_MAP,
         scale_factors: SpatioTemporalScaleFactors = VIDEO_SCALE_FACTORS,
+        active_weights: dict[str, torch.Tensor] | None = None,
     ) -> "DiffusionStage":
         """Build a stage from a checkpoint path and LoRA set.
         Constructs a single transformer builder from ``checkpoint_path`` +
         ``loras`` and delegates to ``__init__``. When ``offload_mode != OffloadMode.NONE``
-        that builder is a :class:`StreamingModelBuilder` (fuse rule +
-        ``cpu_slots_count`` for the mode); otherwise it is the standard single-GPU
-        builder. Quantization and compilation stay on the stage and are applied
-        lazily at build time. This is the high-level entry point used by pipelines;
-        ``__init__`` itself takes an already-built builder.
+        that builder is a :class:`StreamingBuilder` (with a backing mode);
+        otherwise it is a :class:`SimpleBuilder`. Quantization and compilation
+        stay on the stage and are applied lazily at build time. This is the
+        high-level entry point used by pipelines. ``__init__`` itself takes
+        an already-built builder.
         ``model_configurator`` / ``model_sd_ops`` let callers (e.g. the audio-only
         T2A pipeline) override the model class configurator and the state-dict key
         mapping.
         """
-        transformer_builder: ModelBuilderProtocol[LTXModelProtocol]
+        unit_registry = registry or ModelRegistry()
+        transformer_builder: ModelBuilder
         if offload_mode == OffloadMode.NONE:
-            transformer_builder = Builder(
-                model_path=checkpoint_path,
-                model_class_configurator=model_configurator,
-                model_sd_ops=model_sd_ops,
-                loras=tuple(loras),
-                registry=registry or ModelRegistry(cache_models=True, cache_weights=False),
+            transformer_builder = SimpleBuilder(
+                model_configurator,
+                (Path(checkpoint_path),),
+                (model_sd_ops,),
+                loras=tuple(_unit_lora_request(lora) for lora in loras),
+                registry=unit_registry,
             )
         else:
             transformer_builder = cls._build_streaming_builder(
@@ -161,8 +164,7 @@ class DiffusionStage:
                 configurator=model_configurator,
                 model_sd_ops=model_sd_ops,
                 loras=tuple(loras),
-                quantization=quantization,
-                registry=registry or ModelRegistry(cache_models=True, cache_weights=False),
+                registry=unit_registry,
                 offload_mode=offload_mode,
             )
 
@@ -174,6 +176,7 @@ class DiffusionStage:
             compilation_config=compilation_config,
             alloc_trim_strategy=alloc_trim_strategy,
             scale_factors=scale_factors,
+            active_weights=active_weights,
         )
 
     @staticmethod
@@ -183,34 +186,25 @@ class DiffusionStage:
         configurator: type[ModelConfigurator],
         model_sd_ops: SDOps,
         loras: tuple[LoraPathStrengthAndSDOps, ...],
-        quantization: QuantizationPolicy | None,
-        registry: Registry,
+        registry: ModelRegistry,
         offload_mode: OffloadMode,
-    ) -> StreamingModelBuilder:
+    ) -> StreamingBuilder:
         """Construct the streaming transformer builder for an offloading stage.
-        Returns a :class:`StreamingModelBuilder` with the checkpoint path, LoRAs,
-        fuse rule (bf16 or fp8_cast), and ``cpu_slots_count`` for ``offload_mode``.
+        Returns a :class:`StreamingBuilder` with the checkpoint path, LoRAs,
+        and backing mode selected by ``offload_mode``.
         Compilation / quantization sd_ops and module_ops are not applied here --
         the stage applies them lazily via :meth:`_prepared_builder`.
         """
-        # WeightsProvider currently only supports plain bf16 + fp8_cast LoRA fusion
-        # (no companion-key emission). Quantization policies that emit
-        # companion keys (e.g. ``.weight_scale``) cannot be streamed yet.
-        if quantization is not None and quantization.fuse_rule is not fp8_cast_fuse_rule:
-            raise ValueError(
-                "Block streaming is not supported with this quantization policy "
-                "(only bf16 and fp8_cast are currently supported)."
-            )
-        return StreamingModelBuilder(
-            model_class_configurator=configurator,
-            model_path=checkpoint_path,
-            model_sd_ops=model_sd_ops,
-            loras=loras,
+        base = SimpleBuilder(
+            configurator,
+            (Path(checkpoint_path),),
+            (model_sd_ops,),
+            loras=tuple(_unit_lora_request(lora) for lora in loras),
             registry=registry,
-            fuse_rule=quantization.fuse_rule if quantization is not None else bf16_fuse_rule,
-            blocks_attr="transformer_blocks",
-            blocks_prefix="transformer_blocks",
-            cpu_slots_count=DISK_CPU_SLOTS if offload_mode == OffloadMode.DISK else None,
+        )
+        return StreamingBuilder(
+            base,
+            StreamingConfig("transformer_blocks", "disk" if offload_mode == OffloadMode.DISK else "cpu"),
         )
 
     @property
@@ -221,8 +215,14 @@ class DiffusionStage:
         tokens while still costing a full latent frame of tokens each, so pipelines refuse rather
         than silently degrade.
         """
-        transformer_config = self._transformer_builder.model_config().get("transformer", {})
+        transformer_config = self._model_config().get("transformer", {})
         return bool(transformer_config.get("use_keyframes_abs_pos_embedding", False))
+
+    def _model_config(self) -> dict:
+        builder = self._transformer_builder
+        if isinstance(builder, (SequenceParallelBuilder, TiledDataParallelBuilder)):
+            return builder.base.model_config()
+        return builder.model_config()
 
     def _assert_supports_conditionings(self, conditionings: Sequence[ConditioningItem] | None) -> None:
         if conditionings is None or self.supports_generated_keyframes:
@@ -251,20 +251,22 @@ class DiffusionStage:
             return self
         op = set_attention_module_op(attention)
         new = copy.copy(self)
-        new._transformer_builder = self._transformer_builder.with_module_ops(
-            (*self._transformer_builder.module_ops, op),
+        builder = self._transformer_builder
+        new._transformer_builder = (
+            replace(builder, base=builder.base.with_module_ops((*builder.base.module_ops, op)))
+            if isinstance(builder, (StreamingBuilder, SequenceParallelBuilder, TiledDataParallelBuilder))
+            else builder.with_module_ops((*builder.module_ops, op))
         )
-        new._resident = None
         return new
 
-    def with_builder(self, builder: ModelBuilderProtocol[LTXModelProtocol]) -> "DiffusionStage":
+    def with_builder(self, builder: ModelBuilder) -> "DiffusionStage":
         """Return a new ``DiffusionStage`` that builds its transformer from ``builder``.
-        Functional: never mutates ``self``; shares all other configuration (dtype, device,
-        quantization, compilation). Affects the standard (non-offload) build path.
+        Functional: never mutates ``self``; shares all other configuration
+        (dtype, device, quantization, compilation). The given builder determines
+        the build path on subsequent calls.
         """
         new = copy.copy(self)
         new._transformer_builder = builder
-        new._resident = None
         return new
 
     def with_model_wrapper(self, wrapper: "ModelWrapper | None") -> "DiffusionStage":
@@ -273,7 +275,7 @@ class DiffusionStage:
         context -- after the model is built, before the denoising loop -- on both the standard
         and block-streaming paths, and it receives the call's video tools. Wrapping *here*
         rather than around the builder is what lets a wrapper compose with offloading: a
-        wrapping builder would hide a :class:`StreamingModelBuilder` from :attr:`_is_streaming`,
+        wrapping builder would hide a :class:`StreamingBuilder` from :attr:`_is_streaming`,
         so the stage would take the plain ``gpu_model`` path and never tear the stream down.
         ``wrapper=None`` clears any previously set wrapper.
         """
@@ -294,65 +296,80 @@ class DiffusionStage:
         """
         new = copy.copy(self)
         new._quantization = quantization
-        new._resident = None
         return new
 
     def with_loras(self, loras: tuple[LoraPathStrengthAndSDOps, ...]) -> "DiffusionStage":
         """Return a new ``DiffusionStage`` built with exactly ``loras`` (replacing the current set)."""
-        return self.with_builder(self._transformer_builder.with_loras(loras))
+        builder = self._transformer_builder
+        if isinstance(builder, (StreamingBuilder, SequenceParallelBuilder, TiledDataParallelBuilder)):
+            requests = tuple(_unit_lora_request(lora) for lora in loras)
+            return self.with_builder(replace(builder, base=builder.base.with_loras(requests)))
+        return self.with_builder(builder.with_loras(tuple(_unit_lora_request(lora) for lora in loras)))
 
-    def _prepared_builder(self) -> ModelBuilderProtocol[LTXModelProtocol]:
+    def _prepared_builder(self) -> ModelBuilder:
         """Return the configured builder with the stage's build-time ops applied.
         Compilation and quantization live on the stage (not on the builder) and are
         applied here, lazily, for both the standard and streaming paths. This keeps
         the builder holding only raw sd_ops/module_ops/LoRAs, so ``with_loras`` /
         ``with_builder`` swap them consistently regardless of the build path. The
         returned copy preserves the builder's concrete type (e.g. a
-        ``StreamingModelBuilder`` stays one).
+        ``StreamingBuilder`` stays one).
         """
         builder = self._transformer_builder
         _ensure_cudagraph_compatible_builder(builder, self._compilation_config)
-        sd_ops = builder.model_sd_ops
-        module_ops = builder.module_ops
-        loras = builder.loras
+        prepared = builder if isinstance(builder, SimpleBuilder) else builder.base
         if self._quantization is not None:
-            sd_ops, module_ops = _chain_quantization(sd_ops, module_ops, self._quantization)
-            builder = builder.with_fuse_rule(self._quantization.fuse_rule)
+            prepared = compose_quantization(prepared, self._quantization)
         if self._compilation_config is not None:
-            number_of_layers = builder.model_config()["transformer"]["num_layers"]
-            sd_ops, module_ops, loras = _apply_compile_ops(
-                sd_ops, module_ops, loras, number_of_layers, self._compilation_config
-            )
-        return builder.with_module_ops(module_ops).with_sd_ops(sd_ops).with_loras(loras)
+            number_of_layers = self._model_config()["transformer"]["num_layers"]
+            prepared = compose_compilation(prepared, self._compilation_config, number_of_layers)
+        return prepared if isinstance(builder, SimpleBuilder) else replace(builder, base=prepared)
 
     def _build_transformer(self, *, device: torch.device | None = None, **kwargs: object) -> X0Model:
         target = device or self._device
-        return to_device(X0Model(self._prepared_builder().build(device=target, **kwargs)), target).eval()
+        builder = self._prepared_builder()
+        if isinstance(builder, (SimpleBuilder, SequenceParallelBuilder, TiledDataParallelBuilder)):
+            selection = transformer_checkpoint_selection_ops(self._model_config())
+            if selection is not None:
+                if isinstance(builder, SimpleBuilder):
+                    builder = builder.with_sd_ops((*builder.sd_ops, selection))
+                else:
+                    builder = replace(builder, base=builder.base.with_sd_ops((*builder.base.sd_ops, selection)))
+        if isinstance(builder, SimpleBuilder):
+            kwargs.pop("video_tools", None)
+            if self._shares_weights:
+                kwargs["dst"] = self._active_weights
+        return to_device(X0Model(builder.build(device=target, **kwargs)), target).eval()
+
+    @property
+    def _shares_weights(self) -> bool:
+        """Whether builds fill and reuse ``active_weights``: only a plain builder loads into it."""
+        return self._active_weights is not None and isinstance(self._transformer_builder, SimpleBuilder)
 
     @property
     def _is_streaming(self) -> bool:
-        """Whether the configured builder uses the block-streaming build path."""
-        return isinstance(self._transformer_builder, StreamingModelBuilder)
+        """Whether the configured builder uses unit streaming."""
+        return isinstance(self._transformer_builder, StreamingBuilder)
 
     @contextmanager
     def _streaming_transformer_ctx(self) -> Iterator[X0Model]:
         builder = self._prepared_builder()
-        assert isinstance(builder, StreamingModelBuilder)
+        assert isinstance(builder, StreamingBuilder)
+        selection = transformer_checkpoint_selection_ops(builder.model_config())
+        if selection is not None:
+            builder = replace(builder, base=builder.base.with_sd_ops((*builder.base.sd_ops, selection)))
         with streaming_model(builder, self._device, self._dtype, self._alloc_trim_strategy) as streaming_wrapper:
             yield X0Model(streaming_wrapper).eval()
 
     def _transformer_ctx(self, **kwargs: object) -> AbstractContextManager:
         if self._is_streaming:
             return self._streaming_transformer_ctx()
-        if self._resident is None or not self._resident.active or self._transformer_builder.builds_per_shape:
-            return self._transformer_lifetime(self._build_transformer(**kwargs))
-        if self._resident.model is None:
-            self._resident.model = self._resident.lifetime.enter_context(
-                self._transformer_lifetime(self._build_transformer(**kwargs))
-            )
-        return nullcontext(self._resident.model)
+        return self._transformer_lifetime(self._build_transformer(**kwargs))
 
     def _transformer_lifetime(self, transformer: X0Model) -> AbstractContextManager:
+        if self._shares_weights:
+            # The shared allocation outlives the call; release_transformer frees it.
+            return nullcontext(transformer)
         if self._transformer_builder.keeps_gpu_resident_weights and (
             self._alloc_trim_strategy == AllocatorTrimStrategy.DEFER
         ):
@@ -361,28 +378,18 @@ class DiffusionStage:
             return nullcontext(transformer)
         return gpu_model(transformer, alloc_trim_strategy=self._alloc_trim_strategy)
 
-    @contextmanager
-    def resident(self) -> Iterator[None]:
-        """Hold one built transformer for every call on this stage inside the block.
-        The first call builds; later calls -- on this stage or on the ``with_model_wrapper`` copies
-        made of it inside the block, e.g. a tiling wrapper per window -- reuse that model, and the
-        block's end releases it. A copy with another builder or policy (``with_builder``,
-        ``with_loras``, ``with_attention``, ``with_quantization``) is outside the block and builds
-        per call. Every call inside must want the stage's weights: the block does not track LoRA
-        sets, so a call on a stage with other LoRAs must not happen inside it. A streaming stage, a
-        builder that builds per latent shape (tiled data parallel), or a nested block just runs the
-        body.
-        """
-        if self._is_streaming or self._resident is not None:
-            yield
+    def release_transformer(self) -> None:
+        """Free the transformer weights shared through ``active_weights``, and every model bound to them."""
+        if not self._shares_weights:
             return
-        holder = _ResidentTransformer()
-        self._resident = holder
-        try:
-            yield
-        finally:
-            self._resident = None
-            holder.release()
+        assert self._active_weights is not None
+        if self._alloc_trim_strategy == AllocatorTrimStrategy.TRIM:
+            synchronize_device()
+        builder = self._transformer_builder
+        assert isinstance(builder, SimpleBuilder)
+        builder.registry.release_active_models(self._active_weights)
+        if self._alloc_trim_strategy == AllocatorTrimStrategy.TRIM:
+            cleanup_memory()
 
     def __call__(
         self,
@@ -424,7 +431,9 @@ class DiffusionStage:
         )
 
         mode = "streaming" if self._is_streaming else "standard"
-        logger.info("Building transformer (%s) from %s", mode, self._transformer_builder.checkpoint)
+        builder = self._transformer_builder
+        checkpoint = builder.paths if isinstance(builder, SimpleBuilder) else builder.base.paths
+        logger.info("Building transformer (%s) from %s", mode, checkpoint)
         with self._transformer_ctx(video_tools=video_tools) as built:
             transformer = built if self._model_wrapper is None else self._model_wrapper(built, video_tools)
             logger.info(
@@ -457,6 +466,8 @@ class DiffusionStage:
                 audio_state=audio_state,
                 transformer=wrapped,
                 denoiser=denoiser,
+                v_context=video.context if video is not None else None,
+                a_context=audio.context if audio is not None else None,
             )
 
             if video_state is not None and video_tools is not None:
@@ -507,57 +518,22 @@ class RecordingDiffusionStage:
         return getattr(self._stage, name)
 
 
-def _chain_quantization(
-    sd_ops: SDOps,
-    module_ops: tuple[ModuleOps, ...],
-    quantization: QuantizationPolicy,
-) -> tuple[SDOps, tuple[ModuleOps, ...]]:
-    chained_sd_ops = sd_ops
-    if quantization.sd_ops is not None:
-        chained_sd_ops = SDOps(
-            name=f"sd_ops_chain_{sd_ops.name}+{quantization.sd_ops.name}",
-            mapping=(*sd_ops.mapping, *quantization.sd_ops.mapping),
-        )
-    return chained_sd_ops, (*module_ops, *quantization.module_ops)
-
-
-def _apply_compile_ops(
-    sd_ops: SDOps,
-    module_ops: tuple[ModuleOps, ...],
-    loras: tuple[LoraPathStrengthAndSDOps, ...],
-    number_of_layers: int,
-    compilation_config: CompilationConfig,
-) -> tuple[SDOps, tuple[ModuleOps, ...], tuple[LoraPathStrengthAndSDOps, ...]]:
-    """Rewrite sd_ops/module_ops/LoRAs for compiled blocks (params land under ``_orig_mod``)."""
-    sd_ops = modify_sd_ops_for_compilation(sd_ops, number_of_layers)
-    compile_op = build_compile_transformer_op(compilation_config)
-    module_ops = (*module_ops, compile_op)
-    loras = tuple(
-        LoraPathStrengthAndSDOps(
-            lora.path,
-            lora.strength,
-            modify_sd_ops_for_compilation(lora.sd_ops, number_of_layers),
-        )
-        for lora in loras
-    )
-    return sd_ops, module_ops, loras
-
-
 def _ensure_cudagraph_compatible_builder(
-    builder: ModelBuilderProtocol[LTXModelProtocol], compilation_config: CompilationConfig | None
+    builder: ModelBuilder,
+    compilation_config: CompilationConfig | None,
 ) -> None:
     """CUDA-graph compile paths need GPU-resident weights across dispose/rebuild."""
     if compilation_config is None:
         return
     cudagraph_modes = frozenset({"reduce-overhead", "max-autotune"})
     needs_resident = compilation_config.capture or compilation_config.mode in cudagraph_modes
-    if not needs_resident or builder.keeps_gpu_resident_weights:
+    if not needs_resident or isinstance(builder, StreamingBuilder) or builder.keeps_gpu_resident_weights:
         return
     raise ValueError(
         "CompilationConfig capture / mode=reduce-overhead|max-autotune requires a builder "
         "with keeps_gpu_resident_weights=True (SequenceParallelBuilder / "
-        "TiledDataParallelBuilder with a weight tracker, or StreamingModelBuilder). "
-        "Plain SingleGPUModelBuilder reloads weights onto fresh GPU storages each stage, "
+        "TiledDataParallelBuilder, or StreamingBuilder). "
+        "The default SimpleBuilder does not promise stable GPU weight storage across stages, "
         "which invalidates CUDA graphs (or repeatedly recaptures until Dynamo gives up)."
     )
 

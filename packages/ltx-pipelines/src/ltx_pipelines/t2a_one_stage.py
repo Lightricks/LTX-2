@@ -11,7 +11,7 @@ from ltx_core.components.guiders import (
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.loader import LoraPathStrengthAndSDOps
-from ltx_core.loader.registry import Registry
+from ltx_core.loader.registry import ModelRegistry
 from ltx_core.model.transformer import LTXV_AUDIO_ONLY_MODEL_COMFY_RENAMING_MAP, LTXAudioOnlyModelConfigurator
 from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.quantization import QuantizationPolicy
@@ -52,13 +52,14 @@ class T2AOneStagePipeline:
         loras: list[LoraPathStrengthAndSDOps],
         device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
-        registry: Registry | None = None,
+        registry: ModelRegistry | None = None,
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
         prompt_enhancer_gemma_root: str | None = None,
     ):
         self.dtype = torch.bfloat16
+        registry = registry or ModelRegistry()
         self.device = device or get_device()
         self._scheduler = LTX2Scheduler()
         self.prompt_encoder = PromptEncoder(
@@ -148,8 +149,6 @@ class T2AOneStagePipeline:
 
         _, audio_state = self.stage(
             denoiser=FactoryGuidedDenoiser(
-                v_context=None,
-                a_context=a_context_p,
                 video_guider_factory=None,
                 audio_guider_factory=audio_guider_factory,
             ),

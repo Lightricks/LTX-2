@@ -1,6 +1,6 @@
 # Tiled Data Parallelism (TDP)
 
-**Source**: [`ltx_core/multigpu/transformer/tiled_data_parallel.py`](../../../ltx-core/src/ltx_core/multigpu/transformer/tiled_data_parallel.py), [`multigpu/tdp_builder.py`](../../src/ltx_pipelines/multigpu/tdp_builder.py)
+**Source**: [`ltx_core/multigpu/transformer/tiled_data_parallel.py`](../../../ltx-core/src/ltx_core/multigpu/transformer/tiled_data_parallel.py), [`ltx_core/loader/distributed_builders.py`](../../../ltx-core/src/ltx_core/loader/distributed_builders.py)
 
 ## What it is
 
@@ -93,21 +93,21 @@ VAE `TilingConfig`, which specifies tile **sizes**).
 ### `TiledDataParallelBuilder`
 
 ```python
-from ltx_pipelines.multigpu.tdp_builder import TiledDataParallelBuilder
+from ltx_core.loader.distributed_builders import TiledDataParallelBuilder
 
 TiledDataParallelBuilder(
-    inner: ModelBuilderProtocol,   # the stage's single-GPU transformer builder
-    group: dist.ProcessGroup,      # self.groups.transformer_group
+    base: SimpleBuilder,                 # the stage's transformer builder
+    group: dist.ProcessGroup,            # the tiling group
     tiling: TileCountConfig,
-    registry: Registry,
-    tracker: TransformerWeightTracker,
     normalize_positions: bool = True,
+    dst: dict[str, torch.Tensor] | None = None,  # active weights shared with the other stages
 )
 ```
 
-Wraps a `SingleGPUModelBuilder`. Its `build()` requires a `video_tools` kwarg (the
-`VideoLatentTools` for the target shape) so the wrapper can compute tiles — the
-pipeline passes this through automatically.
+Its `build()` requires a `video_tools` kwarg (the `VideoLatentTools` for the target
+shape) so the wrapper can compute tiles — the pipeline passes this through
+automatically. A built model serves only that shape (`builds_per_shape`), so a
+stage builds it on every call.
 
 ## Usage
 
@@ -121,10 +121,6 @@ tdp_tiling = TileCountConfig(
     width=DimensionTilingConfig(num_tiles=w_tiles, overlap=5),
 )
 pipeline.stage_2._transformer_builder = TiledDataParallelBuilder(
-    inner=pipeline.stage_2._transformer_builder,
-    group=self.groups.transformer_group,
-    tiling=tdp_tiling,
-    registry=registry,
-    tracker=tracker,
+    pipeline.stage_2._transformer_builder, self.groups.transformer_group, tdp_tiling, dst=active_weights
 )
 ```

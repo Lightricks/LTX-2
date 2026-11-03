@@ -233,6 +233,18 @@ def rgb_to_yuv420p10(
     return yuv420_planes_u16(y, uv)
 
 
+def rgba_to_yuva444p10(image: torch.Tensor, color_space: ColorSpace, color_range: ColorRange) -> torch.Tensor:
+    """Straight RGBA float ``[0, 1]`` ``(*, 4, H, W)`` → planar uint16 Y, U, V, A ``(*, 4, H, W)``.
+    Colour takes ``color_range`` 10-bit code levels; alpha is always full range (``0``-``1023``).
+    """
+    if image.ndim < 3 or image.shape[-3] != 4:
+        raise ValueError(f"Expected (*, 4, H, W) RGBA, got shape {tuple(image.shape)}")
+    yuv = rgb_to_yuv(image[..., :3, :, :].contiguous(), color_space)
+    y, uv = apply_color_range_(yuv[..., :1, :, :], yuv[..., 1:, :, :], color_range, bits=10)
+    alpha = image[..., 3:, :, :] * 1023
+    return torch.cat([y, uv, alpha], dim=-3).round_().clamp_(0, 1023).to(torch.uint16)
+
+
 def pack_i420(y: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
     """Pack Y + UV into I420 ``(*, H*3//2, W)`` uint8 for PyAV."""
     y_plane = y[..., 0, :, :]

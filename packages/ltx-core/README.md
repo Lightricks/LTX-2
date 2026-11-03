@@ -8,7 +8,7 @@ The foundational library for the LTX-2 Audio-Video generation model. This packag
 - **`conditioning/`**: Tools for preparing latent states and applying conditioning (image, video, keyframes, generated keyframe slots)
 - **`guidance/`**: Perturbation system for fine-grained control over attention mechanisms
 - **`loader/`**: Utilities for loading weights from `.safetensors`, fusing LoRAs, and managing memory
-- **`block_streaming/`**: Memory-efficient inference that streams transformer blocks through the GPU one at a time (from pinned CPU buffers or directly from disk)
+- **`loader/` streaming**: Memory-efficient inference that streams transformer units through reusable device buffers (from CPU memory or disk)
 - **`model/`**: PyTorch implementations of the LTX-2 Transformer, Video VAE, Audio VAE, Vocoder and Upscaler
 - **`text_encoders/gemma`**: Gemma text encoder implementation with tokenizers, feature extractors, and separate encoders for audio-video and video-only generation
 - **`quantization/`**: FP8 (scaled MM, cast), blockwise FP8/FP6, and NVFP4 Linear (via `ltx-kernels`) for reduced memory / faster GEMM.
@@ -56,63 +56,62 @@ pip install -e packages/ltx-core
 
 - **Loader** ([`loader/`](src/ltx_core/loader/)): Model loading from `.safetensors`, LoRA fusion, weight remapping, and memory management
 - **Quantization** ([`quantization/`](src/ltx_core/quantization/)): FP8, blockwise FP8/FP6, and NVFP4 Linear policies for reduced memory footprint and faster inference
-- **Block Streaming** ([`block_streaming/`](src/ltx_core/block_streaming/)): Streams transformer blocks through the GPU one block at a time, so the full model runs on machines without enough memory to hold all its weights at once
+- **Unit Streaming** ([`loader/`](src/ltx_core/loader/)): Streams transformer units through device buffers so a full model can run without keeping every weight on the accelerator
 - **Colour / HDR** ([`color/`](src/ltx_core/color/), [`hdr.py`](src/ltx_core/hdr.py)): Primaries matrices, YUV/HLG helpers, and working-space transfers used by pipeline EXR/`--hdr` I/O. Pipeline-level docs: [HDR Support](../ltx-pipelines/docs/hdr.md).
 
 ### Loader
 
-The `loader/` module provides `SingleGPUModelBuilder`, a frozen dataclass that loads a PyTorch model from `.safetensors` checkpoints and optionally fuses one or more LoRA adapters.
+The `loader/` module builds models from `.safetensors` checkpoints in weight units. `SimpleBuilder` is a frozen
+dataclass holding the recipe: a model configurator, checkpoint shards, `SDOps` stages that rename and transform
+checkpoint keys, `ModuleOps` that rewrite the model shell, and ordered LoRA requests.
 
 #### Basic usage
 
 ```python
-from ltx_core.loader import SingleGPUModelBuilder
+from pathlib import Path
 
-builder = SingleGPUModelBuilder(
-    model_class_configurator=MyModelConfigurator,
-    model_path="/path/to/model.safetensors",
-)
+import torch
+from ltx_core.loader.simple_builder import SimpleBuilder
+
+builder = SimpleBuilder(MyModelConfigurator, (Path("/path/to/model.safetensors"),))
 model = builder.build(device=torch.device("cuda"))
 ```
 
 #### Loading LoRA adapters
 
-Use the `.lora()` method to attach one or more LoRA adapters before calling `.build()`:
+Use `.lora()` to append adapters before calling `.build()`; they are fused in request order:
 
 ```python
 from ltx_core.loader import SDOps
 
-lora_sd_ops = SDOps(name="identity").with_matching()  # or a model-specific key-renaming SDOps
+lora_sd_ops = (SDOps("identity").with_matching(),)  # or model-specific key-renaming SDOps
 
 builder = (
-    SingleGPUModelBuilder(
-        model_class_configurator=MyModelConfigurator,
-        model_path="/path/to/model.safetensors",
-    )
-    .lora("/path/to/lora_a.safetensors", 0.8, lora_sd_ops)
-    .lora("/path/to/lora_b.safetensors", 0.5, lora_sd_ops)
+    SimpleBuilder(MyModelConfigurator, (Path("/path/to/model.safetensors"),))
+    .lora((Path("/path/to/lora_a.safetensors"),), 0.8, lora_sd_ops)
+    .lora((Path("/path/to/lora_b.safetensors"),), 0.5, lora_sd_ops)
 )
 model = builder.build(device=torch.device("cuda"))
 ```
 
-#### Memory-efficient LoRA loading (`lora_load_device`)
+#### Registry and retention
 
-By default, LoRA weights are loaded onto the **CPU** (`lora_load_device=torch.device("cpu")`).  This means each LoRA adapter is kept in CPU memory and transferred to the GPU sequentially during weight fusion, which keeps peak GPU memory low even when fusing large adapters.
-
-If all adapters fit comfortably in GPU memory you can skip the CPU staging by setting `lora_load_device` to the target CUDA device:
+Builders share a `ModelRegistry`. It caches model shells and checkpoint metadata, and keeps unit states only where a
+placement policy places them: the registry's default `placement_policy`, or a builder's own
+`with_placement_policy(...)`. With the default policy nothing is retained, so every build reads the checkpoint again.
+To keep clean weights on the GPU across builds, and LoRA factors in pinned host memory:
 
 ```python
-import torch
-from ltx_core.loader import SingleGPUModelBuilder
+from ltx_core.loader.placement import Placement, RetentionPolicy
+from ltx_core.loader.registry import ModelRegistry
 
-# Load LoRA weights directly onto the GPU (faster, but uses more GPU memory)
-builder = SingleGPUModelBuilder(
-    model_class_configurator=MyModelConfigurator,
-    model_path="/path/to/model.safetensors",
-    lora_load_device=torch.device("cuda"),
-).lora("/path/to/lora.safetensors", 1.0, lora_sd_ops)
-
-model = builder.build(device=torch.device("cuda"))
+registry = ModelRegistry(
+    placement_policy=RetentionPolicy(
+        clean=Placement(torch.device("cuda")),
+        lora=Placement(torch.device("cpu"), pin_memory=True),
+    )
+)
+builder = builder.with_registry(registry)
 ```
 
 ### Quantization
@@ -132,19 +131,14 @@ from ltx_core.quantization.fp8_scaled_mm import build_policy as build_fp8_scaled
 policy = build_fp8_scaled_mm_policy("/path/to/checkpoint.safetensors")
 ```
 
-The policy carries `sd_ops`, `module_ops`, and `fuse_rule` that are passed to the model builder:
+The policy carries `sd_ops`, `module_ops`, and the LoRA `fuse_rule`; `compose_quantization` applies them to a builder:
 
 ```python
 import torch
-from ltx_core.loader import SingleGPUModelBuilder
+from ltx_core.loader.simple_builder import SimpleBuilder
+from ltx_core.quantization.policy import compose_quantization
 
-builder = SingleGPUModelBuilder(
-    model_class_configurator=MyModelConfigurator,
-    model_path="/path/to/checkpoint.safetensors",
-    model_sd_ops=policy.sd_ops,
-    module_ops=policy.module_ops,
-    fuse_rule=policy.fuse_rule,
-)
+builder = compose_quantization(SimpleBuilder(MyModelConfigurator, (Path("/path/to/checkpoint.safetensors"),)), policy)
 model = builder.build(device=torch.device("cuda"))
 ```
 
@@ -158,37 +152,49 @@ from ltx_core.quantization.fp8_cast import build_policy as build_fp8_cast_policy
 policy = build_fp8_cast_policy("/path/to/checkpoint.safetensors")
 ```
 
-### Block Streaming
+### Unit Streaming
 
-The `block_streaming/` module ([`src/ltx_core/block_streaming/`](src/ltx_core/block_streaming/)) lets the full model run on machines that lack the memory to hold all of its weights at once. It streams the transformer's blocks through a small rolling set of GPU buffers, loading each block's weights just before it runs and recycling them afterwards, so only a few blocks are resident on the GPU at any moment. Construct it with `StreamingModelBuilder`, which returns a `BlockStreamingWrapper` -- an `nn.Module` drop-in for the wrapped model.
+The [`loader/`](src/ltx_core/loader/) streaming builder keeps resident weights on the compute device and delivers each selected transformer unit through reusable device buffers just before its forward hook runs. `StreamingBuilder` wraps a `SimpleBuilder` checkpoint recipe and returns a `StreamingModel`, an `nn.Module` wrapper with explicit `close()` cleanup.
 
 #### Strategies
 
-The strategy is chosen automatically from `cpu_slots_count` relative to the number of blocks:
+Choose a backing mode in `StreamingConfig`:
 
-- **RAM streaming** (default, `cpu_slots_count` omitted or `>= num_blocks`): all blocks are pre-loaded into pinned CPU buffers (with LoRA fusion) at build time, then copied to the GPU on demand. Fast; higher CPU memory.
-- **Disk streaming** (`cpu_slots_count < num_blocks`): blocks are read from the `.safetensors` file on demand on a background worker thread. Slower; lowest CPU memory.
+- **RAM streaming** (`mode="cpu"`): selected units are loaded into CPU buffers during the build, then copied to the accelerator on demand.
+- **Disk streaming** (`mode="disk"`): selected units are read from checkpoint shards on demand into reusable host buffers.
+
+The streamed model owns its RAM-streamed host units and frees them on `close()`. Units outlive it only where a
+placement policy retains them: the base builder's own (`with_placement_policy`) or its registry's default
+(`ModelRegistry(placement_policy=...)`).
 
 #### Basic usage
 
 ```python
 import torch
-from ltx_core.block_streaming import StreamingModelBuilder
+from pathlib import Path
+from ltx_core.loader.simple_builder import SimpleBuilder
+from ltx_core.loader.streaming_builder import StreamingBuilder, StreamingConfig
 
-builder = StreamingModelBuilder(
-    model_class_configurator=MyModelConfigurator,
-    model_path="/path/to/model.safetensors",
-    blocks_attr="transformer_blocks",      # dotted path to the nn.ModuleList
-    blocks_prefix="transformer_blocks",    # state-dict key prefix for block weights
+base = SimpleBuilder(
+    configurator=MyModelConfigurator,
+    paths=(Path("/path/to/model.safetensors"),),
+    sd_ops=(),  # add checkpoint-to-model key operations when needed
 )
-
-# Omit cpu_slots_count for RAM streaming; pass a value < num_blocks for disk streaming.
-model = builder.build(
-    device=torch.device("cuda"),
-    dtype=torch.bfloat16,
-    cpu_slots_count=4,
-    gpu_slots_count=2,
+builder = StreamingBuilder(
+    base,
+    StreamingConfig(
+        blocks_prefix="transformer_blocks",
+        mode="disk",  # use "cpu" for RAM streaming
+        prefetch_depth=2,
+        device_buffers=2,
+        host_buffers=2,
+    ),
 )
+model = builder.build(device=torch.device("cuda"), dtype=torch.bfloat16)
+try:
+    output = model(inputs)
+finally:
+    model.close()
 ```
 
 For complete, production-ready pipeline implementations that combine these building blocks, see the [`ltx-pipelines`](../ltx-pipelines/) package.

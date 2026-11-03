@@ -17,7 +17,7 @@ from ltx_core.conditioning import (
     VideoConditionByReferenceLatent,
 )
 from ltx_core.loader import LoraPathStrengthAndSDOps
-from ltx_core.loader.registry import Registry
+from ltx_core.loader.registry import ModelRegistry
 from ltx_core.loader.sd_ops import LTXV_LORA_COMFY_RENAMING_MAP
 from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig, VideoEncoder
 from ltx_core.model.video_vae.keyframes import DecodeKeyframes
@@ -38,7 +38,7 @@ from ltx_pipelines.utils.helpers import (
     ensure_tiling_config,
     generated_keyframe_conditionings,
     get_device,
-    tiling_scale_factors_for_vae,
+    round_up_frames_to_grid,
 )
 from ltx_pipelines.utils.media_io import (
     EXRVideoInput,
@@ -174,7 +174,7 @@ class HDRICLoraPipeline:
         text_embeddings_path: str | Path,
         device: torch.device | None = None,
         quantization: QuantizationPolicy | QuantizationKind | None = _DEFAULT_QUANTIZATION,
-        registry: Registry | None = None,
+        registry: ModelRegistry | None = None,
         tiled_vae_encode_pixel_threshold: int = TILED_VAE_ENCODE_PIXEL_THRESHOLD,
         offload_mode: OffloadMode = OffloadMode.NONE,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
@@ -189,6 +189,7 @@ class HDRICLoraPipeline:
             quantization = None
 
         self.dtype = torch.bfloat16
+        registry = registry or ModelRegistry()
         self.vae_dtype = torch.float32
 
         lora_path = str(Path(hdr_lora).resolve())
@@ -261,14 +262,9 @@ class HDRICLoraPipeline:
                 fps = None
         meta = get_videostream_metadata(str(video_path), fps=fps)
 
-        # Assert 8k+1 frame count.
-        video_scale = SpatioTemporalScaleFactors.default()
-        if (meta.frames - 1) % video_scale.time != 0:
-            snapped = ((meta.frames - 1) // video_scale.time) * video_scale.time + 1
-            raise ValueError(
-                f"Video frame count must satisfy 8k+1 (e.g. 97, 193). "
-                f"Got {meta.frames}; use a video with {snapped} frames."
-            )
+        # Pad the frame count up to 8k+1 by repeating the last frame, cropped back after decode.
+        crop_frames = meta.frames
+        padded_frames = round_up_frames_to_grid(crop_frames, SpatioTemporalScaleFactors.default())
 
         # Pad W/H up to a multiple of 32, croped back after decode.
         gen_w, gen_h, crop_w, crop_h = align_resolution(
@@ -281,20 +277,19 @@ class HDRICLoraPipeline:
             )
 
         # Generate 2N-1 frames for high-quality HDR, N frames otherwise.
-        num_frames = meta.frames
-        gen_frames = 2 * num_frames - 1 if high_quality_hdr else num_frames
+        gen_frames = 2 * padded_frames - 1 if high_quality_hdr else padded_frames
 
         generated_kf: list[int] = []
         guides_kf: list[int] = []
         if keyframe_strength is not None:
-            generated_kf, guides_kf = dfr_seam_roles(num_frames, high_quality_hdr=high_quality_hdr)
+            generated_kf, guides_kf = dfr_seam_roles(padded_frames, high_quality_hdr=high_quality_hdr)
             assert_stage_supports_generated_keyframes(self.stage)
             if not generated_kf and not guides_kf:
                 logger.warning(
                     "[HDR IC-LoRA] keyframe_strength=%.2f but this %d-frame clip has no DFR seams "
                     "after clipping the canvas; running plain IC-LoRA.",
                     keyframe_strength,
-                    num_frames,
+                    padded_frames,
                 )
             else:
                 logger.info(
@@ -304,10 +299,8 @@ class HDRICLoraPipeline:
                     guides_kf,
                 )
 
-        scale_factors = tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path)
         tiling_config = ensure_tiling_config(
             tiling_config,
-            scale_factors=scale_factors,
             vae_checkpoint_path=self.video_decoder.checkpoint_path,
             video_shape=VideoPixelShape(
                 batch=1,
@@ -319,12 +312,13 @@ class HDRICLoraPipeline:
             diffvae_optimization=self.video_decoder.diffvae_optimization,
             device=self.device,
             keyframes=bool(generated_kf),
+            vae_dtype=self.vae_dtype,
         )
 
-        acescct_sdr = self._load_acescct_conditioning(video, gen_h, gen_w, num_frames)
+        acescct_sdr = self._load_acescct_conditioning(video, gen_h, gen_w, crop_frames, padded_frames)
         if high_quality_hdr:
             # BCTHW: duplicate each frame, trim to gen_frames (2N-1).
-            logger.info("[HDR IC-LoRA] High-quality HDR: %d -> %d internal frames", num_frames, gen_frames)
+            logger.info("[HDR IC-LoRA] High-quality HDR: %d -> %d internal frames", padded_frames, gen_frames)
             acescct_sdr = acescct_sdr.repeat_interleave(2, dim=2)[:, :, :gen_frames]
 
         logger.info(
@@ -334,7 +328,7 @@ class HDRICLoraPipeline:
             meta.height,
             gen_w,
             gen_h,
-            num_frames,
+            padded_frames,
             f", hq_internal={gen_frames}" if high_quality_hdr else "",
             video.color_space.value
             if isinstance(video, EXRVideoInput)
@@ -372,6 +366,7 @@ class HDRICLoraPipeline:
             generator,
             crop_w=crop_w,
             crop_h=crop_h,
+            crop_frames=crop_frames,
             generated_kf=generated_kf,
             gen_frames=gen_frames,
             high_quality_hdr=high_quality_hdr,
@@ -384,6 +379,7 @@ class HDRICLoraPipeline:
         height: int,
         width: int,
         num_frames: int,
+        padded_frames: int,
     ) -> torch.Tensor:
         """Load the IC-LoRA reference as ACEScct BCTHW on CPU."""
         match video:
@@ -412,6 +408,7 @@ class HDRICLoraPipeline:
         chunks = list(frames)
         if not chunks:
             raise ValueError(f"No frames loaded from {path}")
+        chunks += chunks[-1:] * (padded_frames - len(chunks))
         return torch.cat(chunks, dim=2)
 
     def _create_reference_conditionings(
@@ -474,7 +471,7 @@ class HDRICLoraPipeline:
         phase_conditionings = list(conditionings)
         phase_conditionings.extend(generated_keyframe_conditionings(generated_kf, frames))
         video_state, _ = self.stage(
-            denoiser=SimpleDenoiser(video_context, None),
+            denoiser=SimpleDenoiser(),
             sigmas=sigmas,
             noiser=GaussianNoiser(generator=torch.Generator(device=self.device).manual_seed(seed)),
             modalities=VideoAudio(
@@ -497,13 +494,14 @@ class HDRICLoraPipeline:
         *,
         crop_w: int,
         crop_h: int,
+        crop_frames: int,
         generated_kf: Sequence[int],
         gen_frames: int,
         high_quality_hdr: bool = False,
     ) -> torch.Tensor:
-        """VAE-decode latent chunks to FHWC ``[0, 1]`` (decoder already clamps); optional pad crop.
+        """VAE-decode latent chunks to FHWC ``[0, 1]`` (decoder already clamps); crop the padding.
         When ``high_quality_hdr`` is set, keep every other frame (undoes the ``2N-1``
-        generation applied during high-quality mode).
+        generation applied during high-quality mode) before cropping to ``crop_frames``.
         """
         decode_kf = decode_keyframes_from_slots(video_state.generated_keyframes, generated_kf, gen_frames)
         if decode_kf is not None:
@@ -520,10 +518,9 @@ class HDRICLoraPipeline:
             keyframes=decode_kf,
         )
         decoded = torch.cat(list(chunks), dim=0)
-        decoded = decoded[:, :crop_h, :crop_w, :]
         if high_quality_hdr:
             decoded = decoded[::2]
-        return decoded
+        return decoded[:crop_frames, :crop_h, :crop_w, :]
 
 
 @torch.inference_mode()

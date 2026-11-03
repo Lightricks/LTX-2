@@ -1,5 +1,9 @@
-# Adapted from: https://github.com/bghira/SimpleTuner
-# With improvements from: https://github.com/ostris/ai-toolkit
+"""LTX staging and exclusion policy over Optimum Quanto's public quantize/freeze API.
+Quantization kernels and module replacement are provided by ``optimum-quanto``:
+https://github.com/huggingface/optimum-quanto#quantization-workflow-for-vanilla-pytorch-models-low-level-api
+"""
+
+from collections.abc import Iterator
 from typing import Literal
 
 import torch
@@ -7,46 +11,51 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn
 
 from ltx_trainer import logger
 
-QuantizationOptions = Literal[
-    "int8-quanto",
-    "int4-quanto",
-    "int2-quanto",
-    "fp8-quanto",
-    "fp8uz-quanto",
-]
+QuantizationOptions = Literal["int8-quanto", "int4-quanto", "int2-quanto", "fp8-quanto", "fp8uz-quanto"]
 
-# Modules to exclude from quantization.
-# These are glob patterns passed to quanto's `exclude` parameter.
-# When quantizing the full model at once, these patterns match against full module paths.
-# When quantizing block-by-block, we also use SKIP_ROOT_MODULES for top-level modules.
+# Quanto matches these globs against names relative to each conversion group.
 EXCLUDE_PATTERNS = [
-    # Input/output projection layers
     "patchify_proj",
     "audio_patchify_proj",
     "proj_out",
     "audio_proj_out",
-    # Timestep embedding layers - int4 tinygemm requires strict bfloat16 input
-    # and these receive float32 sinusoidal embeddings that are cast to bfloat16
     "*adaln*",
     "time_proj",
     "timestep_embedder*",
-    # Caption/text projection layers
     "caption_projection*",
     "audio_caption_projection*",
-    # Normalization layers (usually excluded from quantization)
     "*norm*",
 ]
+SKIP_ROOT_MODULES = {"patchify_proj", "audio_patchify_proj", "proj_out", "audio_proj_out", "audio_caption_projection"}
 
-# Top-level modules to skip entirely during block-by-block quantization.
-# These are exact matches against model.named_children() names.
-# (Needed because quanto's exclude patterns don't work when calling quantize() directly on a module)
-SKIP_ROOT_MODULES = {
-    "patchify_proj",
-    "audio_patchify_proj",
-    "proj_out",
-    "audio_proj_out",
-    "audio_caption_projection",
-}
+
+def _quantization_groups(model: torch.nn.Module) -> Iterator[torch.nn.Module]:
+    """Yield conversion groups, showing progress while transformer blocks are processed."""
+    if not hasattr(model, "transformer_blocks"):
+        yield model
+        return
+
+    blocks = list(model.transformer_blocks)
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        transient=True,
+    ) as progress:
+        task = progress.add_task("Quantizing transformer blocks", total=len(blocks))
+        for block in blocks:
+            yield block
+            progress.advance(task)
+
+    logger.debug("Quantizing remaining model components")
+    for name, child in model.named_children():
+        if name == "transformer_blocks":
+            continue
+        if name in SKIP_ROOT_MODULES:
+            logger.debug(f"Skipping quantization for module: {name}")
+            continue
+        yield child
 
 
 def quantize_model(
@@ -55,141 +64,50 @@ def quantize_model(
     quantize_activations: bool = False,
     device: torch.device | str | None = None,
 ) -> torch.nn.Module:
+    """Quantize in place and restore the model's original device.
+    Models with ``transformer_blocks`` stage each block, then eligible root children,
+    on the conversion device in the first parameter's dtype, returning each to CPU.
+    Other models convert as one group without a dtype cast. Exclusions are relative
+    to each group; root children listed in ``SKIP_ROOT_MODULES`` are skipped entirely.
+    Activation quantization is opt-in and requires Quanto calibration before use.
     """
-    Quantize a model using optimum-quanto.
-    For large models with transformer_blocks, this function quantizes block-by-block
-    on GPU then moves back to CPU, which is much faster than quantizing on CPU and
-    uses less peak VRAM than loading the entire model to GPU at once.
-    Args:
-        model: The model to quantize.
-        precision: The quantization precision (e.g. "int8-quanto", "fp8-quanto").
-        quantize_activations: Whether to quantize activations in addition to weights.
-        device: Device to use for quantization. If None, uses CUDA if available, else CPU.
-    Returns:
-        The quantized model.
-    """
-    from optimum.quanto import freeze, quantize  # noqa: PLC0415
+    from optimum import quanto  # noqa: PLC0415
 
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    elif isinstance(device, str):
-        device = torch.device(device)
-
-    weight_quant = _get_quanto_dtype(precision)
+    conversion_device = torch.device(device if device is not None else "cuda" if torch.cuda.is_available() else "cpu")
+    formats = {
+        "int8-quanto": quanto.qint8,
+        "int4-quanto": quanto.qint4,
+        "int2-quanto": quanto.qint2,
+        "fp8-quanto": quanto.qfloat8,
+        "fp8uz-quanto": quanto.qfloat8_e4m3fnuz,
+    }
+    if precision not in formats:
+        raise ValueError(f"Invalid quantization precision: {precision}")
+    if precision in ("fp8-quanto", "fp8uz-quanto") and torch.backends.mps.is_available():
+        raise ValueError("FP8 quantization is not supported on MPS devices. Use int2, int4, or int8 instead.")
 
     if quantize_activations:
         logger.debug("Quantizing model weights and activations")
-        activations_quant = weight_quant
-    else:
-        activations_quant = None
 
-    # Remember original device to restore after quantization
-    original_device = next(model.parameters()).device
-
-    # Check if model has transformer_blocks for block-by-block quantization
-    if hasattr(model, "transformer_blocks"):
+    source_device = next(model.parameters()).device
+    source_dtype = next(model.parameters()).dtype
+    blockwise = hasattr(model, "transformer_blocks")
+    if blockwise:
         logger.debug("Quantizing model using block-by-block approach for memory efficiency")
-        _quantize_blockwise(
-            model,
-            weight_quant=weight_quant,
-            activations_quant=activations_quant,
-            device=device,
+    for group in _quantization_groups(model):
+        if blockwise:
+            group.to(conversion_device, dtype=source_dtype, non_blocking=True)
+        else:
+            group.to(conversion_device)
+        quanto.quantize(
+            group,
+            weights=formats[precision],
+            activations=formats[precision] if quantize_activations else None,
+            exclude=EXCLUDE_PATTERNS,
         )
-    else:
-        # Fallback: quantize entire model at once
-        model.to(device)
-        quantize(model, weights=weight_quant, activations=activations_quant, exclude=EXCLUDE_PATTERNS)
-        freeze(model)
-
-    # Restore model to original device
-    model.to(original_device)
-
+        quanto.freeze(group)
+        if blockwise:
+            # Quanto repacks INT4 weights on CPU inside this transfer, so host data must be ready.
+            group.to("cpu")
+    model.to(source_device)
     return model
-
-
-def _quantize_blockwise(
-    model: torch.nn.Module,
-    weight_quant: torch.dtype,
-    activations_quant: torch.dtype | None,
-    device: torch.device,
-) -> None:
-    """Quantize a model block-by-block using optimum-quanto.
-    This approach:
-    1. Moves each transformer block to GPU
-    2. Quantizes on GPU (fast!)
-    3. Freezes the quantized weights
-    4. Moves back to CPU
-    This is much faster than quantizing on CPU and uses less peak VRAM
-    than loading the entire model to GPU.
-    """
-    from optimum.quanto import freeze, quantize  # noqa: PLC0415
-
-    original_dtype = next(model.parameters()).dtype
-    transformer_blocks = list(model.transformer_blocks)
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        transient=True,
-    ) as progress:
-        task = progress.add_task("Quantizing transformer blocks", total=len(transformer_blocks))
-
-        for block in transformer_blocks:
-            # Move block to GPU
-            block.to(device, dtype=original_dtype, non_blocking=True)
-
-            # Quantize on GPU
-            quantize(block, weights=weight_quant, activations=activations_quant, exclude=EXCLUDE_PATTERNS)
-            freeze(block)
-
-            # Move back to CPU to free up VRAM for next block
-            block.to("cpu", non_blocking=True)
-
-            progress.advance(task)
-
-    # Quantize remaining non-transformer-block modules (e.g., embeddings, timestep projections)
-    # Skip modules that should not be quantized (patchify_proj, proj_out, etc.)
-    logger.debug("Quantizing remaining model components")
-
-    for name, module in model.named_children():
-        if name == "transformer_blocks":
-            continue  # Already quantized
-
-        if name in SKIP_ROOT_MODULES:
-            logger.debug(f"Skipping quantization for module: {name}")
-            continue  # Don't quantize these modules
-
-        # Move to device, quantize, freeze, move back
-        module.to(device, dtype=original_dtype, non_blocking=True)
-        quantize(module, weights=weight_quant, activations=activations_quant, exclude=EXCLUDE_PATTERNS)
-        freeze(module)
-        module.to("cpu", non_blocking=True)
-
-
-def _get_quanto_dtype(precision: QuantizationOptions) -> torch.dtype:
-    """Map precision string to quanto dtype."""
-    from optimum.quanto import (  # noqa: PLC0415
-        qfloat8,
-        qfloat8_e4m3fnuz,
-        qint2,
-        qint4,
-        qint8,
-    )
-
-    if precision == "int2-quanto":
-        return qint2
-    elif precision == "int4-quanto":
-        return qint4
-    elif precision == "int8-quanto":
-        return qint8
-    elif precision in ("fp8-quanto", "fp8uz-quanto"):
-        if torch.backends.mps.is_available():
-            raise ValueError("FP8 quantization is not supported on MPS devices. Use int2, int4, or int8 instead.")
-        if precision == "fp8-quanto":
-            return qfloat8
-        elif precision == "fp8uz-quanto":
-            return qfloat8_e4m3fnuz
-
-    raise ValueError(f"Invalid quantization precision: {precision}")

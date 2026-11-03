@@ -5,7 +5,7 @@ block is self-contained, so no central model-coordinator object is needed.
 """
 
 from ltx_core.components.noisers import Noiser
-from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
+from ltx_core.loader.simple_builder import SimpleBuilder as Builder
 from ltx_pipelines.utils.blocks.audio_conditioner import AudioConditioner
 from ltx_pipelines.utils.blocks.audio_decoder import AudioDecoder
 from ltx_pipelines.utils.blocks.diffusion_stage import (

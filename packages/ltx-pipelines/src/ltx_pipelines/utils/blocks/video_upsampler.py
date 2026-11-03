@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import torch
 
 from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
-from ltx_core.loader.registry import ModelRegistry, Registry
-from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
+from ltx_core.loader.registry import ModelRegistry
+from ltx_core.loader.simple_builder import SimpleBuilder
 from ltx_core.model.upsampler import LatentUpsamplerConfigurator, upsample_video
 from ltx_core.model.video_vae import VideoEncoderConfigurator
 from ltx_pipelines.utils.blocks.image_conditioner import VAE_ENCODER_SD_OPS
@@ -26,22 +27,23 @@ class VideoUpsampler:
         upsampler_path: str,
         dtype: torch.dtype,
         device: torch.device,
-        registry: Registry | None = None,
+        registry: ModelRegistry | None = None,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
     ) -> None:
         self._upsampler_path = upsampler_path
         self._dtype = dtype
         self._device = device
-        self._encoder_builder = Builder(
-            model_path=checkpoint_path,
-            model_class_configurator=VideoEncoderConfigurator,
-            model_sd_ops=VAE_ENCODER_SD_OPS,
-            registry=registry or ModelRegistry(cache_models=True, cache_weights=False),
+        unit_registry = registry or ModelRegistry()
+        self._encoder_builder = SimpleBuilder(
+            VideoEncoderConfigurator,
+            (Path(checkpoint_path),),
+            (VAE_ENCODER_SD_OPS,),
+            registry=unit_registry,
         )
-        self._upsampler_builder = Builder(
-            model_path=upsampler_path,
-            model_class_configurator=LatentUpsamplerConfigurator,
-            registry=registry or ModelRegistry(cache_models=True, cache_weights=False),
+        self._upsampler_builder = SimpleBuilder(
+            LatentUpsamplerConfigurator,
+            (Path(upsampler_path),),
+            registry=unit_registry,
         )
         self._alloc_trim_strategy = alloc_trim_strategy
 

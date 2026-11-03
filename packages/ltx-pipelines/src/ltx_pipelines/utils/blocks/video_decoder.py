@@ -3,20 +3,19 @@ from __future__ import annotations
 import copy
 import logging
 from collections.abc import Callable, Iterator, Sequence
+from pathlib import Path
 
 import torch
 
 from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
-from ltx_core.loader import SDOps
+from ltx_core.loader.model_builder import ModelBuilder
 from ltx_core.loader.module_ops import ModuleOps
-from ltx_core.loader.primitives import BuilderProtocol
-from ltx_core.loader.registry import ModelRegistry, Registry
-from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
+from ltx_core.loader.registry import ModelRegistry
+from ltx_core.loader.simple_builder import SimpleBuilder
 from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae import (
     CHANNELS_LAST_3D_WEIGHTS,
     MEMORY_EFFICIENT_DECODE,
-    VAE_DECODER_COMFY_KEYS_FILTER,
     TilingConfig,
     VideoDecoderConfigurator,
     is_diffusion_video_vae,
@@ -47,9 +46,9 @@ class VideoDecoder:
         checkpoint_path: str,
         dtype: torch.dtype,
         device: torch.device,
-        registry: Registry | None = None,
+        registry: ModelRegistry | None = None,
         memory_efficient: bool = True,
-        decoder_builder: BuilderProtocol | None = None,
+        decoder_builder: ModelBuilder | None = None,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
         diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
     ) -> None:
@@ -69,28 +68,20 @@ class VideoDecoder:
                     "diffvae_optimization=blackwell_dsl needs a datacenter Blackwell GPU and "
                     "nvidia-cutlass-dsl (uv sync --group kernels)"
                 )
-            sd_ops = (
-                video_decoder_sd_ops_for_checkpoint(
-                    self._checkpoint_path,
-                    diffusion_vae=True,
-                    na_dsl_kernel=use_dsl,
-                )
-                if diffusion_vae
-                else VAE_DECODER_COMFY_KEYS_FILTER
+            sd_ops = video_decoder_sd_ops_for_checkpoint(
+                self._checkpoint_path, diffusion_vae=diffusion_vae, na_dsl_kernel=diffusion_vae and use_dsl
             )
             module_ops: tuple[ModuleOps, ...] = ()
             # channels-last + memory-efficient decode apply to ConvVideoDecoder only
             if memory_efficient and not diffusion_vae:
-                sd_ops = SDOps(
-                    name=f"sd_ops_chain_{sd_ops.name}+{CHANNELS_LAST_3D_WEIGHTS.name}",
-                    mapping=(*sd_ops.mapping, *CHANNELS_LAST_3D_WEIGHTS.mapping),
-                )
+                sd_ops = (*sd_ops, CHANNELS_LAST_3D_WEIGHTS)
                 module_ops = (MEMORY_EFFICIENT_DECODE,)
-            self._decoder_builder = Builder(
-                model_path=self._checkpoint_path,
-                model_class_configurator=VideoDecoderConfigurator,
-                model_sd_ops=sd_ops,
-                registry=registry or ModelRegistry(cache_models=True, cache_weights=False),
+            unit_registry = registry or ModelRegistry()
+            self._decoder_builder = SimpleBuilder(
+                VideoDecoderConfigurator,
+                (Path(self._checkpoint_path),),
+                sd_ops,
+                registry=unit_registry,
                 module_ops=module_ops,
             )
         self._alloc_trim_strategy = alloc_trim_strategy
@@ -103,7 +94,7 @@ class VideoDecoder:
     def diffvae_optimization(self) -> DiffVAEMode:
         return self._diffvae_optimization
 
-    def with_builder(self, builder: BuilderProtocol) -> "VideoDecoder":
+    def with_builder(self, builder: ModelBuilder) -> "VideoDecoder":
         """Return a new ``VideoDecoder`` that builds from ``builder``.
         Functional: never mutates ``self``; shares checkpoint, dtype, device, and
         trim strategy. Mirrors :meth:`DiffusionStage.with_builder`.
@@ -112,7 +103,7 @@ class VideoDecoder:
         new._decoder_builder = builder
         return new
 
-    def _prepared_builder(self) -> BuilderProtocol:
+    def _prepared_builder(self) -> ModelBuilder:
         """Return the builder with DiffVAE mode ops applied at build time.
         DiffVAE ``module_ops`` live on the decoder (not on the caller-held builder),
         matching :meth:`DiffusionStage._prepared_builder`. That keeps

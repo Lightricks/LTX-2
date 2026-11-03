@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 from typing import TypeVar
 
 import torch
 
 from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
-from ltx_core.loader.registry import ModelRegistry, Registry
-from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
+from ltx_core.loader.registry import ModelRegistry
+from ltx_core.loader.simple_builder import SimpleBuilder
 from ltx_core.model.audio_vae import AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER, AudioEncoderConfigurator
 from ltx_pipelines.utils.gpu_model import gpu_model
 
@@ -27,17 +28,18 @@ class AudioConditioner:
         checkpoint_path: str,
         dtype: torch.dtype,
         device: torch.device,
-        registry: Registry | None = None,
+        registry: ModelRegistry | None = None,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
     ) -> None:
         self._dtype = dtype
         self._device = device
         self._alloc_trim_strategy = alloc_trim_strategy
-        self._encoder_builder = Builder(
-            model_path=checkpoint_path,
-            model_class_configurator=AudioEncoderConfigurator,
-            model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
-            registry=registry or ModelRegistry(cache_models=True, cache_weights=False),
+        unit_registry = registry or ModelRegistry()
+        self._encoder_builder = SimpleBuilder(
+            AudioEncoderConfigurator,
+            (Path(checkpoint_path),),
+            (AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,),
+            registry=unit_registry,
         )
 
     def __call__(self, fn: Callable[[torch.nn.Module], T]) -> T:

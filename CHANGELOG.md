@@ -1,5 +1,83 @@
 # Changelog
 
+## 1.6.0 - 2026-11-03
+
+### Fixed
+
+- STG no longer applies per-head attention gates to the value projection used to bypass attention. This applies to both fully perturbed and mixed batches for video and audio.
+
+### Added
+
+- `ICLoraPipeline` accepts optional `audio: AudioInput` (CLI `--audio-path` / `--audio-start-time`) and `refine_audio` (CLI `--refine-audio` / `--no-refine-audio`, default on). A given source is encoded once and held frozen as clean target audio in stage 1; `refine_audio=False` also freezes audio in stages 2+, and then the output carries the source waveform instead of a VAE decode. Audio shorter than `num_frames / frame_rate` raises. Defaults (`audio=None`, `refine_audio=True`) keep the previous behavior.
+- `ltx_pipelines.utils.media_io.encode_media_segments` incrementally encodes ordered `PlaybackSegment` video/audio streams to SDR H.264 or HDR HLG through typed stream specs and a bounded, single-owner container writer.
+- `encode_video(..., codec=VideoCodec.PRORES_4444)` writes ProRes 4444 from straight RGBA `(F, H, W, 4)`, tagging BT.709 and keeping alpha full range. A pixel marker stamps RGB only.
+- Added custom trainer strategy registration through `register_strategy(name, config_cls)`, with hooks for model and
+  optimizer construction, data loading, training steps, validation, and checkpoint state.
+- Added `scripts/preprocess.py CONFIG` to preprocess video, audio, captions, and masks from the same YAML used for
+  training. `--check` verifies cached data compatibility, and `--overwrite` rebuilds the cache. Set
+  `training_strategy.data.decode: true` to decode cached latents for inspection.
+
+### Changed
+
+- The code in this repository is licensed under Apache 2.0. The LTX models are not part of that: LTX-2.5 remains under the LTX-2.x Community License and LTX-2.3 under the LTX-2 Community License.
+- `DiffusionStage` takes an `active_weights` dict that stages share as one transformer allocation: their builds reuse the registry's bound model or switch LoRAs in place, and stay assigned until `release_transformer()`. The single-GPU DFR pipeline uses it for all its passes, tiles and the detailing LoRA, and releases the transformer before decoding.
+- Distilled, TI2Vid two-stage, A2Vid, Dub-It and IC-LoRA CLIs encode the `stream_chunks` output directly, whether it contains one or multiple temporal chunks.
+- All SDR, HDR and progressive encoding paths share the same pipeline-owned container lifecycle. Codec options now apply consistently to SDR and HDR, and HLG with audio uses zero-latency x265 ordering.
+- Trainer model, LoRA, data, optimizer, timestep sampling, and validation content settings moved under
+  `training_strategy`. Global `optimization` retains runtime settings, and global `validation` retains cadence.
+  Legacy flat YAML configurations and legacy strategy names are migrated automatically with a deprecation warning.
+- Preprocessing recorded a configuration manifest and rejected incompatible incremental updates. Training checked
+  existing manifests before loading models; regenerate incompatible caches with `scripts/preprocess.py CONFIG --overwrite`,
+  or explicitly bypass the training check with `allow_stale_preprocessed: true`. Training still accepted older caches
+  without a manifest, while incremental preprocessing required rebuilding them with `--overwrite`.
+- Trainer checkpoints moved to atomic `checkpoints/step_NNNNN/` directories containing `weights.safetensors`,
+  optional `state.pt`, and resume metadata. `checkpoints.load_checkpoint` accepted a run output directory, its
+  `checkpoints/` directory, or a specific step directory.
+- Shared noise levels became the default for joint audio/video training with `flexible`; set
+  `training_strategy.share_sigmas: false` to sample independent noise levels.
+- Trainer dependencies switched to `opencv-python-headless>=4.11.0.86` and `scenedetect-headless>=0.7` for environments
+  without a GUI.
+- Model loading (`ltx_core.loader`) builds models in weight units. `SimpleBuilder(configurator, paths, sd_ops, module_ops, ...)` replaces `SingleGPUModelBuilder` (add LoRAs with `.lora(paths, strength, sd_ops)`); `StreamingBuilder(base, StreamingConfig(blocks_prefix, mode, prefetch_depth, device_buffers, host_buffers))` replaces the block-streaming builder; `ltx_core.loader.distributed_builders` (`SequenceParallelBuilder`, `TiledDataParallelBuilder`, `AccelerateGemmaBuilder`, `BatchParallelGemmaBuilder`) replace the `ltx_pipelines.multigpu` builders and tracker: stage builders given one shared `dst` dict switch LoRAs in place in one replicated allocation, and the registry returns a cached model still holding the requested selection. `ModelRegistry(cache_models=True, cache_metadata=True, placement_policy=...)` caches model shells and checkpoint metadata and keeps weights only where its placement policy, or a builder's `with_placement_policy`, places them; multi-GPU runners use `ltx_pipelines.multigpu.runner.rank_cuda_registry()`. `QuantizationPolicy(sd_ops, fuse_rule, module_ops)` is applied with `compose_quantization`. Every builder follows the `ltx_core.loader.model_builder.ModelBuilder` protocol: `build`, `registry_keys(dtype)` (the registry entries a build queries and retains), `model_config`, `keeps_gpu_resident_weights`, and `builds_per_shape`. `SDOps` value operations take `(key, inputs)` and return a dict of outputs (`with_kv_operation`), and `video_decoder_sd_ops_for_checkpoint` returns a tuple of stages.
+
+### Removed
+
+- The `v_context` / `a_context` constructor arguments of `SimpleDenoiser`, `GuidedDenoiser` and `FactoryGuidedDenoiser`; set `ModalitySpec.context`, or pass them per call. Custom denoisers and denoising loops must accept and forward `v_context` / `a_context`.
+- The `width`, `height`, `frames` and `fps` arguments of `create_initial_video_latent` and `create_initial_av_latents`; pass `pixel_shape=VideoPixelShape(...)`.
+- `DiffusionStage.resident()`: share `active_weights` between stages instead; distributed stage builders already return their bound model on repeated calls.
+- `encode_video` no longer accepts `Iterator[Audio]`; pass one complete `Audio` track, or use `encode_media_segments` for chunk-aligned audio.
+- The `scale_factors` argument of `ensure_tiling_config` and the multi-GPU `EnsureTilingConfig` protocol; scale factors are read from `vae_checkpoint_path`.
+- `HlgPyAVEncoder`, `encode_linear_hdr_frames_to_hlg_mp4`, `encode_sdr_h264`, PyAV-backed `ltx_core.color.audio_mux`, and the direct `ltx-core` PyAV dependency; use `ltx_pipelines.utils.media_io.encode_video` or `encode_audio`. PyAV remains a direct dependency of `ltx-pipelines` and `ltx-trainer`.
+- `ltx_pipelines.chunks.split_decoded_chunks` and `deferred_stitch_audio`; pass the `PlaybackSegment` iterator directly to `encode_media_segments`, or use `pipeline_output_from_chunks` when an in-memory `PipelineOutput` is required.
+- Removed the separate `text_to_video` and `video_to_video` trainer strategies; use `training_strategy.name: flexible`
+  with video/audio conditions. Legacy YAML configurations are migrated by the config loader.
+- Removed the custom strategy hooks `prepare_training_inputs()`, `compute_loss()`, and `get_checkpoint_metadata()`;
+  implement the new `TrainingStrategy` contract with `train_step()` (or `_compute_loss()` for its default training
+  step), `collect_checkpoint()`, and model, optimizer, data, and state restoration hooks.
+- Removed `scripts/process_dataset.py`, `scripts/process_videos.py`, `scripts/process_captions.py`, and
+  `scripts/decode_latents.py`; use `scripts/preprocess.py CONFIG` and its configuration options instead.
+- Removed `ltx_trainer.video_utils`, `ltx_trainer.validation_runner`, and `ltx_trainer.process_videos`; use
+  `ltx_trainer.media_utils`, `ltx_trainer.validation.runner`, and `ltx_trainer.preprocessing`, respectively.
+- Removed automatic Hugging Face Hub uploads and the trainer's `hub` configuration; publish saved checkpoints with
+  an external upload workflow. Migrating a configuration with `hub.push_to_hub: true` emitted a warning.
+- Removed support for resuming legacy flat trainer checkpoints; start a fresh run or resume from a new
+  `checkpoints/step_NNNNN/` directory.
+- `SingleGPUModelBuilder`, `SafetensorsModelStateDictLoader`, `ltx_core.block_streaming`, `ltx_core.multigpu.sharded_sd`, the `ltx_pipelines.multigpu` model builders and weight tracker, `ModelRegistry(cache_weights=...)`, and the legacy `SDOps` forms (`with_legacy_kv_operation`, single-tensor `apply_to_key_value`, `with_additional_allowed_keys`, `ContentMatching`/`ContentReplacement`/`KeyValueOperationResult`); see the loader entry under Changed.
+
+### Fixed
+
+- DiffVAE `AUTO_TILING` now scales its decode memory budget by the VAE dtype (`vae_dtype`), preventing 2x memory underestimation and Stage 5 out-of-memory errors when decoding in `float32` (such as `HDRICLoraPipeline` and `--hdr` EXR runs).
+- Fixed first-frame conditioning suppressing image training loss, temporal positions using the first sample's FPS
+  for an entire batch, and reference geometry checks overlooking later batches or additional references.
+  Single-frame reference pairs retained their configured temporal scale.
+- Fixed validation combinations of masks and reference conditions, audio masks being applied to video, and dropped
+  attention masks. Validation disabled dropout while sampling, restored each module's previous mode, preserved
+  seeded stochastic decoding including seed zero, and avoided NaNs during single-step sampling.
+- Fixed inconsistent image-mask resizing between preprocessing and validation, missing frames in short mask videos,
+  lost frame dimensions in single-frame videos, and caption pairing in nested latent caches. Trainer positions and
+  mask downsampling also used the correct compression factors for nested VAE encoder configurations.
+- Guidance rescaling (`rescale_scale`) estimates its factor only over tokens that are being denoised, so fixed conditioning and appended reference tokens no longer change the scale of the generated output. `MultiModalGuider.calculate` takes an optional `denoise_mask`; without it the factor is computed over all tokens as before. Outputs of conditioned runs with a non-zero `rescale_scale` change.
+- HDR encoding publishes complete EXR sidecar sequences only after successful encoding, preventing partial or stale frames when encoding fails or replaces a longer clip.
+
 ## 1.5.0 - 2026-10-18
 
 ### Added

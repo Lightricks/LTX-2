@@ -1,8 +1,8 @@
-"""Chunk operators: stream ``Chunk`` / ``DecodedChunk`` through denoise, upsample, and decode."""
+"""Chunk operators: stream ``Chunk`` / ``PlaybackSegment`` through denoise, upsample, and decode."""
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from dataclasses import replace
 
 import torch
@@ -14,7 +14,6 @@ from ltx_core.types import VIDEO_SCALE_FACTORS, Audio, AudioLatentShape
 from ltx_pipelines.chunks.layout import ChunkLayout
 from ltx_pipelines.chunks.state import (
     Chunk,
-    DecodedChunk,
     GeneratedKeyframes,
     MakeAudioConditionings,
     MakeVideoConditionings,
@@ -30,9 +29,8 @@ from ltx_pipelines.utils.blocks import (
     VideoUpsampler,
 )
 from ltx_pipelines.utils.helpers import decode_keyframes_from_slots
+from ltx_pipelines.utils.media_io.types import PlaybackSegment
 from ltx_pipelines.utils.types import Denoiser, ModalitySpec, VideoAudio
-
-MakeDenoiser = Callable[[Chunk], Denoiser]
 
 # Longer than the vocoder receptive field so independently decoded seams can
 # overlap-add without exposing either chunk's boundary transient.
@@ -50,11 +48,15 @@ def denoise_chunks(  # noqa: PLR0913
     audio_noise_scale: float | None = None,
     loop: DenoisingLoop | None = None,
     max_batch_size: int = 1,
-    make_denoiser: MakeDenoiser | None = None,
+    denoiser: Denoiser | None = None,
     freeze_video: bool = False,
     freeze_audio: bool = False,
 ) -> Iterator[Chunk]:
-    """Denoise each ``Chunk`` through ``stage``, materializing conditionings and threading carry."""
+    """Denoise each ``Chunk`` through ``stage``, materializing conditionings and threading carry.
+    ``denoiser`` (``SimpleDenoiser`` when omitted) is shared by every chunk; each chunk's positive
+    context reaches it through the chunk's ``ModalitySpec``.
+    """
+    denoiser = SimpleDenoiser() if denoiser is None else denoiser
     scale = sigmas[0].item() if noise_scale is None else noise_scale
     audio_scale = scale if audio_noise_scale is None else audio_noise_scale
     carry_video: torch.Tensor | None = None
@@ -62,11 +64,6 @@ def denoise_chunks(  # noqa: PLR0913
     # Each denoise pass owns a separate carry at that stage's spatial resolution.
     stage_carry_keyframes: GeneratedKeyframes | None = None
     for chunk in chunks:
-        denoiser = (
-            make_denoiser(chunk)
-            if make_denoiser is not None
-            else SimpleDenoiser(chunk.video_context, chunk.audio_context)
-        )
         incoming_keyframes = stage_carry_keyframes if stage_carry_keyframes is not None else chunk.incoming_keyframes
         video_cond = _append_incoming_keyframes(list(chunk.make_video_conditionings(chunk)), incoming_keyframes)
         audio_cond = list(chunk.make_audio_conditionings(chunk))
@@ -81,6 +78,7 @@ def denoise_chunks(  # noqa: PLR0913
             ModalitySpec(
                 latent=chunk.video,
                 conditioning_fps=fps,
+                context=chunk.video_context,
                 conditionings=_append_carry(video_cond, carry_video, VideoConditionByLatentIndex),
                 noise_scale=0.0 if freeze_video else scale,
                 frozen=freeze_video,
@@ -92,6 +90,7 @@ def denoise_chunks(  # noqa: PLR0913
             ModalitySpec(
                 latent=chunk.audio,
                 conditioning_fps=fps,
+                context=chunk.audio_context,
                 conditionings=_append_carry(audio_cond, carry_audio, AudioConditionByLatentIndex),
                 noise_scale=0.0 if freeze_audio else audio_scale,
                 frozen=freeze_audio,
@@ -200,7 +199,7 @@ def decode_chunks(
     generator: torch.Generator | None = None,
     dtype: torch.dtype | None = None,
     keyframes: bool = False,
-) -> Iterator[DecodedChunk]:
+) -> Iterator[PlaybackSegment]:
     """Decode chunks and join their carried overlap.
     Each body streams immediately, while its outgoing video tail waits to blend
     with the next chunk's carried prefix. Audio retains matching seam samples
@@ -210,7 +209,7 @@ def decode_chunks(
     the global timeline. Empty decoder output is skipped. Without an
     ``audio_decoder``, chunks are video-only.
     """
-    pending_tail: DecodedChunk | None = None
+    pending_tail: PlaybackSegment | None = None
     for chunk in chunks:
         if chunk.video is None:
             raise ValueError("decode_chunks requires chunk.video")
@@ -241,7 +240,7 @@ def decode_chunks(
             pending_tail = None
 
         body, pending_tail = _body_and_pending_tail(
-            DecodedChunk(video=frames, audio=audio),
+            PlaybackSegment(video=frames, audio=audio),
             layout=layout,
             fps=fps,
         )
@@ -281,7 +280,7 @@ def _vocoded_chunk_audio(
     audio_decoder: AudioDecoder | None,
     *,
     fps: float,
-    pending_tail: DecodedChunk | None,
+    pending_tail: PlaybackSegment | None,
 ) -> tuple[Audio | None, int]:
     """Vocode this chunk's audio aligned to ``frames``, plus extra prefix samples for seam crossfade."""
     if audio_decoder is None or chunk.audio is None:
@@ -309,10 +308,10 @@ def _vocoded_chunk_audio(
 
 
 def _apply_pending_audio_crossfade(
-    pending_tail: DecodedChunk | None,
+    pending_tail: PlaybackSegment | None,
     audio: Audio | None,
     seam_fade_samples: int,
-) -> tuple[DecodedChunk | None, Audio | None]:
+) -> tuple[PlaybackSegment | None, Audio | None]:
     if pending_tail is None or pending_tail.audio is None or audio is None:
         return pending_tail, audio
     pending_audio, audio = _crossfade_audio_seam(pending_tail.audio, audio, seam_fade_samples)
@@ -320,10 +319,10 @@ def _apply_pending_audio_crossfade(
 
 
 def _blend_pending_video_tail(
-    pending_tail: DecodedChunk,
+    pending_tail: PlaybackSegment,
     decoded_frames: torch.Tensor,
     prev_video_carry_frames: int,
-) -> DecodedChunk:
+) -> PlaybackSegment:
     overlap_end = prev_video_carry_frames
     blend_start = overlap_end - pending_tail.video.shape[0]
     if blend_start < 0:
@@ -338,11 +337,11 @@ def _blend_pending_video_tail(
 
 
 def _body_and_pending_tail(
-    decoded: DecodedChunk,
+    decoded: PlaybackSegment,
     *,
     layout: ChunkLayout,
     fps: float,
-) -> tuple[DecodedChunk, DecodedChunk | None]:
+) -> tuple[PlaybackSegment, PlaybackSegment | None]:
     blend_frames = layout.next_video_blend_frames
     if blend_frames == 0:
         return decoded, None
@@ -358,13 +357,13 @@ def _body_and_pending_tail(
 
 
 def replace_chunks_audio(
-    chunks: Iterator[DecodedChunk],
+    chunks: Iterator[PlaybackSegment],
     source: Audio,
     fps: float,
-) -> Iterator[DecodedChunk]:
+) -> Iterator[PlaybackSegment]:
     """Replace each chunk's audio with the equivalent slice of ``source``.
     Each chunk takes the next unused samples so the stitched waveform stays contiguous.
-    A source shorter than the video emits what remains, then empty. Slices stay on
+    A source shorter than the video emits what remains, then ``None``. Slices stay on
     ``source.waveform``'s device. Run after :func:`decode_chunks` once overlap frames
     are already dropped.
     """
@@ -377,6 +376,9 @@ def replace_chunks_audio(
         end_audio_sample = round(stitched_pixel_frames / fps * sampling_rate)
         remaining = waveform.shape[-1] - emitted_audio_samples
         chunk_audio_samples = max(0, min(remaining, end_audio_sample - emitted_audio_samples))
+        if chunk_audio_samples == 0:
+            yield replace(chunk, audio=None)
+            continue
         sliced = waveform[..., emitted_audio_samples : emitted_audio_samples + chunk_audio_samples]
         emitted_audio_samples += chunk_audio_samples
         yield replace(chunk, audio=Audio(waveform=sliced, sampling_rate=sampling_rate))
@@ -476,11 +478,11 @@ def _drop_video_overlap(frames: torch.Tensor, prev_video_carry_frames: int) -> t
 
 
 def _split_decoded_tail(
-    chunk: DecodedChunk,
+    chunk: PlaybackSegment,
     *,
     tail_frames: int,
     prefix_audio_samples: int,
-) -> tuple[DecodedChunk, DecodedChunk]:
+) -> tuple[PlaybackSegment, PlaybackSegment]:
     """Split a decoded chunk, cloning only the retained tail so it releases the full frame storage."""
     body_audio = None
     tail_audio = None
@@ -488,8 +490,8 @@ def _split_decoded_tail(
         body_audio = replace(chunk.audio, waveform=chunk.audio.waveform[..., :prefix_audio_samples])
         tail_audio = replace(chunk.audio, waveform=chunk.audio.waveform[..., prefix_audio_samples:].clone())
     return (
-        DecodedChunk(video=chunk.video[:-tail_frames], audio=body_audio),
-        DecodedChunk(video=chunk.video[-tail_frames:].clone(), audio=tail_audio),
+        PlaybackSegment(video=chunk.video[:-tail_frames], audio=body_audio),
+        PlaybackSegment(video=chunk.video[-tail_frames:].clone(), audio=tail_audio),
     )
 
 

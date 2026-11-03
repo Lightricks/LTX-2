@@ -1,24 +1,15 @@
-"""Shared model-construction helpers used by both SingleGPUModelBuilder and StreamingModelBuilder."""
+"""Shared model-construction helpers for unit builders."""
 
 from __future__ import annotations
 
-import copy
 from collections.abc import Iterator, Mapping
-from os import PathLike, fspath
 from typing import TypeVar
 
 import torch
 from torch import nn
 from torch.nn.parameter import is_lazy
 
-from ltx_core.loader.module_ops import ModuleOps
-from ltx_core.loader.primitives import StateDict, StateDictLoader
-from ltx_core.loader.registry import Registry
-from ltx_core.loader.sd_ops import SDOps
-from ltx_core.model.model_protocol import ModelConfigurator
-
 _M = TypeVar("_M", bound=nn.Module)
-_PathArg = str | PathLike[str]
 
 
 def _customizes_loading(module: nn.Module) -> bool:
@@ -31,7 +22,7 @@ def _customizes_loading(module: nn.Module) -> bool:
     )
 
 
-def assign_state_dict(module: nn.Module, state_dict: Mapping[str, torch.Tensor]) -> None:
+def assign_state_dict(module: nn.Module, state_dict: Mapping[str, torch.Tensor]) -> None:  # noqa: PLR0912
     """Same result as ``module.load_state_dict(state_dict, strict=False, assign=True)``, in one pass.
     Each parameter / persistent buffer looks its key up directly, where ``nn.Module.load_state_dict``
     re-filters the whole state dict for every child module. Keys without a matching tensor are left
@@ -42,10 +33,24 @@ def assign_state_dict(module: nn.Module, state_dict: Mapping[str, torch.Tensor])
     """
     modules = list(module.named_modules(remove_duplicate=False))
     if torch.__future__.get_swap_module_params_on_conversion() or any(_customizes_loading(m) for _, m in modules):
+        if not torch.is_inference_mode_enabled() and any(value.is_inference() for value in state_dict.values()):
+            regularized: dict[int, torch.Tensor] = {}
+            regular_state = {}
+            for key, value in state_dict.items():
+                supplied = value
+                if value.is_inference():
+                    source_id = id(value)
+                    regular = regularized.get(source_id)
+                    if regular is None:
+                        regular = regularized[source_id] = value.clone()
+                    supplied = regular
+                regular_state[key] = supplied
+            state_dict = regular_state
         module.load_state_dict(state_dict, strict=False, assign=True)
         return
 
     error_msgs: list[str] = []
+    regularized_inference: dict[int, torch.Tensor] = {}
     for prefix, submodule in modules:
         key_prefix = f"{prefix}." if prefix else ""
         for name, param in submodule._parameters.items():
@@ -55,6 +60,14 @@ def assign_state_dict(module: nn.Module, state_dict: Mapping[str, torch.Tensor])
             tensor = _matching_shape(tensor, param, key_prefix + name, error_msgs)
             if tensor is None:
                 continue
+            if tensor.is_inference() and param.requires_grad and not torch.is_inference_mode_enabled():
+                # A retained inference tensor cannot become a trainable Parameter outside
+                # inference mode. Preserve repeated references to tied checkpoint values.
+                source_id = id(tensor)
+                regular = regularized_inference.get(source_id)
+                if regular is None:
+                    regular = regularized_inference[source_id] = tensor.clone()
+                tensor = regular
             if isinstance(tensor, nn.Parameter):
                 tensor.requires_grad_(param.requires_grad)
             else:
@@ -115,61 +128,6 @@ def to_device(model: _M, device: torch.device) -> _M:
     return model.to(device)
 
 
-def as_path_list(paths: _PathArg | tuple[_PathArg, ...] | list[_PathArg]) -> list[str]:
-    """Normalize checkpoint path args to the ``list[str]`` shape registries key on."""
-    if isinstance(paths, (str, PathLike)):
-        return [fspath(paths)]
-    return [fspath(p) for p in paths]
-
-
-def load_state_dict(
-    paths: _PathArg | tuple[_PathArg, ...] | list[_PathArg],
-    loader: StateDictLoader,
-    registry: Registry,
-    device: torch.device | None,
-    sd_ops: SDOps | None = None,
-) -> StateDict:
-    """Load a state dict from disk, using registry caching."""
-    path_list = as_path_list(paths)
-    cached = registry.get(path_list, sd_ops)
-    if cached is not None:
-        return cached
-    result = loader.load(path_list, sd_ops=sd_ops, device=device)
-    # ``add`` returns the retained copy when the registry rewrites storage (e.g. pin to CPU).
-    return registry.add(path_list, sd_ops=sd_ops, state_dict=result)
-
-
-def read_model_metadata(
-    model_path: str | tuple[str, ...],
-    loader: StateDictLoader,
-) -> dict:
-    """Read the full metadata dict from the first shard of a checkpoint."""
-    first = model_path[0] if isinstance(model_path, tuple) else model_path
-    return loader.metadata(first)
-
-
-class LazyModelMetadata:
-    """A checkpoint's parsed metadata, read on first access and shared by every builder copy holding it."""
-
-    def __init__(self, model_path: str | tuple[str, ...], loader: StateDictLoader) -> None:
-        self._model_path = model_path
-        self._loader = loader
-        self._metadata: dict | None = None
-
-    def get(self) -> dict:
-        if self._metadata is None:
-            self._metadata = read_model_metadata(self._model_path, self._loader)
-        return copy.deepcopy(self._metadata)
-
-
-def read_model_config(
-    model_path: str | tuple[str, ...],
-    loader: StateDictLoader,
-) -> dict:
-    """Read the ``config`` sub-dict (transformer/vae/scheduler/...) from a checkpoint's metadata."""
-    return read_model_metadata(model_path, loader).get("config", {})
-
-
 def parse_model_version(version: str | None) -> tuple[int, ...]:
     """Parse a checkpoint's ``model_version`` into comparable numeric components.
     Parsing stops at the first dot-separated component that isn't a plain integer, so
@@ -190,17 +148,3 @@ def parse_model_version(version: str | None) -> tuple[int, ...]:
             break
         numeric_parts.append(int(part))
     return tuple(numeric_parts)
-
-
-def create_meta_model(
-    configurator: type[ModelConfigurator[_M]],
-    metadata: dict,
-    module_ops: tuple[ModuleOps, ...] = (),
-) -> _M:
-    """Create a model on the meta device and apply module operations."""
-    with torch.device("meta"):
-        model = configurator.from_metadata(metadata)
-    for op in module_ops:
-        if op.matcher(model):
-            model = op.mutator(model)
-    return model

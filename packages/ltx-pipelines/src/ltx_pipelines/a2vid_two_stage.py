@@ -11,25 +11,24 @@ from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.conditioning import ConditioningItem
 from ltx_core.loader import LoraPathStrengthAndSDOps
-from ltx_core.loader.registry import Registry
+from ltx_core.loader.registry import ModelRegistry
 from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
 from ltx_core.model.transformer.compiling import CompilationConfig
-from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig, get_video_chunks_number
+from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig
 from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import Audio, AudioLatentShape, VideoPixelShape
 from ltx_pipelines.chunks import (
     Chunk,
     ChunkConfig,
-    DecodedChunk,
     MakeVideoConditionings,
+    PlaybackSegment,
     decode_chunks,
     denoise_chunks,
     generate_uniform_chunks,
     pipeline_output_from_chunks,
     replace_chunks_audio,
     spatially_upsample_chunks,
-    split_decoded_chunks,
 )
 from ltx_pipelines.chunks.conditionings import (
     assert_image_frames_in_clip,
@@ -66,12 +65,11 @@ from ltx_pipelines.utils.helpers import (
     get_device,
     num_frames_from_audio_duration,
     snap_frames_to_grid,
-    tiling_scale_factors_for_vae,
 )
 from ltx_pipelines.utils.media_io import (
     EXRColorSpace,
     decode_audio_from_file,
-    encode_video,
+    encode_media_segments,
     resolve_hdr_color_space,
     vae_dtype_for_hdr,
 )
@@ -129,7 +127,7 @@ class A2VidPipelineTwoStage:
         loras: list[LoraPathStrengthAndSDOps],
         device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
-        registry: Registry | None = None,
+        registry: ModelRegistry | None = None,
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
@@ -138,6 +136,7 @@ class A2VidPipelineTwoStage:
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
+        registry = registry or ModelRegistry()
         self._scheduler = LTX2Scheduler()
 
         self.prompt_encoder = PromptEncoder(
@@ -264,10 +263,8 @@ class A2VidPipelineTwoStage:
         v_context_p, a_context_p = ctx_p.video_encoding, ctx_p.audio_encoding
         v_context_n, _ = ctx_n.video_encoding, ctx_n.audio_encoding
 
-        scale_factors = tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path)
         resolved_tiling_config = ensure_tiling_config(
             tiling_config,
-            scale_factors=scale_factors,
             vae_checkpoint_path=self.video_decoder.checkpoint_path,
             video_shape=VideoPixelShape(
                 batch=1,
@@ -279,6 +276,7 @@ class A2VidPipelineTwoStage:
             diffvae_optimization=self.video_decoder.diffvae_optimization,
             device=self.device,
             keyframes=decode_with_keyframes,
+            vae_dtype=resolved_vae_dtype,
         )
 
         encoded_audio_latent = self.audio_conditioner(lambda enc: vae_encode_audio(decoded_audio, enc, None))
@@ -408,7 +406,7 @@ class A2VidPipelineTwoStage:
         chunk_config: ChunkConfig | None = None,
         generated_keyframes: int | Sequence[int] = 0,
         decode_with_keyframes: bool = False,
-    ) -> tuple[Iterator[DecodedChunk], int, TilingConfig]:
+    ) -> tuple[Iterator[PlaybackSegment], int, TilingConfig]:
         """Generate a video as a stream of decoded chunks.
         ``chunk_config=None`` plans a single chunk covering the snapped clip.
         Audio is the frozen source latent both stages; decoded output is the original waveform.
@@ -448,17 +446,6 @@ class A2VidPipelineTwoStage:
             fps=frame_rate,
         )
 
-        def make_denoiser(chunk: Chunk) -> GuidedDenoiser:
-            return GuidedDenoiser(
-                v_context=chunk.video_context,
-                a_context=chunk.audio_context,
-                video_guider=MultiModalGuider(
-                    params=video_guider_params,
-                    negative_context=ctx.v_context_n,
-                ),
-                audio_guider=MultiModalGuider(params=MultiModalGuiderParams()),
-            )
-
         chunks = generate_uniform_chunks(
             target=target,
             context=VideoAudio(video=ctx.v_context_p, audio=ctx.a_context_p),
@@ -477,7 +464,13 @@ class A2VidPipelineTwoStage:
             noiser=ctx.noiser,
             fps=frame_rate,
             max_batch_size=max_batch_size,
-            make_denoiser=make_denoiser,
+            denoiser=GuidedDenoiser(
+                video_guider=MultiModalGuider(
+                    params=video_guider_params,
+                    negative_context=ctx.v_context_n,
+                ),
+                audio_guider=MultiModalGuider(params=MultiModalGuiderParams()),
+            ),
             freeze_audio=True,
         )
         upscaled = spatially_upsample_chunks(base, self.upsampler)
@@ -622,7 +615,7 @@ def main() -> None:
         skip_step=args.video_skip_step,
         stg_blocks=args.video_stg_blocks,
     )
-    chunks, num_frames_out, tiling_config = pipeline.stream_chunks(
+    chunks, _, _ = pipeline.stream_chunks(
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
         seed=args.seed,
@@ -646,25 +639,12 @@ def main() -> None:
         generated_keyframes=args.num_generated_keyframes,
         decode_with_keyframes=args.decode_with_keyframes,
     )
-    if chunk_config is not None:
-        video, audio, audio_sampling_rate = split_decoded_chunks(chunks)
-        video_chunks_number = 1
-    else:
-        result = pipeline_output_from_chunks(
-            chunks,
-            num_frames=num_frames_out,
-            tiling_config=tiling_config,
-        )
-        video, audio, audio_sampling_rate = result.video, result.audio, None
-        video_chunks_number = get_video_chunks_number(result.num_frames, result.tiling_config)
-    encode_video(
-        video=video,
+    encode_media_segments(
+        chunks,
         fps=args.frame_rate,
-        audio=audio,
         output_path=args.output_path,
-        video_chunks_number=video_chunks_number,
+        video_chunks_number=None,
         color_space=hdr,
-        audio_sampling_rate=audio_sampling_rate,
         video_marker=video_marker,
     )
 

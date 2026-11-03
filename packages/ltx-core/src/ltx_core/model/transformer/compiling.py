@@ -1,7 +1,12 @@
+from __future__ import annotations
+
 import contextlib
+import dataclasses
+import hashlib
+import json
 from collections.abc import Hashable, Iterator
 from dataclasses import dataclass, field, replace
-from typing import Any
+from typing import Any, TypeVar
 
 import torch
 import torch.utils._pytree as pytree
@@ -9,6 +14,7 @@ import torch.utils._pytree as pytree
 from ltx_core.guidance.perturbations import BatchedPerturbationConfig, PerturbationType
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.sd_ops import SDOps
+from ltx_core.loader.simple_builder import SimpleBuilder
 from ltx_core.model.transformer.cudagraph_capture import CudaGraphRunner
 from ltx_core.model.transformer.model import LTXModel
 from ltx_core.model.transformer.transformer_args import (
@@ -21,6 +27,7 @@ from ltx_core.model.transformer.transformer_args import (
 # replaces these wholesale; it does not merge.
 _DEFAULT_INDUCTOR_CONFIG: dict[str, Any] = {}
 _DEFAULT_DYNAMO_CONFIG: dict[str, Any] = {"inline_inbuilt_nn_modules": True, "cache_size_limit": 256}
+_Model = TypeVar("_Model", bound=torch.nn.Module)
 
 
 @dataclass(frozen=True)
@@ -253,12 +260,19 @@ def compile_transformer(model: LTXModel, config: CompilationConfig) -> LTXModel:
 
 
 def build_compile_transformer_op(config: CompilationConfig) -> ModuleOps:
-    """Build a ``ModuleOps`` that compiles transformer blocks with the given settings."""
+    """Build a shell operation whose name distinguishes compilation settings."""
     return ModuleOps(
-        name="compile_transformer",
-        matcher=lambda model: isinstance(model, LTXModel),
+        name=f"compile_transformer:{_config_fingerprint(config)}",
+        matcher=lambda model: hasattr(model, "transformer_blocks"),
         mutator=lambda model: compile_transformer(model, config),
+        required_device_type=("cuda" if config.capture or config.mode in ("reduce-overhead", "max-autotune") else None),
     )
+
+
+def _config_fingerprint(config: CompilationConfig) -> str:
+    """Stable short digest of a config, including its nested inductor/dynamo dicts."""
+    payload = json.dumps(dataclasses.asdict(config), sort_keys=True, default=repr)
+    return hashlib.sha256(payload.encode()).hexdigest()[:8]
 
 
 def modify_sd_ops_for_compilation(original_sd_ops: SDOps, number_of_blocks: int = 48) -> SDOps:
@@ -267,3 +281,25 @@ def modify_sd_ops_for_compilation(original_sd_ops: SDOps, number_of_blocks: int 
             f"transformer_blocks.{i}.", f"transformer_blocks.{i}._orig_mod."
         )
     return original_sd_ops
+
+
+def compiled_key_stage(number_of_blocks: int) -> SDOps:
+    """Rewrite checkpoint and adapter keys for compiled transformer blocks."""
+    if number_of_blocks < 1:
+        raise ValueError("compiled transformer needs at least one block")
+    return modify_sd_ops_for_compilation(
+        SDOps(f"compile-block-keys:{number_of_blocks}").with_matching(), number_of_blocks
+    )
+
+
+def compose_compilation(
+    builder: SimpleBuilder[_Model], config: CompilationConfig, number_of_blocks: int
+) -> SimpleBuilder[_Model]:
+    """Append compilation after prepared model and adapter transforms."""
+    stage = compiled_key_stage(number_of_blocks)
+    return replace(
+        builder,
+        sd_ops=(*builder.sd_ops, stage),
+        module_ops=(*builder.module_ops, build_compile_transformer_op(config)),
+        loras=tuple(replace(request, sd_ops=(*request.sd_ops, stage)) for request in builder.loras),
+    )

@@ -1,8 +1,9 @@
 [project]
 name = "ltx-pipelines"
-version = "1.5.0"
+version = "1.6.0"
 description = "Pipelines implementation for Lightricks' LTX-2 model"
 readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = ["ltx-core", "av", "tqdm", "pillow", "openimageio", "cloudpickle>=3.1"]
 

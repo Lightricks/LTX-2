@@ -1,6 +1,6 @@
 # Sequence Parallelism (SP)
 
-**Source**: [`ltx_core/multigpu/transformer/sequence_parallel.py`](../../../ltx-core/src/ltx_core/multigpu/transformer/sequence_parallel.py), [`multigpu/sp_builder.py`](../../src/ltx_pipelines/multigpu/sp_builder.py)
+**Source**: [`ltx_core/multigpu/transformer/sequence_parallel.py`](../../../ltx-core/src/ltx_core/multigpu/transformer/sequence_parallel.py), [`ltx_core/loader/distributed_builders.py`](../../../ltx-core/src/ltx_core/loader/distributed_builders.py)
 
 ## What it is
 
@@ -63,18 +63,19 @@ derive their uniform per-rank token counts from the input tensors; callers pad b
 ### `SequenceParallelBuilder`
 
 ```python
-from ltx_pipelines.multigpu.sp_builder import SequenceParallelBuilder
+from ltx_core.loader.distributed_builders import SequenceParallelBuilder
 
 SequenceParallelBuilder(
-    inner: ModelBuilderProtocol,   # the stage's single-GPU transformer builder
-    attn_mgr: AttentionManager,
-    registry: Registry,
-    tracker: TransformerWeightTracker,
+    base: SimpleBuilder,                 # the stage's transformer builder
+    attention_manager: AttentionManager,
+    dst: dict[str, torch.Tensor] | None = None,  # active weights shared with the other stages
 )
 ```
 
-Wraps a `SingleGPUModelBuilder` (raises otherwise), injects the all2all attention
-module-ops, and `build()` returns a `SequenceParallelModelWrapper`.
+Adds the all2all attention module op to `base` when constructed, so a stage's
+compilation op runs after it, and `build()` returns a `SequenceParallelModelWrapper`
+around the distributed model (see [shared active weights](pipeline-setup.md#shared-active-weights--one-replica-rank-owned-clean-units)). The all2all barrier timeout is
+`attention_manager.all2all_timeout_seconds`.
 
 ## Usage
 
@@ -89,10 +90,7 @@ attn_mgr = AttentionManager(
     group=self.groups.transformer_group,
 )
 pipeline.stage_1._transformer_builder = SequenceParallelBuilder(
-    inner=pipeline.stage_1._transformer_builder,
-    attn_mgr=attn_mgr,
-    registry=registry,
-    tracker=tracker,
+    pipeline.stage_1._transformer_builder, attn_mgr, dst=active_weights
 )
 ```
 

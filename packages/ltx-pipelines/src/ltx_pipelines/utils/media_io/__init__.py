@@ -22,7 +22,7 @@ from ltx_pipelines.utils.media_io.decode import (
     preprocess,
     video_preprocess,
 )
-from ltx_pipelines.utils.media_io.encode import encode_audio, encode_sdr_h264, encode_video
+from ltx_pipelines.utils.media_io.encode import VideoCodec, encode_audio, encode_media_segments, encode_video
 from ltx_pipelines.utils.media_io.exr import (
     encode_exr_sequence_to_mp4,
     exr_colorspace_tag,
@@ -33,7 +33,7 @@ from ltx_pipelines.utils.media_io.exr import (
     read_exr,
     save_exr_tensor,
 )
-from ltx_pipelines.utils.media_io.inputs import EXRVideoInput, VideoInput
+from ltx_pipelines.utils.media_io.inputs import AudioInput, EXRVideoInput, VideoInput
 from ltx_pipelines.utils.media_io.range_map import from_vae_range, normalize_images, to_vae_range
 from ltx_pipelines.utils.media_io.resize import (
     ResizeMode,
@@ -42,11 +42,15 @@ from ltx_pipelines.utils.media_io.resize import (
     resize_and_reflect_pad,
     resize_aspect_ratio_preserving,
 )
+from ltx_pipelines.utils.media_io.types import PlaybackSegment
 
 __all__ = [
+    "AudioInput",
     "EXRColorSpace",
     "EXRVideoInput",
+    "PlaybackSegment",
     "ResizeMode",
+    "VideoCodec",
     "VideoInput",
     "align_resolution",
     "decode_audio_from_file",
@@ -57,7 +61,7 @@ __all__ = [
     "decode_video_from_file",
     "encode_audio",
     "encode_exr_sequence_to_mp4",
-    "encode_sdr_h264",
+    "encode_media_segments",
     "encode_single_frame",
     "encode_video",
     "exr_colorspace_tag",

@@ -14,7 +14,7 @@ from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.conditioning import ConditioningItem
 from ltx_core.loader import LoraPathStrengthAndSDOps
-from ltx_core.loader.registry import Registry
+from ltx_core.loader.registry import ModelRegistry
 from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig, VideoEncoder, get_video_chunks_number
 from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
@@ -41,7 +41,6 @@ from ltx_pipelines.utils.helpers import (
     ensure_tiling_config,
     get_device,
     image_conditionings,
-    tiling_scale_factors_for_vae,
 )
 from ltx_pipelines.utils.media_io import EXRColorSpace, encode_video, resolve_hdr_color_space, vae_dtype_for_hdr
 from ltx_pipelines.utils.model_paths import ModelPaths
@@ -75,11 +74,12 @@ class AlphaGenPipeline:
         loras: list[LoraPathStrengthAndSDOps],
         device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
-        registry: Registry | None = None,
+        registry: ModelRegistry | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
         diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
     ) -> None:
         self.dtype = torch.bfloat16
+        registry = registry or ModelRegistry()
         self.device = device or get_device()
         self.prompt_encoder = PromptEncoder(
             model_paths, dtype=self.dtype, device=self.device, registry=registry, offload_mode=offload_mode
@@ -143,29 +143,24 @@ class AlphaGenPipeline:
         )
         tiling_config = ensure_tiling_config(
             tiling_config,
-            scale_factors=tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path),
             vae_checkpoint_path=self.video_decoder.checkpoint_path,
             video_shape=VideoPixelShape(batch=1, frames=num_frames, height=height, width=width, fps=frame_rate),
             diffvae_optimization=self.video_decoder.diffvae_optimization,
             device=self.device,
+            vae_dtype=vae_dtype or self.dtype,
         )
         conditionings = self.image_conditioner(
             lambda enc: self._conditionings(enc, images, video_conditioning, height, width, num_frames, color_space)
         )
 
         video_latent = create_initial_video_latent(
-            width=width,
-            height=height,
-            frames=num_frames,
-            fps=frame_rate,
+            pixel_shape=VideoPixelShape(batch=1, frames=num_frames, height=height, width=width, fps=frame_rate),
             device=self.device,
             dtype=self.dtype,
             scale_factors=self.stage.video_scale_factors,
         )
         video_state, _ = self.stage(
             denoiser=FactoryGuidedDenoiser(
-                v_context=ctx_p.video_encoding,
-                a_context=None,
                 video_guider_factory=create_multimodal_guider_factory(
                     params=video_guider_params, negative_context=ctx_n.video_encoding
                 ),

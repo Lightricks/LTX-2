@@ -1,112 +1,120 @@
 # Troubleshooting Guide
 
-This guide covers common issues and solutions when training with the LTX-2 trainer.
+Expand the issue that matches your symptoms, apply the relevant change, and retry on a small subset.
+Commands assume `packages/ltx-trainer` as the working directory.
 
-## 🔧 VRAM and Memory Issues
+## ⚠️ Common Usage Issues
 
-Memory management is crucial for successful training with LTX-2.
+<details>
+<summary>Out of memory during preprocessing, training, or validation</summary>
 
-> [!TIP]
+> 💡 **Low-VRAM starting point**
 > For GPUs with 32GB VRAM, use the pre-configured low VRAM config:
 > [`configs/t2v_lora_low_vram.yaml`](../configs/t2v_lora_low_vram.yaml)
 > which combines 8-bit optimizer, INT8 quantization, and reduced LoRA rank.
 
 ### Memory Optimization Techniques
 
+First check **where** you run out of memory; different stages need different fixes:
+
+- **Encoding captions:** try the 8-bit text encoder below.
+- **Encoding video:** reduce resolution/frame count or enable `training_strategy.data.vae_tiling`.
+- **Training updates:** try gradient checkpointing, a smaller batch, quantization, or the 8-bit optimizer.
+- **Validation sampling:** reduce `training_strategy.validation.video_dims` or try optimizer-state offloading below.
+
+Apply the relevant options rather than treating the list below as a required sequence.
+
 #### 1. Enable Gradient Checkpointing
 
-Gradient checkpointing trades training speed for memory savings. **Highly recommended** for most training runs:
+Gradient checkpointing saves memory by recomputing intermediate activations during backward rather than keeping them
+all in memory. It makes training slower but is recommended for most runs. This is separate from saving model
+checkpoints to disk.
 
 ```yaml
-optimization:
-  enable_gradient_checkpointing: true
+training_strategy:
+  optimizer:
+    gradient_checkpointing: true
 ```
 
 #### 2. Enable 8-bit Text Encoder
 
-Quantize the Gemma text encoder to 8-bit, roughly halving the VRAM it holds while caption embeddings are computed:
+If preprocessing or validation prompt caching runs out of memory, load Gemma in 8-bit. This affects text-encoding
+phases; it does not reduce the transformer's per-step training memory:
 
 ```yaml
-acceleration:
-  load_text_encoder_in_8bit: true
+training_strategy:
+  model:
+    load_text_encoder_in_8bit: true
 ```
-
-This works with both checkpoint layouts. It requires `bitsandbytes` and a CUDA device, and the full-precision
-weights pass through host RAM on the way to being quantized — budget around 26 GB of RAM for LTX 2.5.
-
 
 #### 3. Reduce Batch Size
 
-Lower the batch size if you encounter out-of-memory errors:
-
-```yaml
-optimization:
-  batch_size: 1  # Start with 1 and increase gradually
-```
-
-Use gradient accumulation to maintain a larger effective batch size:
+Reduce per-GPU batch size and use gradient accumulation to retain a larger effective batch:
 
 ```yaml
 optimization:
   batch_size: 1
-  gradient_accumulation_steps: 4  # Effective batch size = 4
+  gradient_accumulation_steps: 4  # Effective global batch = 4 × num_processes
 ```
 
 #### 4. Use Lower Resolution
 
-Reduce spatial or temporal dimensions to save memory:
+Reduce bucket width, height, or frame count and rebuild the cached artifacts. For example, use one smaller bucket:
+
+```yaml
+training_strategy:
+  data:
+    resolution_buckets:
+      - [512, 512, 49]
+```
 
 ```bash
-# Smaller spatial resolution
-uv run python scripts/process_dataset.py dataset.json \
-    --resolution-buckets "512x512x49" \
-    --model-path /path/to/model.safetensors \
-    --text-encoder-path /path/to/gemma
-
-# Fewer frames
-uv run python scripts/process_dataset.py dataset.json \
-    --resolution-buckets "960x544x25" \
-    --model-path /path/to/model.safetensors \
-    --text-encoder-path /path/to/gemma
+uv run python scripts/preprocess.py configs/t2v_lora.yaml --overwrite
 ```
+
+Alternatively, reduce duration, e.g. `[960, 544, 25]`. `--overwrite` recomputes current items but leaves files for removed samples;
+use a fresh `preprocessed_data_root` for a clean rebuild. See
+[manifest behavior](dataset-preparation.md#preprocessing-manifest-and-staleness-guard).
 
 #### 5. Enable Model Quantization
 
-Use quantization to reduce memory usage:
+Quantization stores the base transformer's weights at lower precision to save memory. This is supported in LoRA mode only:
 
 ```yaml
-acceleration:
-  quantization: "int8-quanto"  # Options: int8-quanto, int4-quanto, fp8-quanto
+training_strategy:
+  quantization: "int8-quanto"
 ```
+
+Other choices are `int4-quanto`, `int2-quanto`, `fp8-quanto`, and `fp8uz-quanto`.
 
 #### 6. Use 8-bit Optimizer
 
-The 8-bit AdamW optimizer uses less memory:
+AdamW keeps running statistics for trainable parameters. Its 8-bit variant stores these more compactly to save memory:
 
 ```yaml
-optimization:
-  optimizer_type: "adamw8bit"
+training_strategy:
+  optimizer:
+    optimizer_type: "adamw8bit"
 ```
 
 #### 7. Offload Optimizer State During Validation
 
-If you OOM specifically during validation video sampling — typically in
-full fine-tunes or high-rank LoRA runs where AdamW state and the VAE decoder
-can't coexist on the GPU — offload optimizer state to CPU during sampling:
+If you run out of memory specifically during validation video sampling, move the optimizer's running statistics
+to CPU while sampling. This can help full fine-tunes or high-rank LoRA runs where those statistics and the VAE decoder
+do not fit on the GPU together:
 
 ```yaml
-acceleration:
+optimization:
   offload_optimizer_during_validation: true
 ```
 
-The offload + reload happens once per validation interval, not per step.
-No effect for FSDP (sharded state).
+The trainer moves the state back to GPU after sampling. This happens once per validation interval, not per step,
+and has no effect for FSDP, which uses sharded state.
 
----
+</details>
 
-## ⚠️ Common Usage Issues
-
-### Issue: "No module named 'ltx_trainer'" Error
+<details>
+<summary>"No module named 'ltx_trainer'" Error</summary>
 
 **Solution:**
 Ensure you've installed the dependencies and are using `uv run` to execute scripts:
@@ -118,85 +126,53 @@ cd packages/ltx-trainer
 uv run python scripts/train.py configs/t2v_lora.yaml
 ```
 
-> [!TIP]
-> Always use `uv run` to execute Python scripts. This automatically uses the correct virtual environment
-> without requiring manual activation.
+`uv run` selects the workspace virtual environment without manual activation.
 
-### Issue: Wrong `text_encoder_path` for the checkpoint layout
+</details>
 
-**Solution:**
-`text_encoder_path` follows the layout of the model you are training on. With a unified checkpoint it is a
-directory holding the matching Gemma model; with a split pack it is the packed text-encoder `.safetensors`,
-which embeds the Gemma weights, the HF sidecars and the text projections in one file. LTX 2.5 requires the
-LTX-specific fine-tuned Gemma 4, not Google's vanilla Gemma 4 model; do not reuse the Gemma 3 root from an
-LTX-2.3 run.
+<details>
+<summary>The text encoder path format does not match the checkpoint</summary>
+
+**Solution:** Set `text_encoder_path` to the matching local text encoder. Unified LTX-2/LTX-2.3 checkpoints use a
+Gemma model directory; an LTX-2.5 split pack uses the packed LTX-specific text-encoder safetensors file. For example:
 
 ```yaml
-model:
-  model_path: "/path/to/ltx-2.x-checkpoint.safetensors"  # Unified checkpoint
-  text_encoder_path: "/path/to/matching-gemma-root/"      # Gemma directory
+training_strategy:
+  model:
+    model_path: "/path/to/ltx-2-model.safetensors"  # Unified checkpoint
+    text_encoder_path: "/path/to/gemma-model/"      # Gemma model directory
 ```
 
-### Issue: "is the transformer of a split checkpoint pack and carries no video VAE" Error
-
-**Solution:**
-`model_path` points at a split pack's transformer, which holds no VAE weights. Name the components explicitly:
+For an LTX-2.5 split pack, use its transformer and packed text-encoder files:
 
 ```yaml
-model:
-  model_path: "/path/to/diffusion_models/ltx-2.5-22b-dev-transformer-bf16.safetensors"
-  text_encoder_path: "/path/to/text_encoders/gemma4-12b-with-proj-ltx-2.5-bf16.safetensors"
-  video_vae_path: "/path/to/vae/ltx-2.5-video-vae-bf16.safetensors"
-  audio_vae_path: "/path/to/vae/ltx-2.5-audio-vae-bf16.safetensors"
+training_strategy:
+  model:
+    model_path: "/path/to/ltx-2.5-transformer.safetensors"
+    text_encoder_path: "/path/to/ltx-2.5-text-encoder.safetensors"
+    video_vae_path: "/path/to/video-vae.safetensors"
+    audio_vae_path: "/path/to/audio-vae.safetensors"
 ```
 
-The preprocessing scripts take the same components as `--video-vae-path` / `--audio-vae-path`.
+Set VAE paths for the modalities used, and use the LTX-specific text encoder. See
+[model configuration](configuration-reference.md#model).
 
-### Issue: "Gemma version mismatch" Error
+</details>
 
-**Solution:**
+<details>
+<summary>"Model path does not exist" Error</summary>
 
-The checkpoint and Gemma root are incompatible. Use the LTX-specific fine-tuned Gemma 4 root named by the checkpoint's
-`gemma_source_checkpoint` metadata and do not mix LTX-2.3 caption features or Gemma weights with LTX 2.5.
-The checkpoint metadata supplied with the model is authoritative.
+Use an existing local `.safetensors` path for `training_strategy.model.model_path`. URLs are unsupported.
+For split packs, also check the matching text-encoder and VAE component paths; see
+[model configuration](configuration-reference.md#model).
 
-### Issue: Training fails after switching from LTX-2.3 to LTX 2.5
+</details>
 
-**Solution:**
-
-Recompute the preprocessed data. Caption feature files in `conditions/` are generated by the selected Gemma model
-and are not interchangeable across versions:
-
-```bash
-uv run python scripts/process_dataset.py dataset.json \
-    --resolution-buckets "960x544x49" \
-    --model-path /path/to/ltx-2.x-checkpoint.safetensors \
-    --text-encoder-path /path/to/gemma4-12b-ltx-v1 \
-    --overwrite
-```
-
-Use a fresh output directory when possible. `process_dataset.py`, `process_captions.py`, and `process_videos.py`
-skip existing `.pt` files unless `--overwrite` is passed.
-
-### Issue: "Model path does not exist" Error
+<details>
+<summary>"frames must satisfy (frames - 1) % T == 0" Error</summary>
 
 **Solution:**
-LTX-2 requires local model paths. URLs are not supported:
-
-```yaml
-# ✅ Correct - local path
-model:
-  model_path: "/path/to/ltx-2-model.safetensors"
-
-# ❌ Wrong - URL not supported
-model:
-  model_path: "https://huggingface.co/..."
-```
-
-### Issue: "frames must satisfy (frames - 1) % T == 0" Error
-
-**Solution:**
-The number of frames must be VAE-aligned: `frames % T == 1`, where `T` is the VAE temporal
+The number of frames must be VAE-aligned: `(frames - 1) % T == 0`, where `T` is the VAE temporal
 compression factor read from the checkpoint. For the **default** VAE, `T = 8`:
 
 - ✅ Valid: 1, 9, 17, 25, 33, 41, 49, 57, 65, 73, 81, 89, 97, 121
@@ -205,17 +181,113 @@ compression factor read from the checkpoint. For the **default** VAE, `T = 8`:
 A less-compressed VAE lowers `T` (e.g. a 16x16x4 VAE uses `T = 4`, allowing 1, 5, 9, 13, ...).
 The spatial dimensions must likewise be divisible by the VAE spatial factor (32 by default).
 
-### Issue: Slow Training Speed
+</details>
+
+<details>
+<summary>Preprocessed Data Does Not Match the Current Configuration</summary>
+
+**Cause:** `preprocess_manifest.json` records the encode-affecting settings from the last successful preprocessing
+run. The current config differs in a field such as `lora_trigger`, resolution buckets, model paths, reference scale
+factors, audio settings, or a modality/reference/mask directory.
+
+**Solution:** Align the config with the saved fingerprint, use a fresh output root, or recompute current items:
+
+```bash
+uv run python scripts/preprocess.py configs/your_config.yaml --overwrite
+```
+
+If the mismatch is intentional, set `allow_stale_preprocessed: true`; training continues with a
+warning. The check runs before model loading.
+
+To diagnose compatibility without starting training or encoding, run:
+
+```bash
+uv run python scripts/preprocess.py configs/your_config.yaml --check
+```
+
+`--check` reports failure if the manifest is missing. Training allows older caches without a manifest and warns,
+but that warning does not mean the config matches the cache.
+
+</details>
+
+<details>
+<summary>Preprocessing Fails Before Encoding with a Manifest Error</summary>
+
+An incremental run is rejected when the output root is populated but its manifest is missing or differs from the
+current fingerprint. Existing files would otherwise be skipped and mixed with newly encoded artifacts. Use a new
+`preprocessed_data_root`, restore the matching config, or re-run with `--overwrite`.
+
+Corrupt JSON or an unsupported manifest `format_version` also stops preprocessing; use a fresh
+`preprocessed_data_root`, restore a valid matching manifest, or rebuild with `--overwrite`. See
+[Preprocessing Manifest and Staleness Guard](dataset-preparation.md#preprocessing-manifest-and-staleness-guard) for
+details on rebuilding and removing old cached files.
+
+</details>
+
+<details>
+<summary>Data loading fails or no cached samples are found</summary>
+
+Errors such as **"No data files found"**, **"Required … directory does not exist"**, or **"No valid samples found"**
+usually point to the cache location or missing artifacts. For the built-in flexible strategy:
+
+- Set `training_strategy.data.preprocessed_data_root` to the folder containing the configured source directories,
+  such as `latents/` and `conditions/`, rather than to one of those directories.
+- Check that all sources required by your mode exist, including any audio, reference, or mask directories.
+  Samples need matching cached files across sources; preserve their relative paths when moving data.
+- If the error is hidden behind a dataloader worker traceback, set the worker count to zero and retry to see the
+  underlying error in the training process:
+
+```yaml
+training_strategy:
+  data:
+    preprocessed_data_root: "/path/to/dataset/.precomputed"
+    num_dataloader_workers: 0
+```
+
+When the selected root contains a `.precomputed/` subdirectory, the dataset loader uses that subdirectory.
+Check the [dataset layout for your mode](training-modes.md) and the
+[preprocessing workflow](dataset-preparation.md) before regenerating data.
+
+</details>
+
+<details>
+<summary>A checkpoint loads, but training starts again at step 0</summary>
+
+**Loading weights and resuming training are different operations.** Point `checkpoints.load_checkpoint` at the
+checkpoint directory to restore the step counter, and keep `checkpoints.no_resume: false`:
+
+```yaml
+checkpoints:
+  load_checkpoint: "outputs/my_run/checkpoints/step_01000"
+  no_resume: false
+optimization:
+  steps: 1500  # Total target: continue from step 1,000 to 1,500
+```
+
+- Pointing directly at `weights.safetensors`, or setting `no_resume: true`, loads weights and starts a new run at step 0.
+- A resumable checkpoint needs `state.pt` and `metadata.json` beside `weights.safetensors`. Saves made with
+  `save_training_state: "off"` contain weights only.
+- Missing or incompatible resume state/metadata can cause a fallback to step 0. Read the preceding warning for the
+  reason, and confirm **"Resuming training from step …"** in the logs before continuing a long run.
+
+If you instead see **"No remaining training steps"**, increase `optimization.steps` beyond the restored step;
+the value is the total target, not the number of additional updates. See
+[resume behavior and limitations](training-guide.md#resume-training), including which optimizer/RNG state is restored.
+
+</details>
+
+<details>
+<summary>Slow Training Speed</summary>
 
 **Optimizations:**
 
 1. **Disable gradient checkpointing** (if you have enough VRAM):
 
    ```yaml
-   optimization:
-     enable_gradient_checkpointing: false
+   training_strategy:
+     optimizer:
+       gradient_checkpointing: false
    ```
-
 
 2. **Use torch.compile** via Accelerate:
 
@@ -224,77 +296,81 @@ The spatial dimensions must likewise be divisible by the VAE spatial factor (32 
      scripts/train.py configs/t2v_lora.yaml
    ```
 
-### Issue: Poor Quality Validation Outputs
+</details>
+
+<details>
+<summary>Poor Quality Validation Outputs</summary>
 
 **Solutions:**
 
-First confirm that the validation recipe matches the checkpoint. The trainer's validation runner is one-stage:
-for an LTX 2.5 distilled checkpoint, start with 8 steps, CFG scales of `1.0`, and STG scales of `0.0`. PT/SFT
-checkpoints need their own one-stage sampling recipe. The production two-stage distilled workflow is provided by
-[`ltx-pipelines`](../../ltx-pipelines/README.md), not this training-time validator.
-
-1. **Use conditioned validation:** For more reliable validation, use image-to-video (first-frame conditioning) rather than pure text-to-video:
+1. **Match validation to your task:** For image-to-video training, use a starting image to test the behavior you intend
+   to use. For text-to-video training, keep text-only samples so you can evaluate generation without image guidance.
+   An image-conditioned sample looks like this:
 
    ```yaml
-   validation:
-     samples:
-       - prompt: "a professional portrait video of a person"
-         conditions:
-           - type: first_frame
-             image_or_video: "/path/to/first_frame.png"
+   training_strategy:
+     validation:
+       samples:
+         - prompt: "a professional portrait video of a person"
+           conditions:
+             - type: first_frame
+               image_or_video: "/path/to/first_frame.png"
    ```
 
 2. **Increase inference steps:**
 
    ```yaml
-   validation:
-     inference_steps: 30
+   training_strategy:
+     validation:
+       inference_steps: 40  # Default is 30
    ```
 
-3. **Adjust guidance settings:**
+3. **Restore the default guidance settings if you changed them:**
 
    ```yaml
-   validation:
-     video_cfg_scale: 3.0
-     audio_cfg_scale: 7.0
-     video_stg_scale: 1.0
-     audio_stg_scale: 1.0
-     stg_blocks: [28]
-     guidance_rescale: 0.7
-     video_modality_guidance_scale: 3.0
-     audio_modality_guidance_scale: 3.0
+   training_strategy:
+     validation:
+       video_cfg_scale: 3.0
+       audio_cfg_scale: 7.0
+       video_stg_scale: 1.0
+       audio_stg_scale: 1.0
+       stg_blocks: [28]
+       guidance_rescale: 0.7
    ```
 
 4. **Check caption quality:**
-   Review and manually edit captions for accuracy if using auto-generated captions.
-   LTX models prefer long, detailed captions that describe both visual content and audio (e.g., ambient sounds, speech,
-   music).
+   Review auto-generated captions for accurate visual/audio descriptions (ambient sounds, speech, music).
+   After editing captions, rerun preprocessing with `--overwrite` to refresh text embeddings.
 
 5. **Check target modules:**
    Ensure your `target_modules` configuration matches your training goals. For audio-video training,
    use patterns that match both branches (e.g., `"to_k"` instead of `"attn1.to_k"`).
    See [Understanding Target Modules](configuration-reference.md#understanding-target-modules) for details.
 
-6. **Adjust LoRA rank:**
-   Try higher values for more capacity:
+6. **Check adapter capacity:**
+   If a lower-rank adapter underfits, try rank 64 or 128 and compare the same validation prompts:
 
    ```yaml
-   lora:
-     rank: 64  # Or 128 for more capacity
+   training_strategy:
+     lora:
+       rank: 64  # Or 128 for more capacity
    ```
 
-7. **Increase training steps:**
+7. **Check training duration:** If validation is still improving, try a larger step budget:
 
    ```yaml
    optimization:
      steps: 3000
    ```
 
+</details>
+
 ---
 
 ## 🔍 Debugging Tools
 
-### Monitor GPU Memory Usage
+<details>
+<summary>Monitor GPU Memory Usage</summary>
 
 Track memory usage during training:
 
@@ -306,72 +382,33 @@ watch -n 1 nvidia-smi
 nvidia-smi --query-gpu=memory.used,memory.total --format=csv --loop=5 > memory_log.csv
 ```
 
-### Verify Preprocessed Data
+</details>
 
-Decode latents to visualize the preprocessed videos:
+<details>
+<summary>Verify Preprocessed Data</summary>
 
-```bash
-uv run python scripts/decode_latents.py dataset/.precomputed/latents debug_output \
-    --model-path /path/to/model.safetensors
+To sanity-check preprocessing, set `training_strategy.data.decode: true` in your config and run the preprocessor.
+It VAE-decodes the latents right after encoding so you can compare them against the originals:
+
+```yaml
+training_strategy:
+  data:
+    decode: true
 ```
 
-To also decode audio latents, add the `--with-audio` flag:
-
 ```bash
-uv run python scripts/decode_latents.py dataset/.precomputed/latents debug_output \
-    --model-path /path/to/model.safetensors \
-    --with-audio
+uv run python scripts/preprocess.py configs/t2v_lora.yaml
 ```
 
-Compare decoded videos and audio with originals to ensure quality.
+Compare decoded media with the originals. See
+[decode output directories](dataset-preparation.md#-decoding-videos-for-verification) for video, audio, reference,
+and single-frame image outputs.
 
----
-
-## 💡 Best Practices
-
-### Before Training
-
-- [ ] Test preprocessing with a small subset first
-- [ ] Verify all video files are accessible
-- [ ] Check available GPU memory
-- [ ] Review configuration against hardware capabilities
-- [ ] Ensure model and text encoder paths are correct
-
-### During Training
-
-- [ ] Monitor GPU memory usage
-- [ ] Check loss convergence regularly
-- [ ] Review validation samples periodically
-- [ ] Save checkpoints frequently
-
-### After Training
-
-- [ ] Test trained model with diverse prompts
-- [ ] Document training parameters and results
-- [ ] Archive training data and configs
+</details>
 
 ## 🆘 Getting Help
 
-If you're still experiencing issues:
-
-1. **Check logs:** Review console output for error details
-2. **Search issues:** Look through GitHub issues for similar problems
-3. **Provide details:** When reporting issues, include:
-    - Hardware specifications (GPU model, VRAM)
-    - Configuration file used
-    - Complete error message
-    - Steps to reproduce the issue
-
----
-
-## 🤝 Join the Community
-
-Have questions, want to share your results, or need real-time help?
-Join our [community Discord server](https://discord.gg/ltxplatform)
-to connect with other users and the development team!
-
-- Get troubleshooting help
-- Share your training results and workflows
-- Stay up to date with announcements and updates
-
-We look forward to seeing you there!
+Check the full console error and search existing GitHub issues. When reporting a problem, include the GPU model/VRAM,
+resolved training config, complete error/traceback, and reproduction steps. Preserve the run config and relevant logs
+so another user or agent can reproduce the failure. For discussion, use the
+[community Discord](https://discord.gg/ltxplatform).

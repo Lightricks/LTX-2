@@ -39,13 +39,13 @@ _GIB: int = 1 << 30
 
 # Peak-activation heuristic (bytes):
 #   hard (resident for whole tiled decode):
-#     stage-4 input feature (stages 1-3 output): s4_txs4_hxs4_wxstage4_channelsxbf16
+#     stage-4 input feature (stages 1-3 output): s4_txs4_hxs4_wxstage4_channelsxdtype.itemsize
 #   per temporal group + stage-5 tile:
-#     accumulator: H x W x (2 x tile_t) x out_channels x accum_elem
+#     accumulator: H x W x (2 x tile_t) x out_channels x accum_dtype.itemsize
 #       (full-frame spatial; ~current group buffer + retained overlap stub / still-
-#        live emitted exclusive chunk heading to encode; RGB by default; accum_elem
+#        live emitted exclusive chunk heading to encode; RGB by default; accum_dtype
 #        matches decode: fp16 when features are bf16, else feature dtype)
-#     stage-5: stage5_tokens x stage5_channels x bf16 x coef
+#     stage-5: stage5_tokens x stage5_channels x dtype.itemsize x coef
 # where stage5_tokens = F x (H/patch) x (W/patch) and coef folds NA working-set multiplicity.
 
 
@@ -76,9 +76,13 @@ _BUDGET_BY_MODE: dict[DiffVAEMode, _StageFiveBudget] = {
     DiffVAEMode.CHUNKED_EAGER: _StageFiveBudget(coef=5, coef_keyframes=5, reserve_bytes=1 * _GIB),
     DiffVAEMode.BLACKWELL_DSL: _StageFiveBudget(coef=2.5, coef_keyframes=4.0, reserve_bytes=2 * _GIB),
 }
-_DEFAULT_ELEMENT_SIZE: int = 2  # bf16 features → fp16 accumulator / bf16 stage-5
 _ACCUMULATOR_CHANNELS: int = 3  # RGB pixel blend buffer (decoder out_channels)
-_MIN_MODEL_BYTES_FLOOR: int = 1 << 30  # never assume a free DiffVAE weight footprint
+_SUPPORTED_DTYPES: frozenset[torch.dtype] = frozenset({torch.bfloat16, torch.float16, torch.float32})
+_MIN_MODEL_BYTES_FLOOR: dict[torch.dtype, int] = {
+    torch.bfloat16: 1 * _GIB,
+    torch.float16: 1 * _GIB,
+    torch.float32: 2 * _GIB,
+}
 _BUDGET_SAFETY_BYTES_EAGER: int = 1 * _GIB
 #: Keyframe decode runs eager blocks, so it takes the eager reserve -- unless the joint attention
 #: ends up on torch's MATH SDPA kernel, which materializes its score block and wants one more GiB.
@@ -153,7 +157,7 @@ def emit_convert_bytes(
     height: int,
     width: int,
     out_channels: int,
-    element_size: int,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> int:
     """Downstream bytes a yielded chunk costs while the encoder consumes it.
     The decode budget alone is not enough to size a tile: whatever ``_emit`` yields is
@@ -168,6 +172,9 @@ def emit_convert_bytes(
     write-back path YUV lands in that same RGB storage, so it is not charged here at all
     and only the GEMM temporary is.
     """
+    if dtype not in _SUPPORTED_DTYPES:
+        raise ValueError(f"Unsupported dtype for emit_convert_bytes: {dtype!r}")
+    element_size = dtype.itemsize
     frames = int(tile_frames)
     gemm_frames = min(frames, frames_per_yuv_gemm(height, width))
     # Write-back reuses the RGB storage, so no full YUV tensor survives into the pack.
@@ -188,33 +195,44 @@ def budget_safety_bytes(
     *,
     keyframes: bool = False,
     joint_sdpa_materializes: bool = False,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> int:
-    """Extra bytes withheld from the recommend budget.
+    """Extra bytes withheld from the recommend budget, scaled by ``dtype``.
     Args:
         mode: the decode preset.
         keyframes: whether this decode carries a keyframe stream.
         joint_sdpa_materializes: whether the joint attention will run on torch's MATH SDPA kernel
             (see ``fallback_na.joint_eager.sdpa_materializes_scores``). Ignored without keyframes,
             and irrelevant when a fused joint kernel serves the decode.
+        dtype: activation or accumulator dtype (defaults to ``torch.bfloat16``).
     """
+    if dtype not in _SUPPORTED_DTYPES:
+        raise ValueError(f"Unsupported dtype for tiling budget: {dtype!r}")
     try:
         budget = _BUDGET_BY_MODE[mode]
     except KeyError as exc:
         raise ValueError(f"Unsupported DiffVAEMode for tiling budget: {mode!r}") from exc
     if keyframes and mode is not DiffVAEMode.BLACKWELL_DSL:
-        return _BUDGET_SAFETY_BYTES_JOINT_MATERIALIZED if joint_sdpa_materializes else _BUDGET_SAFETY_BYTES_EAGER
-    if _falls_back_to_eager_na(mode):
-        return _BUDGET_SAFETY_BYTES_EAGER
-    return budget.reserve_bytes
+        base_reserve = (
+            _BUDGET_SAFETY_BYTES_JOINT_MATERIALIZED if joint_sdpa_materializes else _BUDGET_SAFETY_BYTES_EAGER
+        )
+    elif _falls_back_to_eager_na(mode):
+        base_reserve = _BUDGET_SAFETY_BYTES_EAGER
+    else:
+        base_reserve = budget.reserve_bytes
+    return (base_reserve * dtype.itemsize) // torch.float16.itemsize
 
 
-def accumulator_element_size(feature_dtype: torch.dtype) -> int:
-    """Bytes per accumulator element; mirrors ``_decode_temporal_group_isolated``.
-    ``accum_dtype = float16 if feat_s4.dtype == bfloat16 else feat_s4.dtype``.
+def accumulator_dtype_for(feature_dtype: torch.dtype) -> torch.dtype:
+    """Accumulator dtype for tiled pixel blend; mirrors ``_decode_temporal_group_isolated``.
+    Returns ``torch.float16`` for ``torch.bfloat16`` features and passes through
+    ``torch.float16`` and ``torch.float32``.
     """
+    if feature_dtype not in _SUPPORTED_DTYPES:
+        raise ValueError(f"Unsupported feature_dtype for accumulator: {feature_dtype!r}")
     if feature_dtype is torch.bfloat16:
-        return 2  # stored as fp16
-    return int(torch.tensor([], dtype=feature_dtype).element_size())
+        return torch.float16
+    return feature_dtype
 
 
 def stage4_feature_bytes(
@@ -224,7 +242,7 @@ def stage4_feature_bytes(
     num_frames: int,
     upsample_strides: Sequence[Tuple[int, int, int]],
     stage4_channels: int,
-    element_size: int = _DEFAULT_ELEMENT_SIZE,
+    dtype: torch.dtype = torch.bfloat16,
     natten_trailing_pad_latent_frames: int = 0,
 ) -> int:
     """Resident stages-1-3 output size (full volume tiled into stage 4).
@@ -233,8 +251,8 @@ def stage4_feature_bytes(
     """
     if stage4_channels < 1:
         raise ValueError(f"stage4_channels must be >= 1, got {stage4_channels}")
-    if element_size < 1:
-        raise ValueError(f"element_size must be >= 1, got {element_size}")
+    if dtype not in _SUPPORTED_DTYPES:
+        raise ValueError(f"Unsupported dtype for stage4_feature_bytes: {dtype!r}")
     if len(upsample_strides) < 3:
         raise ValueError(f"need at least 3 upsample strides, got {len(upsample_strides)}")
     if natten_trailing_pad_latent_frames < 0:
@@ -254,7 +272,7 @@ def stage4_feature_bytes(
         latent.width,
         drop_leading_frame=True,
     )
-    return int(s4_t) * int(s4_h) * int(s4_w) * int(stage4_channels) * int(element_size)
+    return int(s4_t) * int(s4_h) * int(s4_w) * int(stage4_channels) * dtype.itemsize
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +295,7 @@ def recommended_decode_tiling_config(  # noqa: PLR0913
     stage4_channels: int,
     upsample_strides: Sequence[Tuple[int, int, int]],
     model_bytes: int = 0,
-    element_size: int = _DEFAULT_ELEMENT_SIZE,
+    dtype: torch.dtype = torch.bfloat16,
     natten_trailing_pad_latent_frames: int = 0,
     out_channels: int = _ACCUMULATOR_CHANNELS,
     keyframes: bool = False,
@@ -292,23 +310,23 @@ def recommended_decode_tiling_config(  # noqa: PLR0913
          :class:`~ltx_core.tiling.TileSizeConfig` construction); derive tile
          counts from :func:`~ltx_core.tiling.split_by_size` (same as decode).
       2. Drop triples whose peak-bytes estimate exceeds ``usable`` bytes
-         (``free - max(model, 1 GiB) - safety - stage4_feature``; safety is
-         1 GiB eager / 2 GiB compiled, see :func:`budget_safety_bytes`).
+         (``free - max(model, _MIN_MODEL_BYTES_FLOOR[dtype]) - safety - stage4_feature``;
+         base safety is 1 GiB eager / 2 GiB compiled at 2-byte width and scales with
+         ``dtype``, see :func:`budget_safety_bytes`).
          Stage-4 input features stay resident for the whole tiled decode.
       3. Among feasible triples, pick minimal :func:`volumetric_overlap_waste`.
     Peak-bytes estimate::
         stage4_feature_bytes(...)                         # hard, full volume
-        + H * W * (2 * tile_t) * out_channels * element_size
-        + stage5_tokens * stage5_channels * element_size * coef
+        + H * W * (2 * tile_t) * out_channels * accum_dtype.itemsize
+        + stage5_tokens * stage5_channels * dtype.itemsize * coef
     Accumulator is full output HxW (not spatially tiled) with temporal extent
     ``2 * tile_t``: current group buffer plus the still-live previous exclusive
     emit / overlap stub during handoff (not merely ``tile_t + overlap_t``).
-    RGBx``element_size`` by default. ``element_size`` is the activation width:
-    production bf16 features use fp16 accumulators (2), matching
-    :func:`accumulator_element_size`. Stage-5 uses the same element size x
-    ``stage5_channels`` x ``coef``, which :func:`stage5_mem_coef` reads off the
-    mode and ``keyframes`` (11 / 7 / 5 / 2.5 by mode; 15 / 5 / 5 / 4.0 with a
-    keyframe stream, which runs eager blocks).
+    RGBx``accum_dtype.itemsize`` by default: production bf16 features use fp16
+    accumulators (2 bytes), matching :func:`accumulator_dtype_for`. Stage-5 uses
+    ``dtype.itemsize`` x ``stage5_channels`` x ``coef``, which :func:`stage5_mem_coef`
+    reads off the mode and ``keyframes`` (11 / 7 / 5 / 2.5 by mode; 15 / 5 / 5 / 4.0
+    with a keyframe stream, which runs eager blocks).
     Args beyond the geometry:
         keyframes: this decode carries a keyframe stream (joint attention, eager blocks).
         joint_sdpa_materializes: the joint attention will run on torch's MATH SDPA kernel;
@@ -322,8 +340,7 @@ def recommended_decode_tiling_config(  # noqa: PLR0913
         raise ValueError(f"stage5_channels must be >= 1, got {stage5_channels}")
     if out_channels < 1:
         raise ValueError(f"out_channels must be >= 1, got {out_channels}")
-    if element_size < 1:
-        raise ValueError(f"element_size must be >= 1, got {element_size}")
+    accum_dtype = accumulator_dtype_for(dtype)
 
     overlap_t, overlap_hw = recommended_pixel_overlaps(tile_halos, pixel_scale)
 
@@ -347,7 +364,7 @@ def recommended_decode_tiling_config(  # noqa: PLR0913
         step_w,
     )
 
-    model_cost = max(int(model_bytes), _MIN_MODEL_BYTES_FLOOR)
+    model_cost = max(int(model_bytes), _MIN_MODEL_BYTES_FLOOR[dtype])
     coef = stage5_mem_coef(mode, keyframes=keyframes)
     s4_feat_bytes = stage4_feature_bytes(
         height=height,
@@ -355,13 +372,18 @@ def recommended_decode_tiling_config(  # noqa: PLR0913
         num_frames=num_frames,
         upsample_strides=upsample_strides,
         stage4_channels=stage4_channels,
-        element_size=element_size,
+        dtype=dtype,
         natten_trailing_pad_latent_frames=natten_trailing_pad_latent_frames,
     )
-    reserve = budget_safety_bytes(mode, keyframes=keyframes, joint_sdpa_materializes=joint_sdpa_materializes)
+    reserve = budget_safety_bytes(
+        mode,
+        keyframes=keyframes,
+        joint_sdpa_materializes=joint_sdpa_materializes,
+        dtype=accum_dtype,
+    )
     usable = max(0, int(free_bytes) - model_cost - reserve - s4_feat_bytes)
-    s5_bytes_per_token = max(1.0, float(stage5_channels) * float(element_size) * coef)
-    acc_bytes_per_pixel = int(out_channels) * int(element_size)
+    s5_bytes_per_token = max(1.0, float(stage5_channels) * float(dtype.itemsize) * coef)
+    acc_bytes_per_pixel = int(out_channels) * int(accum_dtype.itemsize)
 
     t_cands = _axis_candidates(num_frames, overlap_t, min_t_px, step_t)
     h_cands = _axis_candidates(height, overlap_hw, min_h_px, step_h)
@@ -379,7 +401,7 @@ def recommended_decode_tiling_config(  # noqa: PLR0913
             height=height,
             width=width,
             out_channels=out_channels,
-            element_size=element_size,
+            dtype=accum_dtype,
         )
         if acc_bytes + downstream_bytes >= usable:
             continue

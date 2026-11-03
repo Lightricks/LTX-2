@@ -93,6 +93,13 @@ Defaults are 1024×1536 at 24 fps (`--temporal-upscalings 0`). UHD 4K is `--widt
 
 ### Full Model List
 
+| Model | Model license |
+| :--- | :--- |
+| [LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5) | [LTX-2.x Community License](LICENSE-2_x) |
+| [LTX-2.3](https://huggingface.co/Lightricks/LTX-2.3) | [LTX-2 Community License](LICENSE-2) |
+
+The code in this repository is open source under the [Apache License 2.0](LICENSE). The LTX models are not part of that: they are released under their own licenses, listed above, which apply whenever you use the models, including with this code.
+
 LTX-2.5 is the recommended model, and what the [Quick Start](#-quick-start) uses. Its weights are published as one file per component, so you download only the parts your pipeline needs.
 
 Download from the [LTX-2.5 HuggingFace repository](https://huggingface.co/Lightricks/LTX-2.5):
@@ -129,9 +136,9 @@ Download from the [LTX-2.5 HuggingFace repository](https://huggingface.co/Lightr
 #### Legacy: LTX-2.3
 
 Every pipeline in this repository also runs on LTX-2.3. Its checkpoints are single files bundling
-the transformer, VAEs and text projection, with the Gemma 3 text encoder downloaded separately.
-Files are not interchangeable between the two models, and a LoRA only works with the model it was
-trained on.
+the transformer, VAEs and text projection, under the [LTX-2 Community License](LICENSE-2). The Gemma 3
+text encoder is downloaded separately and stays under Google's license. Files are not interchangeable
+between the two models, and a LoRA only works with the model it was trained on.
 
 See **[LTX-2.3 models](MODELS-LTX-2.3.md)** for the full list.
 

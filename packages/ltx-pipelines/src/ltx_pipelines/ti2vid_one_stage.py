@@ -12,7 +12,7 @@ from ltx_core.components.guiders import (
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.loader import LoraPathStrengthAndSDOps
-from ltx_core.loader.registry import Registry
+from ltx_core.loader.registry import ModelRegistry
 from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig, get_video_chunks_number
 from ltx_core.model.video_vae.transformer import DiffVAEMode
@@ -46,7 +46,6 @@ from ltx_pipelines.utils.helpers import (
     get_device,
     image_conditionings,
     resolve_generated_keyframes,
-    tiling_scale_factors_for_vae,
 )
 from ltx_pipelines.utils.media_io import (
     EXRColorSpace,
@@ -81,7 +80,7 @@ class TI2VidOneStagePipeline:
         loras: list[LoraPathStrengthAndSDOps],
         device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
-        registry: Registry | None = None,
+        registry: ModelRegistry | None = None,
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
@@ -89,6 +88,7 @@ class TI2VidOneStagePipeline:
         diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
     ):
         self.dtype = torch.bfloat16
+        registry = registry or ModelRegistry()
         self.device = device or get_device()
         self._scheduler = LTX2Scheduler()
         self.prompt_encoder = PromptEncoder(
@@ -193,15 +193,14 @@ class TI2VidOneStagePipeline:
             frame_rate=frame_rate,
         )
 
-        scale_factors = tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path)
         tiling_config = ensure_tiling_config(
             tiling_config,
-            scale_factors=scale_factors,
             vae_checkpoint_path=self.video_decoder.checkpoint_path,
             video_shape=VideoPixelShape(batch=1, frames=num_frames, height=height, width=width, fps=frame_rate),
             diffvae_optimization=self.video_decoder.diffvae_optimization,
             device=self.device,
             keyframes=decode_with_keyframes,
+            vae_dtype=vae_dtype,
         )
 
         stage_1_conditionings = self.image_conditioner(
@@ -230,18 +229,13 @@ class TI2VidOneStagePipeline:
         )
 
         video_latent, audio_latent = create_initial_av_latents(
-            width=width,
-            height=height,
-            frames=num_frames,
-            fps=frame_rate,
+            pixel_shape=VideoPixelShape(batch=1, frames=num_frames, height=height, width=width, fps=frame_rate),
             device=self.device,
             dtype=self.dtype,
             video_scale_factors=self.stage.video_scale_factors,
         )
         video_state, audio_state = self.stage(
             denoiser=FactoryGuidedDenoiser(
-                v_context=v_context_p,
-                a_context=a_context_p,
                 video_guider_factory=video_guider_factory,
                 audio_guider_factory=audio_guider_factory,
             ),

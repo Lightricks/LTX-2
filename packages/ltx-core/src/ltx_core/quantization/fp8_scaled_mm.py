@@ -1,23 +1,15 @@
-import json
-import struct
+from collections.abc import Mapping, Sequence
+from hashlib import sha256
+from pathlib import Path
 from typing import Callable
 
 import torch
 from torch import nn
 
-from ltx_core.loader.fuse_loras import FuseRule, bf16_fuse_rule
+from ltx_core.loader.checkpoint import CheckpointReader
 from ltx_core.loader.module_ops import ModuleOps
-from ltx_core.loader.primitives import StateDict
-from ltx_core.model.transformer import LTXModel
+from ltx_core.loader.units import FuseRule
 from ltx_core.quantization.policy import QuantizationPolicy
-
-
-def _read_safetensors_dtypes(path: str) -> dict[str, str]:
-    """Return ``{tensor_name: dtype_string}`` from the safetensors header."""
-    with open(path, "rb") as f:
-        header_size = struct.unpack("<Q", f.read(8))[0]
-        header = json.loads(f.read(header_size).decode("utf-8"))
-    return {k: v["dtype"] for k, v in header.items() if k != "__metadata__"}
 
 
 class FP8Linear(nn.Module):
@@ -84,7 +76,7 @@ def quantize_weight_to_fp8_per_tensor(weight: torch.Tensor) -> tuple[torch.Tenso
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
 
     max_abs = torch.amax(torch.abs(weight_fp32))
-    scale = fp8_max / max_abs
+    scale = torch.where(max_abs == 0, torch.ones_like(max_abs), fp8_max / max_abs)
 
     @torch.compiler.disable
     def _quantize(
@@ -133,63 +125,60 @@ def _swap_linears_to_fp8(model: nn.Module, should_swap: Callable[[str], bool]) -
     return model
 
 
-def get_fp8_swap_module_ops(checkpoint_path: str) -> tuple[ModuleOps, ...]:
-    """Return the FP8 swap ``ModuleOps`` for layers whose ``.weight`` is ``F8_E4M3``
-    and which have a sibling ``.weight_scale`` tensor in the checkpoint.
-    Raises ``ValueError`` if no such layers are found — that combination is ambiguous
-    (a BF16 checkpoint with this policy would load as a no-op).
-    """
-    dtypes = _read_safetensors_dtypes(checkpoint_path)
-    fp8_scale_paths = frozenset(
-        key.removesuffix(".weight_scale")
-        for key in dtypes
-        if key.endswith(".weight_scale") and dtypes.get(key.removesuffix(".weight_scale") + ".weight") == "F8_E4M3"
-    )
-    if not fp8_scale_paths:
-        raise ValueError(
-            f"fp8_scaled_mm requires a pre-quantized checkpoint with F8_E4M3 .weight + .weight_scale "
-            f"tensors, but {checkpoint_path!r} has none. Use QuantizationPolicy.fp8_cast() for BF16 checkpoints."
-        )
-
-    def _should_swap(name: str) -> bool:
-        suffix = "." + name
-        return any(p == name or p.endswith(suffix) for p in fp8_scale_paths)
-
-    return (
-        ModuleOps(
-            name="fp8_swap_linears",
-            matcher=lambda model: isinstance(model, LTXModel),
-            mutator=lambda model: _swap_linears_to_fp8(model, _should_swap),
-        ),
-    )
-
-
-def _fp8_scaled_mm_fuse(
-    key: str,
-    weight: torch.Tensor,
-    deltas: torch.Tensor,
-    model_sd: StateDict,
+def _fuse_scaled_weight(
+    key: str, weight: torch.Tensor, delta: torch.Tensor, scale: torch.Tensor
 ) -> dict[str, torch.Tensor]:
-    """Dequantize via ``weight.float() * weight_scale``, add the BF16 delta,
-    and re-quantize to FP8 with a fresh per-tensor scale.
-    Layers that were not swapped to scaled FP8 (e.g. small embedder linears
-    excluded from the auto-discovered swap set) stay BF16 and have no
-    ``.weight_scale`` companion -- for those, fall back to a plain bf16 fuse.
-    """
-    scale_key = key.replace(".weight", ".weight_scale")
-    if scale_key not in model_sd.sd:
-        return bf16_fuse_rule(key, weight, deltas, model_sd)
-    weight_scale = model_sd.sd[scale_key]
-    original_weight = weight.to(torch.float32) * weight_scale
-    new_weight = original_weight + deltas.to(torch.float32)
-    new_fp8_weight, new_weight_scale = quantize_weight_to_fp8_per_tensor(new_weight)
-    return {key: new_fp8_weight, scale_key: new_weight_scale}
+    scale_key = f"{key.removesuffix('.weight')}.weight_scale"
+    decoded = weight.float() * scale.float()
+    payload, new_scale = quantize_weight_to_fp8_per_tensor(decoded + delta.float())
+    return {key: payload, scale_key: new_scale.reshape(scale.shape).to(scale.dtype)}
 
 
-fp8_scaled_mm_fuse_rule = FuseRule(aggregation_dtype=torch.bfloat16, fuse_fn=_fp8_scaled_mm_fuse)
+def _fp8_scaled_unit_patch(
+    key: str, weight: torch.Tensor, delta: torch.Tensor, clean: Mapping[str, torch.Tensor]
+) -> Mapping[str, torch.Tensor]:
+    if weight.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
+        if not weight.is_floating_point():
+            raise ValueError(f"{key!r} is not a floating fallback weight")
+        return {key: (weight.to(delta.dtype) + delta).to(weight.dtype)}
+    scale_key = f"{key.removesuffix('.weight')}.weight_scale"
+    return _fuse_scaled_weight(key, weight, delta, clean[scale_key])
 
 
-def build_policy(checkpoint_path: str) -> QuantizationPolicy:
+FP8_SCALED_UNIT_FUSE_RULE = FuseRule("fp8-scaled-mm", torch.bfloat16, _fp8_scaled_unit_patch, (".weight_scale",))
+
+
+def selected_fp8_layers(paths: Sequence[Path]) -> frozenset[str]:
+    """Discover supported FP8/scale pairs from safetensors headers alone."""
+    with CheckpointReader.open(paths) as reader:
+        _, metadata = reader.scan()
+    selected = frozenset(
+        key.removesuffix(".weight_scale")
+        for key in metadata
+        if key.endswith(".weight_scale")
+        and metadata.get(f"{key.removesuffix('.weight_scale')}.weight", (None, None))[1] == torch.float8_e4m3fn
+    )
+    if not selected:
+        raise ValueError("scaled FP8 requires at least one F8_E4M3 weight with a weight_scale companion")
+    return selected
+
+
+def swap_module_op(paths: Sequence[Path]) -> ModuleOps:
+    """Replace only linears whose checkpoint headers select scaled FP8 weights."""
+    selected = selected_fp8_layers(paths)
+
+    def should_swap(name: str) -> bool:
+        return any(path == name or path.endswith(f".{name}") for path in selected)
+
+    fingerprint = sha256("\0".join(sorted(selected)).encode()).hexdigest()[:12]
+    return ModuleOps(
+        f"fp8-scaled-swap:{fingerprint}",
+        matcher=lambda model: hasattr(model, "transformer_blocks"),
+        mutator=lambda model: _swap_linears_to_fp8(model, should_swap),
+    )
+
+
+def build_policy(checkpoint_path: str | Path) -> QuantizationPolicy:
     """FP8 scaled matmul for checkpoints pre-quantized with per-tensor scales.
     The set of layers to swap to ``FP8Linear`` is discovered from the
     checkpoint's ``.weight_scale`` tensors via suffix-matching against the
@@ -197,7 +186,5 @@ def build_policy(checkpoint_path: str) -> QuantizationPolicy:
     checkpoints, use :func:`ltx_core.quantization.fp8_cast.build_policy`.
     """
     return QuantizationPolicy(
-        sd_ops=None,
-        module_ops=get_fp8_swap_module_ops(checkpoint_path),
-        fuse_rule=fp8_scaled_mm_fuse_rule,
+        sd_ops=(), module_ops=(swap_module_op((Path(checkpoint_path),)),), fuse_rule=FP8_SCALED_UNIT_FUSE_RULE
     )

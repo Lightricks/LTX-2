@@ -22,7 +22,7 @@ import torch.distributed as dist
 
 from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_core.loader import LoraPathStrengthAndSDOps
-from ltx_core.loader.registry import ModelRegistry
+from ltx_core.loader.distributed_builders import AccelerateGemmaBuilder, SequenceParallelBuilder
 from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae import AUTO_TILING, get_video_chunks_number
 from ltx_core.model.video_vae.transformer import DiffVAEMode
@@ -34,11 +34,8 @@ from ltx_core.types import VIDEO_SCALE_FACTORS, SpatioTemporalScaleFactors
 from ltx_pipelines.dfr_pipeline import DFRPipeline, add_dfr_cli_args
 from ltx_pipelines.multigpu.controller import MGPUController
 from ltx_pipelines.multigpu.decode_tiling import dist_auto_tiling
-from ltx_pipelines.multigpu.gemma_builders import AccelerateGemmaBuilder
-from ltx_pipelines.multigpu.runner import MGPURunner
-from ltx_pipelines.multigpu.sp_builder import SequenceParallelBuilder
+from ltx_pipelines.multigpu.runner import MGPURunner, rank_cuda_registry
 from ltx_pipelines.multigpu.vae_builders import DistributedDecoderBuilder
-from ltx_pipelines.multigpu.weight_tracker import TransformerWeightTracker
 from ltx_pipelines.utils.args import markers_from_args
 from ltx_pipelines.utils.helpers import get_device
 from ltx_pipelines.utils.media_io import encode_video
@@ -110,7 +107,7 @@ class DFRRunner(MGPURunner):
         quantization_policy = (
             quantization() if quantization is not None else _build_fp8_cast_policy(model_paths.transformer())
         )
-        registry = ModelRegistry(cache_models=True, cache_weights=True)
+        unit_registry = rank_cuda_registry()
         pipeline = DFRPipeline(
             model_paths=model_paths,
             spatial_upsampler_path=spatial_upsampler_path,
@@ -118,13 +115,14 @@ class DFRRunner(MGPURunner):
             detailing_lora=list(detailing_lora),
             temporal_upsampler_path=temporal_upsampler_path,
             prompt_enhancer_gemma_root=prompt_enhancer_gemma_root,
-            registry=registry,
+            registry=unit_registry,
             quantization=quantization_policy,
             compilation_config=compilation_config,
             alloc_trim_strategy=AllocatorTrimStrategy.DEFER,
             diffvae_optimization=diffvae_optimization,
         )
-        tracker = TransformerWeightTracker(group=self.groups.transformer_group)
+        # Every distributed transformer build of this runner rewrites one shared set of active weights.
+        active_weights: dict[str, torch.Tensor] = {}
 
         # SP on both stages: stage 1 / temporal rounds share ``stage``; stage 2 /
         # the spatial epilogue use ``stage_detailing`` (same checkpoint, extra IC-LoRA).
@@ -138,33 +136,20 @@ class DFRRunner(MGPURunner):
         )
         for stage in (pipeline.stage, pipeline.stage_detailing):
             stage._transformer_builder = SequenceParallelBuilder(
-                inner=stage._transformer_builder,
-                attn_mgr=attn_mgr,
-                registry=registry,
-                tracker=tracker,
+                stage._transformer_builder.with_registry(unit_registry), attn_mgr, dst=active_weights
             )
 
         # Accelerate Gemma parallelization. Capture shared-vs-separate before replacing
         # the encode builder so a shared alias is re-bound to the new instance.
         pe = pipeline.prompt_encoder
         separate_enhancer = pe._enhancer_text_encoder_builder is not pe._text_encoder_builder
-        pe._text_encoder_builder = AccelerateGemmaBuilder(
-            gemma_root_path=model_paths.text_encoder(),
-            gemma_group=self.groups.gemma_group,
-            broadcast_group=self.groups.transformer_group,
-            registry=registry,
-            src_rank=_DRIVER_RANK,
-            dtype=pipeline.dtype,
+        pe._text_encoder_builder = AccelerateGemmaBuilder.from_root(
+            model_paths.text_encoder(), unit_registry, self.groups.gemma_group, _DRIVER_RANK
         )
         if separate_enhancer:
             assert prompt_enhancer_gemma_root is not None
-            pe._enhancer_text_encoder_builder = AccelerateGemmaBuilder(
-                gemma_root_path=prompt_enhancer_gemma_root,
-                gemma_group=self.groups.gemma_group,
-                broadcast_group=self.groups.transformer_group,
-                registry=registry,
-                src_rank=_DRIVER_RANK,
-                dtype=pipeline.dtype,
+            pe._enhancer_text_encoder_builder = AccelerateGemmaBuilder.from_root(
+                prompt_enhancer_gemma_root, unit_registry, self.groups.gemma_group, _DRIVER_RANK
             )
         else:
             pe._enhancer_text_encoder_builder = pe._text_encoder_builder
@@ -182,7 +167,7 @@ class DFRRunner(MGPURunner):
             vae_group=self.groups.vae_group,
             vae_tiling=vae_tiling,
             driver_rank=_DRIVER_RANK,
-            registry=registry,
+            registry=unit_registry,
             num_temporal_batches=vae_temporal_batches,
         )
         self._vae_tiling = vae_tiling

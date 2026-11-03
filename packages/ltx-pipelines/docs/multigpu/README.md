@@ -14,11 +14,10 @@ Run LTX-2 pipelines across several GPUs on a single machine.
 > doesn't fit on one GPU suddenly fit — for that use FP8 quantization and weight
 > offloading (see [Optimization Tips](../optimization.md)).
 >
-> Each rank *also* holds a second, immutable copy of the **clean (pre-LoRA)
-> weights** — kept for LoRA hot-swap (reset + broadcast) — but that copy is
-> **sharded** across GPUs (`ShardedSD`, ~1/world_size per rank), not replicated.
+> Each rank *also* keeps the **clean (pre-LoRA) weights** of the units it owns, for
+> LoRA hot-swap: about 1/world_size of the checkpoint per rank, not a replica.
 > Sequence parallelism additionally splits **activation** memory across ranks. See
-> the [weight tracker](pipeline-setup.md#transformerweighttracker--working-copy--sharded-clean-weights)
+> the [shared active weights](pipeline-setup.md#shared-active-weights--one-replica-rank-owned-clean-units)
 > for the exact layout. The headline purpose is **latency**, not memory.
 >
 > **Single machine only.** One process per GPU, `MASTER_ADDR=localhost`, one rank
@@ -99,7 +98,7 @@ python -m ltx_pipelines.ti2vid_two_stages_mgpu \
 ## Pages
 
 - **[Controller](controller.md)** — `MGPUController` / `MGPURunner` / `Stream`, lifecycle, one-job-at-a-time contract, threading, error handling.
-- **[Pipeline setup](pipeline-setup.md)** — swapping builders, the shared weights registry, the LoRA-hot-swap weight tracker.
+- **[Pipeline setup](pipeline-setup.md)** — swapping builders, the shared weights registry, LoRA hot-swap on shared active weights.
 - **[Sequence parallelism](sequence-parallel.md)** — faithful token-dim split, the all2all kernels, `AttentionManager`, `SequenceParallelBuilder`.
 - **[Tiled data parallelism](tiled-data-parallel.md)** — out-of-distribution resolutions, position normalization, shared negative (reference) positions, `TiledDataParallelBuilder`.
 - **[Distributed decoder](distributed-decoder.md)** — inter-GPU vs intra-GPU tiling, `DistributedDecoderBuilder`.

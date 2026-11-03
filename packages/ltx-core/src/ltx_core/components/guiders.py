@@ -211,6 +211,16 @@ class MultiModalGuiderParams:
     "Skip step controlling how often the model skips the step."
 
 
+def _masked_std(x: torch.Tensor, active: torch.Tensor, count: torch.Tensor) -> torch.Tensor:
+    """Unbiased std of ``x`` over its ``count`` ``active`` elements (``active`` broadcast to ``x``).
+    Inactive elements are replaced by the masked mean, so they add nothing to the squared deviations,
+    and ``std`` is rescaled from the full element count to ``count``. With every element active this is
+    bit-identical to ``x.std()``. Boolean indexing (``x[active].std()``) would force a host sync.
+    """
+    mean = torch.where(active, x, 0.0).sum() / count
+    return torch.where(active, x, mean).std() * ((x.numel() - 1) / (count - 1)).sqrt()
+
+
 def _params_for_sigma_from_sorted_dict(
     sigma: float, params_by_sigma: Sequence[tuple[float, MultiModalGuiderParams]]
 ) -> MultiModalGuiderParams:
@@ -247,11 +257,15 @@ class MultiModalGuider:
         uncond_text: torch.Tensor | float,
         uncond_perturbed: torch.Tensor | float,
         uncond_modality: torch.Tensor | float,
+        denoise_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         The guider calculates the guidance delta as (scale - 1) * (cond - uncond) for cfg and modality cfg,
         and as scale * (cond - uncond) for stg, steering the denoising process away from the unconditioned
         prediction.
+        When ``denoise_mask`` (broadcastable to ``cond``, e.g. ``(B, T, 1)``) is given, the rescale factor
+        is estimated only over tokens with a non-zero mask, so fixed conditioning and reference tokens do
+        not skew it. With no such tokens, no rescaling is applied.
         """
         dtype = cond.dtype
         cond = cond.float()
@@ -266,7 +280,13 @@ class MultiModalGuider:
         )
 
         if self.params.rescale_scale != 0:
-            factor = cond.std() / pred.std()
+            if denoise_mask is None:
+                factor = cond.std() / pred.std()
+            else:
+                active = (denoise_mask != 0).expand_as(cond)
+                count = active.sum()
+                masked_factor = _masked_std(cond, active, count) / _masked_std(pred, active, count)
+                factor = torch.where(count > 1, masked_factor, 1.0)
             factor = self.params.rescale_scale * factor + (1 - self.params.rescale_scale)
             pred = pred * factor
 

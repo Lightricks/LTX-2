@@ -3,14 +3,15 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from pathlib import Path
 from typing import TypeVar
 
 import torch
 
 from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
 from ltx_core.loader import SDOps
-from ltx_core.loader.registry import ModelRegistry, Registry
-from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
+from ltx_core.loader.registry import ModelRegistry
+from ltx_core.loader.simple_builder import SimpleBuilder
 from ltx_core.model.video_vae import (
     CHANNELS_LAST_3D_WEIGHTS,
     VAE_ENCODER_COMFY_KEYS_FILTER,
@@ -27,6 +28,7 @@ from ltx_pipelines.utils.types import DecodedStill, ImageConditioningInput, Load
 VAE_ENCODER_SD_OPS = SDOps(
     name=f"sd_ops_chain_{VAE_ENCODER_COMFY_KEYS_FILTER.name}+{CHANNELS_LAST_3D_WEIGHTS.name}",
     mapping=(*VAE_ENCODER_COMFY_KEYS_FILTER.mapping, *CHANNELS_LAST_3D_WEIGHTS.mapping),
+    excluded_prefixes=VAE_ENCODER_COMFY_KEYS_FILTER.excluded_prefixes,
 )
 
 T = TypeVar("T")
@@ -49,18 +51,19 @@ class ImageConditioner:
         checkpoint_path: str,
         dtype: torch.dtype,
         device: torch.device,
-        registry: Registry | None = None,
+        registry: ModelRegistry | None = None,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
     ) -> None:
         self._checkpoint_path = checkpoint_path
         self._default_image_crf: int | None = None
         self._dtype = dtype
         self._device = device
-        self._encoder_builder = Builder(
-            model_path=checkpoint_path,
-            model_class_configurator=VideoEncoderConfigurator,
-            model_sd_ops=VAE_ENCODER_SD_OPS,
-            registry=registry or ModelRegistry(cache_models=True, cache_weights=False),
+        unit_registry = registry or ModelRegistry()
+        self._encoder_builder = SimpleBuilder(
+            VideoEncoderConfigurator,
+            (Path(checkpoint_path),),
+            (VAE_ENCODER_SD_OPS,),
+            registry=unit_registry,
         )
         self._alloc_trim_strategy = alloc_trim_strategy
         self._decode_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="image-decode")

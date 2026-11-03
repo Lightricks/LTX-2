@@ -958,7 +958,7 @@ class DiffusionVideoDecoder(nn.Module, Disposable, VideoDecoder):
         group_temporal_len = curr_temporal_slice.stop - curr_temporal_slice.start
         group_shape = full_video_shape._replace(frames=group_temporal_len)
         full_torch_shape = full_video_shape.to_torch_shape()
-        accum_dtype = torch.float16 if feat_s4.dtype == torch.bfloat16 else feat_s4.dtype
+        accum_dtype = diffusion_tiling.accumulator_dtype_for(feat_s4.dtype)
         # One tile with all-ones masks covering the group *is* the blend (0 + x * 1).
         sole_tile = len(tiles) == 1 and complementary and all(bool((mask == 1).all()) for mask in tiles[0].masks_1d)
         buffer = (
@@ -1379,7 +1379,7 @@ class DiffusionVideoDecoder(nn.Module, Disposable, VideoDecoder):
         group_temporal_len = curr_temporal_slice.stop - curr_temporal_slice.start
         group_shape = full_video_shape._replace(frames=group_temporal_len)
         full_torch_shape = full_video_shape.to_torch_shape()
-        accum_dtype = torch.float16 if feat_s4.dtype == torch.bfloat16 else feat_s4.dtype
+        accum_dtype = diffusion_tiling.accumulator_dtype_for(feat_s4.dtype)
         # One tile with all-ones masks covering the group *is* the blend (0 + x * 1).
         sole_tile = len(tiles) == 1 and complementary and all(bool((mask == 1).all()) for mask in tiles[0].masks_1d)
         buffer = (

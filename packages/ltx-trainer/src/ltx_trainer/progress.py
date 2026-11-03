@@ -122,22 +122,22 @@ class TrainingProgress:
     def update_training(
         self,
         *,
-        loss: float,
-        lr: float,
+        metrics: dict[str, float],
         step_time: float,
         advance: bool = True,
     ) -> None:
-        """Update the training progress display.
+        """Update the training progress display from an arbitrary metrics dict.
         Args:
-            loss: Current training loss
-            lr: Current learning rate
+            metrics: Reduced scalar metrics to display (e.g. ``train/loss``, learning rate(s)).
             step_time: Time taken for this step in seconds
             advance: Whether to advance the progress by one step
         """
         if self._progress is None or self._train_task is None:
             return
 
-        info = f"Loss: {loss:.4f} | LR: {lr:.2e} | {step_time:.2f}s/step"
+        parts = [f"{key.removeprefix('train/')}: {value:.4g}" for key, value in metrics.items()]
+        parts.append(f"{step_time:.2f}s/step")
+        info = " | ".join(parts)
         self._progress.update(
             self._train_task,
             advance=1 if advance else 0,

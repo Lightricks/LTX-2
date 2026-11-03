@@ -28,6 +28,7 @@ Usage via the ``ModuleOps`` pattern (preferred)::
     sd_ops = SDOps(
         name=f"sd_ops_chain_{VAE_DECODER_COMFY_KEYS_FILTER.name}+{CHANNELS_LAST_3D_WEIGHTS.name}",
         mapping=(*VAE_DECODER_COMFY_KEYS_FILTER.mapping, *CHANNELS_LAST_3D_WEIGHTS.mapping),
+    excluded_prefixes=VAE_DECODER_COMFY_KEYS_FILTER.excluded_prefixes,
     )
     builder = decoder_builder.with_module_ops(
         (*decoder_builder.module_ops, MEMORY_EFFICIENT_DECODE)
@@ -45,6 +46,7 @@ module op only formats activations and installs the workspace forward.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import torch
@@ -53,7 +55,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from ltx_core.loader.module_ops import ModuleOps
-from ltx_core.loader.sd_ops import KeyValueOperationResult, SDOps
+from ltx_core.loader.sd_ops import SDOps
 from ltx_core.model.common.normalization import PixelNorm
 from ltx_core.model.video_vae.convolution import CausalConv3d, memory_format_of
 from ltx_core.model.video_vae.ops import unpatchify
@@ -595,17 +597,18 @@ def _memory_efficient_forward(
 # ---------------------------------------------------------------------------
 
 
-def _to_channels_last_3d(key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
+def _to_channels_last_3d(key: str, inputs: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Store 5D conv weights in NHWC so the mem-efficient path never reformats them."""
+    value = inputs[key]
     if value.dim() == 5:
         value = value.to(memory_format=torch.channels_last_3d)
-    return [KeyValueOperationResult(key, value)]
+    return {key: value}
 
 
-# Load-time NHWC for 5D weights. Chain onto the VAE decoder filter at the builder
-# (same pattern as QuantizationPolicy.sd_ops) so the registry caches this layout
+# Load-time NHWC for 5D weights. Chain after the VAE decoder filter at the builder
+# (same pattern as QuantizationPolicy.sd_ops) so the registry keeps this layout
 # under a distinct sd_ops name.
-CHANNELS_LAST_3D_WEIGHTS = SDOps("channels_last_3d_weights").with_kv_operation(operation=_to_channels_last_3d)
+CHANNELS_LAST_3D_WEIGHTS = SDOps("channels_last_3d_weights").with_kv_operation(_to_channels_last_3d)
 
 
 def enable_memory_efficient_decode(decoder: nn.Module) -> nn.Module:

@@ -221,6 +221,17 @@ LTXV_MODEL_COMFY_RENAMING_MAP = (
     .with_replacement("model.diffusion_model.", "")
 )
 
+
+def transformer_checkpoint_selection_ops(config: dict) -> SDOps | None:
+    """Exclude connector weights owned by the embeddings processor when configured."""
+    if not config.get("transformer", {}).get("use_embeddings_connector", False):
+        return None
+    return SDOps(
+        "transformer-connectors-in-embeddings-processor",
+        excluded_prefixes=("video_embeddings_connector.", "audio_embeddings_connector."),
+    )
+
+
 LTXV_AUDIO_ONLY_MODEL_COMFY_RENAMING_MAP = (
     SDOps("LTXV_AUDIO_ONLY_MODEL_COMFY_MAP")
     .with_matching(prefix="model.diffusion_model.", contains="audio_attn1")

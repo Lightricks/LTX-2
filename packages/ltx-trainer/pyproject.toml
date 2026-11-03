@@ -1,8 +1,9 @@
 [project]
 name = "ltx-trainer"
-version = "1.5.0"
+version = "1.6.0"
 description = "LTX-2 training, democratized."
 readme = "README.md"
+license = "Apache-2.0"
 authors = [
     { name = "Matan Ben-Yosef", email = "mbyosef@lightricks.com" }
 ]
@@ -17,7 +18,7 @@ dependencies = [
     "imageio>=2.37.0",
     "imageio-ffmpeg>=0.6.0",
     "openai>=2.0",
-    "opencv-python>=4.11.0.86",
+    "opencv-python-headless>=4.11.0.86",
     "optimum-quanto>=0.2.6",
     "pandas>=2.2.3",
     "peft>=0.14.0",
@@ -25,7 +26,7 @@ dependencies = [
     "pydantic>=2.10.4",
     "rich>=13.9.4",
     "safetensors>=0.5.0",
-    "scenedetect>=0.6.5.2",
+    "scenedetect-headless>=0.7",
     "sentencepiece>=0.2.0",
     "soundfile>=0.12.1",
     "torch>=2.6.0",
@@ -63,7 +64,7 @@ dev = [
 
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 

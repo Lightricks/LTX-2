@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import torch
 
 from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
-from ltx_core.loader.registry import ModelRegistry, Registry
-from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
+from ltx_core.loader.registry import ModelRegistry
+from ltx_core.loader.simple_builder import SimpleBuilder
 from ltx_core.model.audio_vae import (
     AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
     VOCODER_COMFY_KEYS_FILTER,
@@ -30,23 +31,24 @@ class AudioDecoder:
         checkpoint_path: str,
         dtype: torch.dtype,
         device: torch.device,
-        registry: Registry | None = None,
+        registry: ModelRegistry | None = None,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
     ) -> None:
         self._checkpoint_path = checkpoint_path
         self._dtype = dtype
         self._device = device
-        self._decoder_builder = Builder(
-            model_path=checkpoint_path,
-            model_class_configurator=AudioDecoderConfigurator,
-            model_sd_ops=AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
-            registry=registry or ModelRegistry(cache_models=True, cache_weights=False),
+        unit_registry = registry or ModelRegistry()
+        self._decoder_builder = SimpleBuilder(
+            AudioDecoderConfigurator,
+            (Path(checkpoint_path),),
+            (AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,),
+            registry=unit_registry,
         )
-        self._vocoder_builder = Builder(
-            model_path=checkpoint_path,
-            model_class_configurator=VocoderConfigurator,
-            model_sd_ops=VOCODER_COMFY_KEYS_FILTER,
-            registry=registry or ModelRegistry(cache_models=True, cache_weights=False),
+        self._vocoder_builder = SimpleBuilder(
+            VocoderConfigurator,
+            (Path(checkpoint_path),),
+            (VOCODER_COMFY_KEYS_FILTER,),
+            registry=unit_registry,
         )
         self._alloc_trim_strategy = alloc_trim_strategy
 

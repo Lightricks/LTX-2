@@ -1,78 +1,45 @@
 # LTX Trainer
 
-This package provides tools and scripts for training and fine-tuning
-Lightricks' **LTX family** of audio-video generation models. It supports LoRA training, full
-fine-tuning, and a flexible conditioning framework covering text-to-video, text-to-audio, image-to-video,
-video extension, audio extension, video inpainting, audio inpainting, video outpainting, IC-LoRA for video, audio, and joint
-audio-video references, audio-to-video, and video-to-audio.
-
----
+Fine-tune Lightricks' **LTX** audio-video models. Train small LoRA adapters to customize a base model, or use full
+fine-tuning to update all transformer weights. Choose from text-to-video, image-to-video, audio generation,
+reference-guided transformations, extension, inpainting, and outpainting in [Training Modes](docs/training-modes.md).
 
 ## 📖 Documentation
 
-All detailed guides and technical documentation are in the [docs](./docs/) directory:
+New to the trainer? Follow **Quick Start** for your first run. For a specific task, choose a recipe in **Training Modes**,
+then follow **Dataset Preparation** and the **Training Guide**. Keep **Configuration Reference** nearby for field details.
 
-- [⚡ Quick Start Guide](docs/quick-start.md)
-- [🎬 Dataset Preparation](docs/dataset-preparation.md)
-- [🛠️ Training Modes](docs/training-modes.md)
-- [⚙️ Configuration Reference](docs/configuration-reference.md)
-- [🚀 Training Guide](docs/training-guide.md)
-- [🧪 Inference Guide](../ltx-pipelines/README.md)
-- [🔧 Utility Scripts](docs/utility-scripts.md)
-- [🧩 Custom Training Strategies](docs/custom-training-strategies.md)
-- [📚 LTX-Core Documentation](../ltx-core/README.md)
-- [🛡️ Troubleshooting Guide](docs/troubleshooting.md)
+- [⚡ Quick Start](docs/quick-start.md) — Complete your first training run.
+- [🛠️ Training Modes](docs/training-modes.md) — Choose a recipe and example YAML from the [config index](configs/README.md).
+- [🎬 Dataset Preparation](docs/dataset-preparation.md) — Prepare metadata, encode media, and rebuild cached data.
+- [⚙️ Configuration Reference](docs/configuration-reference.md) — Look up fields, defaults, and condition types.
+- [🚀 Training Guide](docs/training-guide.md) — Launch, distribute, monitor, and resume training.
+- [🔧 Utility Scripts](docs/utility-scripts.md) — Split scenes, generate captions, and create reference videos.
+- [🧩 Custom Training Strategies](docs/custom-training-strategies.md) — Implement a different training algorithm.
+- [🛡️ Troubleshooting](docs/troubleshooting.md) — Diagnose errors and memory issues.
+- [🧪 ltx-pipelines](../ltx-pipelines/README.md) — Use trained weights for inference.
+- [📚 ltx-core](../ltx-core/README.md) — Understand model components.
 
 ### 🤖 Agent-Assisted Training
 
-Use the [`train-model`](../../.claude/skills/train-model/SKILL.md) repository skill for an end-to-end guided run:
-it probes your data and hardware, chooses the matching training mode, prepares/preprocesses the dataset, launches
-training, and monitors the job while using the docs above as the source of truth.
-
----
+In environments with repository skills, [`/train`](../../.claude/skills/train/SKILL.md) guides mode selection,
+data preparation, preprocessing, launch, and monitoring using these docs.
 
 ## 🔧 Requirements
 
 - **LTX Model** - Local files, in either published layout:
-    - *Unified* (LTX-2, LTX-2.3, LTX-2.5) — one `.safetensors` holding the transformer, both VAEs and the vocoder,
-      plus a directory containing the matching Gemma text encoder.
-    - *Split* (LTX 2.5) — one file per component: transformer, packed text encoder, video VAE, audio VAE. Each is
-      named separately in the config; see [Configuration Reference](docs/configuration-reference.md#modelconfig).
+    - *Unified* (LTX-2, LTX-2.3) — one `.safetensors` holding the transformer, both VAEs, and the vocoder, used with
+      a separate matching Gemma text-encoder directory.
+    - *Split* (LTX-2.5) — separate transformer, packed text encoder, video VAE, and audio VAE files. Configure VAE
+      paths for the modalities used; see [Model configuration](docs/configuration-reference.md#model).
 - **Matching text encoder** - LTX 2.5 requires the LTX-specific fine-tuned Gemma 4 text encoder; do not substitute
   Google's vanilla Gemma 4 model. LTX-2/LTX-2.3 use Gemma 3.
 - **Linux with CUDA** - CUDA 13+ recommended for optimal performance
 - **Nvidia GPU with 80GB+ VRAM** - Recommended for the standard config. For GPUs with 32GB VRAM (e.g., RTX 5090),
   use the [low VRAM config](configs/t2v_lora_low_vram.yaml) which enables INT8 quantization and other
-  memory optimizations
-
----
+  memory optimizations.
 
 ## 🤝 Contributing
 
-We welcome contributions from the community! Here's how you can help:
-
-- **Share Your Work**: If you've trained interesting LoRAs or achieved cool results, please share them with the
-  community.
-- **Report Issues**: Found a bug or have a suggestion? Open an issue on GitHub.
-- **Submit PRs**: Help improve the codebase with bug fixes or general improvements.
-- **Feature Requests**: Have ideas for new features? Let us know through GitHub issues.
-
----
-
-## 💬 Join the Community
-
-Have questions, want to share your results, or need real-time help?
-
-Join our [community Discord server](https://discord.gg/ltxplatform) to connect with other users and the development
-team!
-
-- Get troubleshooting help
-- Share your training results and workflows
-- Collaborate on new ideas and features
-- Stay up to date with announcements and updates
-
-We look forward to seeing you there!
-
----
-
-Happy training! 🎉
+Report bugs and request features through GitHub issues; contributions are welcome through pull requests.
+For questions, sharing training results, and announcements, join the [community Discord](https://discord.gg/ltxplatform).

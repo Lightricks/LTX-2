@@ -1,6 +1,6 @@
 # Setting Up an MGPU Pipeline
 
-**Source**: [`ti2vid_two_stages_mgpu.py`](../../src/ltx_pipelines/ti2vid_two_stages_mgpu.py), [`multigpu/weight_tracker.py`](../../src/ltx_pipelines/multigpu/weight_tracker.py)
+**Source**: [`ti2vid_two_stages_mgpu.py`](../../src/ltx_pipelines/ti2vid_two_stages_mgpu.py), [`ltx_core/loader/distributed.py`](../../../ltx-core/src/ltx_core/loader/distributed.py), [`ltx_core/loader/distributed_builders.py`](../../../ltx-core/src/ltx_core/loader/distributed_builders.py)
 
 An MGPU pipeline **is** a single-GPU pipeline with its per-block builders swapped
 for MGPU builders. Build the standard pipeline, then replace each block's
@@ -12,17 +12,18 @@ This is performed inside a runner's `setup()` (which runs on every rank — see
 [Controller](controller.md)).
 
 ```python
-from ltx_core.loader.registry import ModelRegistry
-from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
-from ltx_pipelines.multigpu.sp_builder import SequenceParallelBuilder
-from ltx_pipelines.multigpu.tdp_builder import TiledDataParallelBuilder
-from ltx_pipelines.multigpu.gemma_builders import AccelerateGemmaBuilder
-from ltx_pipelines.multigpu.vae_builders import DistributedDecoderBuilder
-from ltx_pipelines.multigpu.weight_tracker import TransformerWeightTracker
+from ltx_core.loader.distributed_builders import (
+    AccelerateGemmaBuilder,
+    SequenceParallelBuilder,
+    TiledDataParallelBuilder,
+)
 from ltx_core.multigpu.transformer.attention import AttentionManager
+from ltx_pipelines.multigpu.runner import rank_cuda_registry
+from ltx_pipelines.multigpu.vae_builders import DistributedDecoderBuilder
+from ltx_pipelines.ti2vid_two_stages import TI2VidTwoStagesPipeline
 
-# 1. ONE shared registry for every builder in this process.
-registry = ModelRegistry()
+# 1. ONE shared registry for every builder in this process, keeping weights on this rank's GPU.
+registry = rank_cuda_registry()
 
 # 2. Build the normal pipeline, handing it the registry.
 pipeline = TI2VidTwoStagesPipeline(
@@ -30,26 +31,24 @@ pipeline = TI2VidTwoStagesPipeline(
     loras=[], registry=registry, quantization=...,
 )
 
-# 3. One weight tracker per transformer process group (shared by the stages).
-tracker = TransformerWeightTracker(group=self.groups.transformer_group)
+# 3. One set of active weights shared by the transformer stages.
+active_weights: dict[str, torch.Tensor] = {}
 
 # 4. Swap each block's builder.
 pipeline.stage_1._transformer_builder = SequenceParallelBuilder(
-    inner=pipeline.stage_1._transformer_builder, attn_mgr=attn_mgr,
-    registry=registry, tracker=tracker,
+    pipeline.stage_1._transformer_builder, attn_mgr, dst=active_weights
 )
 pipeline.stage_2._transformer_builder = TiledDataParallelBuilder(
-    inner=pipeline.stage_2._transformer_builder, group=self.groups.transformer_group,
-    tiling=tdp_tiling, registry=registry, tracker=tracker,
+    pipeline.stage_2._transformer_builder, self.groups.transformer_group, tdp_tiling, dst=active_weights
 )
-pipeline.prompt_encoder._text_encoder_builder = AccelerateGemmaBuilder(...)
+pipeline.prompt_encoder._text_encoder_builder = AccelerateGemmaBuilder.from_root(...)
 pipeline.video_decoder._decoder_builder = DistributedDecoderBuilder(...)
 ```
 
-Each MGPU builder **wraps** the block's existing single-GPU builder (`inner=...`),
-so it inherits the checkpoint path, quantization, compilation, and LoRA config —
-only the parallelism is added. See the per-technique pages for each builder's
-constructor.
+Each MGPU builder **wraps** the block's existing `SimpleBuilder` (its `base`), so it
+inherits the checkpoint paths, LoRA requests and registry; the stage still applies
+quantization and compilation to that base. Only the parallelism is added. See the
+per-technique pages for each builder's constructor.
 
 > **`with_builder` vs direct assignment.** `DiffusionStage.with_builder(builder)`
 > returns a *new* stage with the builder swapped (functional, never mutates). The
@@ -58,57 +57,62 @@ constructor.
 
 ## The shared model registry
 
-`ModelRegistry` is an in-process cache with two independent stores, toggled via
-`cache_weights` / `cache_models` on construction (both default `True`):
+`ModelRegistry` (`ltx_core.loader.registry`) is an in-process cache:
 
-- **Weights** — state dicts keyed by `(resolved paths, sd_ops name)`. Passing
-  **one** registry to every builder means the transformer checkpoint is read from
-  disk **once per process**, even though stage 1 (SP) and stage 2 (TDP) are
-  separate builders on the same file. Gemma and the VAE cache their weights the
-  same way.
-- **Module shells** — `nn.Module` instances keyed by `module_registry_key`
-  (configurator + init config + module ops). A hit reuses the shell; callers
-  always reassign weights onto it. Non-persistent buffers installed by module ops
-  stay on the shell across `dispose` and are not stored in the weight map.
+- **Model shells** (`cache_models`, default `True`) — meta shells keyed by
+  configurator, checkpoint metadata and module ops. A hit reuses the shell; every
+  build assigns weights onto it. Non-persistent buffers installed by module ops
+  stay on the shell across `dispose`.
+- **Checkpoint metadata** (`cache_metadata`, default `True`) — parsed safetensors
+  `__metadata__` per resolved shard, and checkpoint projections per resolved paths
+  and SDOps names, so a rebuild neither re-reads headers nor re-projects keys.
+- **Unit states** — retained only where a placement policy places them. The
+  registry's `placement_policy` is the default of every builder using it; a builder
+  may override it with `with_placement_policy`.
 
-Retained weights are treated as immutable clean cache: LoRA fusion allocates a
-fresh destination SD when `registry.get(...)` hits, so in-place fuse never
-corrupts the registry.
+The runners create their registry with `rank_cuda_registry()`
+(`ltx_pipelines.multigpu.runner`): clean weights and LoRA factors stay on the rank's
+GPU. Passing **one** registry to every builder means a checkpoint is read from disk
+**once per process**, even though stage 1 (SP) and stage 2 (TDP) are separate
+builders on the same file. Gemma and the VAE keep their weights the same way, except
+the Accelerate Gemma builder, which keeps its own dispatched encoder and weights.
+
+Retained states are read-only: LoRA fusion writes into separate active storage.
 
 The registry is **per process** — it is not shared across ranks. Each worker loads
 its own copy, so the full checkpoint is resident on every GPU (see the
 [memory disclaimer](README.md)).
 
-## `TransformerWeightTracker` — working copy + sharded clean weights
+## Shared active weights — one replica, rank-owned clean units
 
-```python
-TransformerWeightTracker(group: dist.ProcessGroup, bucket_mb=256, no_lora_swap=False)
-```
+The transformer stage builders share one `dst` dict. The first distributed build
+fills it with a **full replica on every GPU**; every later build, from any stage and
+with any LoRA set, rewrites those same tensors, so their addresses never change. The
+registry records the selection each cached shell holds, so it knows what `dst`
+holds. On a build:
 
-The tracker is shared by the transformer stage builders that operate on the same
-checkpoint. It does **not** own weights — it references the tensors in the registry
-and receives a builder at `build()` time. Two copies of the weights exist per rank,
-and they are **not** the same shape of memory:
+- each rank loads only the units it owns, fuses the selected LoRAs into them, and
+  writes them into `dst`;
+- bucketed all-gather rounds, through a `bucket_bytes` staging buffer the registry
+  keeps per device, copy every owner's units into the other ranks' replicas;
+- a request `dst` already holds binds the stage's shell to it without loading,
+  after one agreement between ranks;
+- a LoRA switch rewrites only the weights the outgoing or incoming set patches
+  (restoring outgoing ones from clean units, fusing incoming ones) and exchanges
+  only those keys. Every stage model bound to `dst` then holds the new weights, so
+  stage models must not run concurrently.
 
-- **Working copy** — the model the builder returns, backed by the registry's
-  tensors. This is a **full replica on every GPU**. LoRAs are fused into it
-  **in place**; `broadcast_sd` (a zero-copy `ShardedSD` view over these tensors)
-  broadcasts each owner rank's freshly fused shards — bucketed, `bucket_mb` at a
-  time — so all ranks converge on identical working weights.
-- **Clean weights** (`stored_sd`) — an immutable, cloned backup of the original
-  (pre-LoRA) weights, held so the working copy can be reset before a different LoRA
-  set is applied. This copy is **sharded** across ranks (deterministic
-  `md5(key) % world_size` ownership): each rank stores only its ~1/world_size slice,
-  not a full clone.
+Clean units come from the registry. With `rank_cuda_registry()` each rank retains
+the clean states of the units it owns, about 1/world_size of the checkpoint, so a
+switch reads nothing from disk. Per-GPU transformer memory is therefore one full
+replica **plus** a ~1/world_size clean share (and the LoRA factors).
 
-So per-GPU transformer memory is one full working model **plus** a ~1/world_size
-clean-weights shard — the clean backup is distributed, the working copy is not.
-
-This allows a two-stage pipeline to apply the distilled LoRA to stage 2 and reset it
-for stage 1 without reloading the checkpoint. Pass `no_lora_swap=True` when the
-LoRA set is fixed (none, or one set for the whole run): the clean-weights clone is
-skipped (`stored_sd` becomes a zero-copy view) and any swap/reset raises — saves the
-~1/N shard, and guards against accidental swaps.
+This allows a two-stage pipeline to apply the distilled LoRA to stage 2 and remove
+it for stage 1 without reloading the checkpoint. When the LoRA set is fixed for the
+whole run (none, or one set), the clean share is unnecessary: give the transformer
+builder a placement policy without clean retention, e.g.
+`builder.with_placement_policy(RetentionPolicy(lora=rank_device))`; a switch still
+works, but reads the rank's units from the checkpoint again.
 
 ## Full example
 

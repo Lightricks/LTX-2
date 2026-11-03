@@ -14,23 +14,22 @@ from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.conditioning import ConditioningItem
 from ltx_core.loader import LoraPathStrengthAndSDOps
-from ltx_core.loader.registry import Registry
+from ltx_core.loader.registry import ModelRegistry
 from ltx_core.model.transformer.compiling import CompilationConfig
-from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig, get_video_chunks_number
+from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig
 from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
 from ltx_core.types import VideoPixelShape
 from ltx_pipelines.chunks import (
     Chunk,
     ChunkConfig,
-    DecodedChunk,
     MakeVideoConditionings,
+    PlaybackSegment,
     decode_chunks,
     denoise_chunks,
     generate_uniform_chunks,
     pipeline_output_from_chunks,
     spatially_upsample_chunks,
-    split_decoded_chunks,
 )
 from ltx_pipelines.chunks.conditionings import (
     assert_image_frames_in_clip,
@@ -67,9 +66,13 @@ from ltx_pipelines.utils.helpers import (
     ensure_tiling_config,
     get_device,
     snap_frames_to_grid,
-    tiling_scale_factors_for_vae,
 )
-from ltx_pipelines.utils.media_io import EXRColorSpace, encode_video, resolve_hdr_color_space, vae_dtype_for_hdr
+from ltx_pipelines.utils.media_io import (
+    EXRColorSpace,
+    encode_media_segments,
+    resolve_hdr_color_space,
+    vae_dtype_for_hdr,
+)
 from ltx_pipelines.utils.model_paths import ModelPaths
 from ltx_pipelines.utils.types import (
     DEFAULT_AUTO_DURATION,
@@ -122,7 +125,7 @@ class TI2VidTwoStagesPipeline:
         loras: list[LoraPathStrengthAndSDOps],
         device: torch.device | None = None,
         quantization: QuantizationPolicy | None = None,
-        registry: Registry | None = None,
+        registry: ModelRegistry | None = None,
         compilation_config: CompilationConfig | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
@@ -131,6 +134,7 @@ class TI2VidTwoStagesPipeline:
     ):
         self.device = device or get_device()
         self.dtype = torch.bfloat16
+        registry = registry or ModelRegistry()
         self._scheduler = LTX2Scheduler()
 
         self.prompt_encoder = PromptEncoder(
@@ -257,10 +261,8 @@ class TI2VidTwoStagesPipeline:
         if chunk_config is None:
             chunk_config = ChunkConfig(chunk_pixel_frames=resolved_num_frames, next_video_carry_frames=0)
 
-        scale_factors = tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path)
         resolved_tiling_config = ensure_tiling_config(
             tiling_config,
-            scale_factors=scale_factors,
             vae_checkpoint_path=self.video_decoder.checkpoint_path,
             video_shape=VideoPixelShape(
                 batch=1,
@@ -272,6 +274,7 @@ class TI2VidTwoStagesPipeline:
             diffvae_optimization=self.video_decoder.diffvae_optimization,
             device=self.device,
             keyframes=decode_with_keyframes,
+            vae_dtype=resolved_vae_dtype,
         )
 
         return _TI2VidRunContext(
@@ -393,7 +396,7 @@ class TI2VidTwoStagesPipeline:
         decode_with_keyframes: bool = False,
         chunk_config: ChunkConfig | None = None,
         refine_audio: bool = False,
-    ) -> tuple[Iterator[DecodedChunk], int, TilingConfig]:
+    ) -> tuple[Iterator[PlaybackSegment], int, TilingConfig]:
         """Generate a video as a stream of decoded chunks.
         ``chunk_config=None`` plans a single chunk covering the snapped clip.
         Set ``refine_audio=True`` to denoise audio in stage 2; by default stage-1 audio is preserved.
@@ -422,18 +425,6 @@ class TI2VidTwoStagesPipeline:
         ).to(dtype=torch.float32, device=self.device)
         stage_2_sigmas = stage_2_sigmas.to(dtype=torch.float32, device=self.device)
 
-        def make_denoiser(chunk: Chunk) -> FactoryGuidedDenoiser:
-            return FactoryGuidedDenoiser(
-                v_context=chunk.video_context,
-                a_context=chunk.audio_context,
-                video_guider_factory=create_multimodal_guider_factory(
-                    params=video_guider_params, negative_context=ctx.v_context_n
-                ),
-                audio_guider_factory=create_multimodal_guider_factory(
-                    params=audio_guider_params, negative_context=ctx.a_context_n
-                ),
-            )
-
         target = VideoPixelShape(
             batch=1,
             frames=ctx.num_frames,
@@ -458,7 +449,14 @@ class TI2VidTwoStagesPipeline:
             noiser=ctx.noiser,
             fps=frame_rate,
             max_batch_size=max_batch_size,
-            make_denoiser=make_denoiser,
+            denoiser=FactoryGuidedDenoiser(
+                video_guider_factory=create_multimodal_guider_factory(
+                    params=video_guider_params, negative_context=ctx.v_context_n
+                ),
+                audio_guider_factory=create_multimodal_guider_factory(
+                    params=audio_guider_params, negative_context=ctx.a_context_n
+                ),
+            ),
         )
         upscaled = spatially_upsample_chunks(base, self.upsampler)
         refined = denoise_chunks(
@@ -531,7 +529,7 @@ def main() -> None:
         skip_step=args.audio_skip_step,
         stg_blocks=args.audio_stg_blocks,
     )
-    chunks, num_frames, tiling_config = pipeline.stream_chunks(
+    chunks, _, _ = pipeline.stream_chunks(
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
         seed=args.seed,
@@ -554,25 +552,12 @@ def main() -> None:
         chunk_config=chunk_config,
         refine_audio=args.refine_audio,
     )
-    if chunk_config is not None:
-        video, audio, audio_sampling_rate = split_decoded_chunks(chunks)
-        video_chunks_number = 1
-    else:
-        result = pipeline_output_from_chunks(
-            chunks,
-            num_frames=num_frames,
-            tiling_config=tiling_config,
-        )
-        video, audio, audio_sampling_rate = result.video, result.audio, None
-        video_chunks_number = get_video_chunks_number(result.num_frames, result.tiling_config)
-    encode_video(
-        video=video,
+    encode_media_segments(
+        chunks,
         fps=args.frame_rate,
-        audio=audio,
         output_path=args.output_path,
-        video_chunks_number=video_chunks_number,
+        video_chunks_number=None,
         color_space=hdr,
-        audio_sampling_rate=audio_sampling_rate,
         video_marker=video_marker,
         audio_marker=audio_marker,
     )

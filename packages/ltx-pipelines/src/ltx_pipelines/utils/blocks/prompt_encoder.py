@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import logging
 from contextlib import AbstractContextManager
+from pathlib import Path
 
 import torch
 
 from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
-from ltx_core.block_streaming import DISK_CPU_SLOTS, StreamingModelBuilder
-from ltx_core.loader.primitives import BuilderProtocol
-from ltx_core.loader.registry import ModelRegistry, Registry
-from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
+from ltx_core.loader.registry import ModelRegistry
+from ltx_core.loader.simple_builder import SimpleBuilder
+from ltx_core.loader.streaming_builder import StreamingBuilder, StreamingConfig
 from ltx_core.text_encoders.gemma import (
     EMBEDDINGS_PROCESSOR_KEY_OPS,
     EmbeddingsProcessorConfigurator,
@@ -43,12 +43,12 @@ class PromptEncoder:
         model_paths: ModelPaths,
         dtype: torch.dtype,
         device: torch.device,
-        registry: Registry | None = None,
+        registry: ModelRegistry | None = None,
         offload_mode: OffloadMode = OffloadMode.NONE,
-        text_encoder_builder: BuilderProtocol | None = None,
+        text_encoder_builder: SimpleBuilder | None = None,
         alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
         prompt_enhancer_gemma_root: str | None = None,
-        enhancer_text_encoder_builder: BuilderProtocol | None = None,
+        enhancer_text_encoder_builder: SimpleBuilder | None = None,
     ) -> None:
         text_encoder_path = model_paths.text_encoder()
         embeddings_paths = model_paths.embeddings_weight_paths
@@ -65,8 +65,7 @@ class PromptEncoder:
         self._alloc_trim_strategy = alloc_trim_strategy
         self._prompt_enhancer_gemma_root = prompt_enhancer_gemma_root
 
-        registry = registry or ModelRegistry(cache_models=True, cache_weights=False)
-        self._registry = registry
+        unit_registry = registry or ModelRegistry()
 
         if text_encoder_builder is not None:
             encode_type = text_encoder_builder.model_config().get("model_type") or gemma_model_type(text_encoder_path)
@@ -90,22 +89,19 @@ class PromptEncoder:
         else:
             gemma_sd_ops, gemma_module_ops = get_gemma_ops(text_encoder_path)
             weight_paths = resolve_gemma_weight_paths(text_encoder_path)
-            self._text_encoder_builder = Builder(
-                model_path=weight_paths,
-                model_class_configurator=GemmaTextEncoderConfigurator.with_gemma_model_path(text_encoder_path),
-                model_sd_ops=gemma_sd_ops,
-                module_ops=gemma_module_ops,
-                registry=registry,
+            self._text_encoder_builder = SimpleBuilder(
+                GemmaTextEncoderConfigurator.with_gemma_model_path(text_encoder_path),
+                tuple(Path(path) for path in weight_paths),
+                (gemma_sd_ops,),
+                gemma_module_ops,
+                registry=unit_registry,
             )
-            self._streaming_text_encoder_builder = StreamingModelBuilder(
-                model_path=weight_paths,
-                model_class_configurator=GemmaTextEncoderConfigurator.with_gemma_model_path(text_encoder_path),
-                model_sd_ops=gemma_sd_ops,
-                module_ops=gemma_module_ops,
-                registry=registry,
-                blocks_attr="model.model.language_model.layers",
-                blocks_prefix="model.model.language_model.layers",
-                cpu_slots_count=DISK_CPU_SLOTS if offload_mode == OffloadMode.DISK else None,
+            self._streaming_text_encoder_builder = StreamingBuilder(
+                self._text_encoder_builder,
+                StreamingConfig(
+                    "model.model.language_model.layers",
+                    "disk" if offload_mode == OffloadMode.DISK else "cpu",
+                ),
             )
 
         # Always set: shared enhance aliases the encode builder (same object / residency).
@@ -114,21 +110,21 @@ class PromptEncoder:
         elif prompt_enhancer_gemma_root is not None and prompt_enhancer_gemma_root != text_encoder_path:
             enhancer_sd_ops, enhancer_module_ops = get_gemma_ops(prompt_enhancer_gemma_root)
             enhancer_paths = resolve_gemma_weight_paths(prompt_enhancer_gemma_root)
-            self._enhancer_text_encoder_builder = Builder(
-                model_path=enhancer_paths,
-                model_class_configurator=GemmaTextEncoderConfigurator.with_gemma_model_path(prompt_enhancer_gemma_root),
-                model_sd_ops=enhancer_sd_ops,
-                module_ops=enhancer_module_ops,
-                registry=registry,
+            self._enhancer_text_encoder_builder = SimpleBuilder(
+                GemmaTextEncoderConfigurator.with_gemma_model_path(prompt_enhancer_gemma_root),
+                tuple(Path(path) for path in enhancer_paths),
+                (enhancer_sd_ops,),
+                enhancer_module_ops,
+                registry=unit_registry,
             )
         else:
             self._enhancer_text_encoder_builder = self._text_encoder_builder
 
-        self._embeddings_processor_builder = Builder(
-            model_path=embeddings_paths,
-            model_class_configurator=EmbeddingsProcessorConfigurator.with_gemma_model_path(text_encoder_path),
-            model_sd_ops=EMBEDDINGS_PROCESSOR_KEY_OPS,
-            registry=registry,
+        self._embeddings_processor_builder = SimpleBuilder(
+            EmbeddingsProcessorConfigurator.with_gemma_model_path(text_encoder_path),
+            tuple(Path(path) for path in embeddings_paths),
+            (EMBEDDINGS_PROCESSOR_KEY_OPS,),
+            registry=unit_registry,
         )
 
     def _build_text_encoder(self) -> torch.nn.Module:

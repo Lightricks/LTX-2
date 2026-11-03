@@ -1,15 +1,10 @@
-"""Colour transforms, primaries, YUV packing, and HLG encode.
+"""Colour transforms, primaries, YUV packing, and HLG conversion.
 VAE working-space helpers (``to_acescct_working_space``, ``to_hdr_linear``, ``TransferEncoding``) live in
 :mod:`ltx_core.hdr` — import them from there. This package does not re-export
 hdr symbols (that would cycle: ``hdr`` imports ``color.primaries``).
 """
 
-from ltx_core.color.hlg import (
-    HlgGpuConverter,
-    HlgPyAVEncoder,
-    encode_linear_hdr_frames_to_hlg_mp4,
-    hlg_inverse_oetf,
-)
+from ltx_core.color.hlg import HlgGpuConverter, hlg_inverse_oetf
 from ltx_core.color.primaries import (
     ACESCG_TO_2020,
     ACESCG_TO_SRGB,
@@ -30,6 +25,7 @@ from ltx_core.color.yuv import (
     rgb_to_yuv420,
     rgb_to_yuv420p10,
     rgb_uint8_converter_,
+    rgba_to_yuva444p10,
     yuv420p_bt709_converter_,
 )
 
@@ -44,16 +40,15 @@ __all__ = [
     "ColorSpace",
     "FrameConverter",
     "HlgGpuConverter",
-    "HlgPyAVEncoder",
     "PixelFormat",
     "Primaries",
     "apply_acescg_to_srgb",
     "apply_srgb_to_acescg",
-    "encode_linear_hdr_frames_to_hlg_mp4",
     "hlg_inverse_oetf",
     "rgb_to_yuv",
     "rgb_to_yuv420",
     "rgb_to_yuv420p10",
     "rgb_uint8_converter_",
+    "rgba_to_yuva444p10",
     "yuv420p_bt709_converter_",
 ]

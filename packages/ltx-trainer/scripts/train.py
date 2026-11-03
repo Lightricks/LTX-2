@@ -7,6 +7,7 @@ either LoRA fine-tuning or full model fine-tuning. It loads configuration from
 a YAML file and passes it to the trainer.
 Basic usage:
     python scripts/train.py CONFIG_PATH [--disable-progress-bars]
+Deprecated flat-layout YAML configs are auto-migrated on load (with a deprecation warning).
 Resume is automatic when a training state file exists next to the loaded checkpoint.
 To start fresh, set `checkpoints.no_resume: true` in the YAML config.
 For multi-GPU/FSDP training, configure and launch via Accelerate:
@@ -50,7 +51,7 @@ def main(
         config_data = yaml.safe_load(file)
 
     try:
-        trainer_config = LtxTrainerConfig(**config_data)
+        trainer_config = LtxTrainerConfig.from_dict(config_data)
     except Exception as e:
         typer.echo(f"Error: Invalid configuration data: {e}")
         raise typer.Exit(code=1) from e

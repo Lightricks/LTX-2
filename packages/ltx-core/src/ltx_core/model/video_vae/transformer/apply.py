@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from ltx_core.loader.module_ops import ModuleOps
-from ltx_core.model.transformer.compiling import CompilationConfig
+from ltx_core.model.transformer.compiling import CompilationConfig, _config_fingerprint
 from ltx_core.model.video_vae.transformer.attention import (
     NeighborhoodAttention3D,
     configure_w_chunks,
@@ -194,13 +194,18 @@ def build_diffvae_mode_op(
     mode: DiffVAEMode,
     compilation_config: CompilationConfig | None = None,
 ) -> ModuleOps:
-    """ModuleOps mutator that applies ``mode.resolve()`` on the meta model."""
+    """Apply ``mode.resolve()`` on the meta model, keyed by non-default compile config."""
 
     def mutator(model: torch.nn.Module) -> torch.nn.Module:
         return apply_diffvae_mode(model, mode, compilation_config=compilation_config)  # type: ignore[arg-type]
 
     return ModuleOps(
-        name=f"diffvae_mode_{mode.value}",
+        name=f"diffvae_mode_{mode.value}"
+        + (
+            f":{_config_fingerprint(compilation_config)}"
+            if compilation_config is not None and compilation_config != CompilationConfig()
+            else ""
+        ),
         matcher=_diffusion_decoder_matcher,
         mutator=mutator,
     )
@@ -217,10 +222,11 @@ def build_cutlass_fna_diffusion_decoder_op() -> ModuleOps:
 
 
 def build_compile_diffusion_decoder_op(config: CompilationConfig | None = None) -> ModuleOps:
-    """Backward-compat ModuleOps name; mutator applies :attr:`DiffVAEMode.COMBINED_COMPILE`."""
+    """Apply combined compilation, retaining the legacy name for default config."""
     inner = build_diffvae_mode_op(DiffVAEMode.COMBINED_COMPILE, compilation_config=config)
     return ModuleOps(
-        name="compile_diffusion_decoder",
+        name="compile_diffusion_decoder"
+        + (f":{_config_fingerprint(config)}" if config is not None and config != CompilationConfig() else ""),
         matcher=inner.matcher,
         mutator=inner.mutator,
     )

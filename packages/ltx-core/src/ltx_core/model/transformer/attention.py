@@ -575,16 +575,16 @@ class Attention(torch.nn.Module):
             else:
                 out = self.masked_attention_function(q, k, v, self.heads, mask)
 
-            if perturbation_mask is not None:
-                out = out * perturbation_mask + v * (1 - perturbation_mask)
-
         # Apply per-head gating if enabled
-        if self.to_gate_logits is not None:
+        if self.to_gate_logits is not None and use_attention:
             gate_logits = self.to_gate_logits(x)
             b, t, _ = out.shape
             out = out.view(b, t, self.heads, self.dim_head)
             gates = 2.0 * torch.sigmoid(gate_logits)
             out = out * gates.unsqueeze(-1)
             out = out.view(b, t, self.heads * self.dim_head)
+
+        if use_attention and perturbation_mask is not None:
+            out = out * perturbation_mask + v * (1 - perturbation_mask)
 
         return self.to_out(out)

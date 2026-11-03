@@ -1,16 +1,14 @@
 import dataclasses
 import functools
+from collections.abc import Mapping
 from pathlib import Path
 
-import safetensors
 import torch
 
-from ltx_core.loader.fuse_loras import FuseRule, bf16_fuse_rule
 from ltx_core.loader.kernels import TRITON_AVAILABLE
 from ltx_core.loader.module_ops import ModuleOps
-from ltx_core.loader.primitives import StateDict
-from ltx_core.loader.sd_ops import KeyValueOperationResult, SDOps
-from ltx_core.model.transformer.model import LTXModel
+from ltx_core.loader.sd_ops import KeyMatching, KeyReplacement, KeyValueOperation, SDOps
+from ltx_core.loader.units import MPS_HOST_FUSED_FP8, FuseRule
 from ltx_core.quantization.policy import QuantizationPolicy
 
 BLOCK_SIZE = 1024
@@ -54,13 +52,6 @@ def fused_add_round_launch(target_weight: torch.Tensor, original_weight: torch.T
     return target_weight
 
 
-def _naive_weight_or_bias_downcast(key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
-    """
-    Downcast the weight or bias to the float8_e4m3fn dtype.
-    """
-    return [KeyValueOperationResult(key, value.to(dtype=torch.float8_e4m3fn))]
-
-
 # Triton's fp8e4nv (torch.float8_e4m3fn) is only a legal kernel dtype on
 # sm_89+ (Ada). Below that, tl.load of an e4m3fn tensor fails at compile with
 # "type fp8e4nv not supported in this architecture". PyTorch eager conversion
@@ -92,8 +83,13 @@ def _upcast_and_round(
     Stochastic rounding is implemented via a Triton kernel. When Triton is not
     available (e.g., on Windows) or cannot compile ``fp8e4nv`` (pre-Ada GPUs),
     this falls back to deterministic (nearest) rounding via ``weight.to(dtype)``.
+    MPS moves FP8 storage as bytes to CPU for conversion, then returns the
+    converted tensor to MPS.
     """
-    if not with_stochastic_rounding or not _use_triton_fp8_kernel(weight.device):
+    if weight.device.type == "mps":
+        cpu_weight = weight.view(torch.uint8).cpu().view(weight.dtype).view(weight.shape)
+        return cpu_weight.to(dtype).to(weight.device)
+    if not with_stochastic_rounding or dtype != torch.bfloat16 or not _use_triton_fp8_kernel(weight.device):
         return weight.to(dtype)
     return fused_add_round_launch(torch.zeros_like(weight, dtype=dtype), weight, seed)
 
@@ -174,7 +170,7 @@ def _amend_forward_with_upcast(
     Replace the forward method of the fp8-cast Linear layers (per
     :data:`_FP8_CAST_LINEAR_SUFFIXES`) to forward with upcast and optional
     stochastic rounding.
-    Only the Linears whose weights are downcast by :data:`TRANSFORMER_LINEAR_DOWNCAST_MAP`
+    Only the Linears whose weights are downcast by :func:`fp8_cast_downcast_stage`
     are retyped. Linears outside that subset (e.g. ``to_gate_logits``) are left as
     plain ``nn.Linear`` so the meta-model param dtype matches the loaded checkpoint
     dtype.
@@ -185,46 +181,6 @@ def _amend_forward_with_upcast(
     return model
 
 
-def _build_transformer_linear_downcast_map() -> SDOps:
-    """Build the sd_ops downcast map from the same suffix registry as the matcher."""
-    ops = SDOps("TRANSFORMER_LINEAR_DOWNCAST_MAP")
-    for suffix in _FP8_CAST_LINEAR_SUFFIXES:
-        ops = ops.with_kv_operation(
-            key_prefix=_FP8_CAST_KEY_PREFIX,
-            key_suffix=suffix + ".weight",
-            operation=_naive_weight_or_bias_downcast,
-        ).with_kv_operation(
-            key_prefix=_FP8_CAST_KEY_PREFIX,
-            key_suffix=suffix + ".bias",
-            operation=_naive_weight_or_bias_downcast,
-        )
-    return ops
-
-
-TRANSFORMER_LINEAR_DOWNCAST_MAP = _build_transformer_linear_downcast_map()
-
-UPCAST_DURING_INFERENCE = ModuleOps(
-    name="upcast_fp8_during_linear_forward",
-    matcher=lambda model: isinstance(model, LTXModel),
-    mutator=lambda model: _amend_forward_with_upcast(model, False),
-)
-
-
-class UpcastWithStochasticRounding(ModuleOps):
-    """
-    ModuleOps for upcasting the model's float8_e4m3fn weights and biases to the bfloat16 dtype
-    and applying stochastic rounding during linear forward.
-    """
-
-    def __new__(cls, seed: int = 0):
-        return super().__new__(
-            cls,
-            name="upcast_fp8_during_linear_forward_with_stochastic_rounding",
-            matcher=lambda model: isinstance(model, LTXModel),
-            mutator=lambda model: _amend_forward_with_upcast(model, True, seed),
-        )
-
-
 def fuse_cast_fp8_weight(
     delta_bf16: torch.Tensor,
     weight_fp8: torch.Tensor,
@@ -232,37 +188,20 @@ def fuse_cast_fp8_weight(
     """Return ``(delta_bf16 + dequantize(weight_fp8)).to(weight_fp8.dtype)``.
     CUDA with Triton on sm_89+ uses stochastic rounding via the fused kernel;
     otherwise falls back to a deterministic bf16 add (no Triton, or a GPU
-    whose Triton cannot compile ``fp8e4nv``). ``delta_bf16`` is the bf16
-    accumulator and is mutated in place.
+    whose Triton cannot compile ``fp8e4nv``). The CUDA/CPU path mutates the
+    BF16 accumulator; MPS fuses on CPU and returns a new MPS tensor.
     """
     if delta_bf16.dtype != torch.bfloat16:
         raise ValueError(f"delta_bf16 must be bfloat16, got {delta_bf16.dtype}")
+    if weight_fp8.device.type == "mps":
+        cpu_weight = weight_fp8.view(torch.uint8).cpu().view(weight_fp8.dtype).view(weight_fp8.shape)
+        cpu_result = fuse_cast_fp8_weight(delta_bf16.cpu(), cpu_weight)
+        return cpu_result.view(torch.uint8).to(weight_fp8.device).view(weight_fp8.dtype).view(weight_fp8.shape)
     if _use_triton_fp8_kernel(weight_fp8.device):
         fused_add_round_launch(delta_bf16, weight_fp8, seed=0)
     else:
         delta_bf16.add_(weight_fp8.to(dtype=torch.bfloat16))
     return delta_bf16.to(dtype=weight_fp8.dtype)
-
-
-def _fp8_cast_fuse(
-    key: str,
-    weight: torch.Tensor,
-    deltas: torch.Tensor,
-    model_sd: StateDict,
-) -> dict[str, torch.Tensor]:
-    """Cast the dequantized FP8 weight + BF16 deltas back to ``weight.dtype``
-    (FP8) via the fused-add-round kernel on CUDA when Triton can compile
-    ``fp8e4nv``, otherwise via a deterministic software add.
-    Only a subset of linears are FP8-downcast (see ``TRANSFORMER_LINEAR_DOWNCAST_MAP``);
-    LoRAs may also target layers left in BF16 (e.g. audio ``add_q/k/v_proj``, cross-modal
-    projections). For those, fall back to a plain BF16 fuse.
-    """
-    if weight.dtype not in (torch.float8_e4m3fn, torch.float8_e5m2):
-        return bf16_fuse_rule(key, weight, deltas, model_sd)
-    return {key: fuse_cast_fp8_weight(deltas, weight)}
-
-
-fp8_cast_fuse_rule = FuseRule(aggregation_dtype=torch.bfloat16, fuse_fn=_fp8_cast_fuse)
 
 
 E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
@@ -331,109 +270,91 @@ def with_rowwise_fp8_gemm(policy: QuantizationPolicy, min_rows: int = 8192) -> Q
     activation row count from which the e4m3 GEMM is taken: the video token sequences of long passes,
     not the audio or text-context projections.
     """
-    if policy.fuse_rule is not fp8_cast_fuse_rule:
+    if policy.fuse_rule is not FP8_CAST_UNIT_FUSE_RULE:
         raise ValueError("with_rowwise_fp8_gemm needs an fp8-cast policy (weights stored in e4m3)")
     op = ModuleOps(
         name=f"fp8_rowwise_gemm_from_{min_rows}_rows",
-        matcher=lambda model: isinstance(model, LTXModel),
+        matcher=lambda model: hasattr(model, "transformer_blocks"),
         mutator=functools.partial(_amend_forward_with_rowwise_fp8_gemm, min_rows=min_rows),
     )
     return dataclasses.replace(policy, module_ops=(*policy.module_ops, op))
 
 
-# Raw safetensors storage prefix shared by every diffusion-transformer
-# parameter (and every prequant `*_scale` sibling). Verified against
-# ltx-2.3-22b-{dev,distilled}-fp8.safetensors: 2924/2924 and 2992/2992 of
-# the scale keys start with this exact prefix.
-_RAW_DIFFUSION_MODEL_PREFIX = "model.diffusion_model."
+def _fp8_cast_unit_patch(
+    key: str, weight: torch.Tensor, delta: torch.Tensor, _clean: Mapping[str, torch.Tensor]
+) -> Mapping[str, torch.Tensor]:
+    if weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        return {key: fuse_cast_fp8_weight(delta.to(torch.bfloat16), weight)}
+    if not weight.is_floating_point() or weight.dtype == torch.uint8:
+        raise ValueError(f"{key!r} has an unsupported FP8 cast fuse payload")
+    return {key: (weight.to(delta.dtype) + delta).to(weight.dtype)}
 
 
-def _read_scales(checkpoint_path: str | Path) -> dict[str, torch.Tensor]:
-    """Return ``{post_rename_param_key: scale_tensor}`` for every prequant
-    ``*_scale`` sibling in *checkpoint_path*.
-    Keys are returned in the post-rename form the loader will pass to the
-    sd-op (e.g. ``transformer_blocks.0.attn1.to_q.weight``) -- the raw
-    ``model.diffusion_model.`` prefix and the ``_scale`` suffix are both
-    stripped. Catches both ``.weight_scale`` and ``.bias_scale``; the
-    latter is absent in the current LTX-2.3 prequant checkpoints but
-    accepted for forward compatibility.
+FP8_CAST_UNIT_FUSE_RULE = FuseRule(
+    "fp8-cast", torch.bfloat16, _fp8_cast_unit_patch, host_fused_dtypes=MPS_HOST_FUSED_FP8
+)
+
+
+def _fold_unit_scale(scale_key: str, inputs: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    parent = scale_key.removesuffix("_scale")
+    if parent not in inputs:
+        raise ValueError(f"prequant scale {scale_key!r} has no parent tensor")
+    scale, weight = inputs[scale_key], inputs[parent]
+    if scale.ndim != 0:
+        raise ValueError(f"prequant scale {scale_key!r} must be scalar")
+    return {parent: (weight.float() * scale.float()).to(torch.bfloat16)}
+
+
+def _drop_activation_scale(_key: str, _inputs: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {}
+
+
+def fp8_cast_prequant_fold_stage() -> SDOps:
+    """Fold checkpoint weight and bias scales into their parents before downcasting.
+    FP8 casting keeps activations in bf16, so static activation scales (``.input_scale``) are dropped.
     """
-    out: dict[str, torch.Tensor] = {}
-    with safetensors.safe_open(str(checkpoint_path), framework="pt", device="cpu") as h:
-        raw_keys = h.keys()
-        for k in raw_keys:
-            if not k.endswith("_scale"):
-                continue
-            if not k.startswith(_RAW_DIFFUSION_MODEL_PREFIX):
-                raise ValueError(
-                    f"Scale key {k!r} does not start with the expected raw prefix {_RAW_DIFFUSION_MODEL_PREFIX!r}"
-                )
-            param_key = k.removeprefix(_RAW_DIFFUSION_MODEL_PREFIX).removesuffix("_scale")
-            out[param_key] = h.get_tensor(k)
-    return out
-
-
-def _build_prequant_fold_sd_ops(scales: dict[str, torch.Tensor]) -> SDOps:
-    """Build sd-ops that fold prequant ``*_scale`` siblings into their parent
-    tensor at load time.
-    *scales* is keyed by the **post-rename** param key (e.g.
-    ``transformer_blocks.0.attn1.to_q.weight``); see :func:`_read_scales`.
-    Four ``with_kv_operation`` entries (symmetric for ``.weight`` and ``.bias``):
-    * ``.weight`` / ``.bias`` -> if a sibling scale exists in *scales*, fold;
-      then delegate to ``TRANSFORMER_LINEAR_DOWNCAST_MAP`` (downcast covered
-      Linears, pass everything else through). Without a scale, delegate
-      directly.
-    * ``.weight_scale`` / ``.bias_scale`` -> drop (the scale is consumed by
-      the fold). Raises if the scale key doesn't correspond to a known
-      entry in *scales* -- that means the file shipped a scale we didn't
-      pre-register, which would silently desync the fold.
-    """
-
-    def _on_param(param_key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
-        scale = scales.get(param_key)
-        if scale is None:
-            return TRANSFORMER_LINEAR_DOWNCAST_MAP.apply_to_key_value(param_key, value)
-        scale = scale.to(device=value.device)
-        if scale.ndim != 0:
-            raise ValueError(f"Unsupported scale shape {tuple(scale.shape)} for {param_key}")
-        bf16 = (value.to(torch.float32) * scale).to(torch.bfloat16)
-        # Delegate the final fp8-vs-bf16 decision to the downcast map: Linears
-        # outside the fp8 subset (e.g. to_gate_logits) stay bf16 to match the
-        # plain nn.Linear that the upcast matcher leaves untouched.
-        return TRANSFORMER_LINEAR_DOWNCAST_MAP.apply_to_key_value(param_key, bf16)
-
-    def _drop_scale(scale_key: str, _value: torch.Tensor) -> list[KeyValueOperationResult]:
-        param_key = scale_key.removesuffix("_scale")
-        if param_key not in scales:
-            raise ValueError(
-                f"Scale key {scale_key!r} has no matching entry in the prequant scales dict; "
-                f"_read_scales and the loader's rename map have drifted"
-            )
-        return []
-
-    # Register the drop ops first so the dict-membership sanity check is the
-    # earliest sd-op that can fire on a scale key -- we crash on a stray scale
-    # before any silently mismatched fold has a chance to land in the state
-    # dict. Registration order is irrelevant for correctness (no overlap
-    # between matchers) but communicates intent.
+    fold = KeyValueOperation(
+        _fold_unit_scale, auxiliary_key_specs=((KeyMatching(suffix="_scale"), KeyReplacement("_scale", "")),)
+    )
     return (
-        SDOps("FP8_CAST_PREQUANT_AWARE")
-        .with_kv_operation(key_suffix=".weight_scale", operation=_drop_scale)
-        .with_kv_operation(key_suffix=".bias_scale", operation=_drop_scale)
-        .with_kv_operation(key_suffix=".weight", operation=_on_param)
-        .with_kv_operation(key_suffix=".bias", operation=_on_param)
+        SDOps("fp8-cast-fold-prequant")
+        .with_kv_operation(fold, key_suffix=".weight_scale")
+        .with_kv_operation(fold, key_suffix=".bias_scale")
+        .with_kv_operation(_drop_activation_scale, key_suffix=".input_scale")
     )
 
 
-def build_policy(checkpoint_path: str | Path) -> QuantizationPolicy:
+def _downcast_unit_weight(key: str, inputs: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {key: inputs[key].to(torch.float8_e4m3fn)}
+
+
+def fp8_cast_downcast_stage() -> SDOps:
+    """Downcast the selected transformer linear weights and biases after folding."""
+    stage = SDOps("fp8-cast-downcast")
+    for suffix in _FP8_CAST_LINEAR_SUFFIXES:
+        for parameter in (".weight", ".bias"):
+            stage = stage.with_kv_operation(
+                _downcast_unit_weight, key_prefix=_FP8_CAST_KEY_PREFIX, key_suffix=suffix + parameter
+            )
+    return stage
+
+
+def fp8_cast_upcast_module_op(*, stochastic: bool = False, seed: int = 0) -> ModuleOps:
+    """Rewrite selected transformer linears to upcast their FP8 weights at use."""
+    return ModuleOps(
+        name=f"fp8-cast-upcast:stochastic={stochastic}:seed={seed if stochastic else 0}",
+        matcher=lambda model: hasattr(model, "transformer_blocks"),
+        mutator=lambda model: _amend_forward_with_upcast(model, stochastic, seed),
+    )
+
+
+def build_policy(_checkpoint_path: str | Path) -> QuantizationPolicy:
     """FP8 casting with upcasting during inference.
-    *checkpoint_path* is required (mirroring ``fp8_scaled_mm.build_policy``).
-    For prequantized fp8 checkpoints, sibling ``*_scale`` tensors (weight or
-    bias) are folded into the parent at load time.
+    The checkpoint path is accepted for the shared policy-factory interface.
+    Checkpoint scale siblings are folded when the model is materialized.
     """
-    scales = _read_scales(checkpoint_path)
     return QuantizationPolicy(
-        sd_ops=_build_prequant_fold_sd_ops(scales),
-        module_ops=(UPCAST_DURING_INFERENCE,),
-        fuse_rule=fp8_cast_fuse_rule,
+        sd_ops=(fp8_cast_prequant_fold_stage(), fp8_cast_downcast_stage()),
+        module_ops=(fp8_cast_upcast_module_op(),),
+        fuse_rule=FP8_CAST_UNIT_FUSE_RULE,
     )

@@ -1,20 +1,34 @@
-from dataclasses import dataclass
+from __future__ import annotations
 
-from ltx_core.loader.fuse_loras import FuseRule, bf16_fuse_rule
+from dataclasses import dataclass, replace
+from typing import TypeVar
+
+import torch
+
 from ltx_core.loader.module_ops import ModuleOps
 from ltx_core.loader.sd_ops import SDOps
+from ltx_core.loader.simple_builder import SimpleBuilder
+from ltx_core.loader.units import FuseRule
+
+_Model = TypeVar("_Model", bound=torch.nn.Module)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class QuantizationPolicy:
-    """Configuration for model quantization during loading.
-    Attributes:
-        sd_ops: State-dict operations applied to each tensor during load.
-        module_ops: Post-load module transformations applied to the meta model.
-        fuse_rule: How LoRA deltas merge into this policy's weight layout.
-            Default ``bf16_fuse_rule`` is used when no policy is configured.
-    """
+    """Checkpoint stages, shell rewrites, and LoRA fusion for model loading."""
 
-    sd_ops: SDOps | None = None
+    sd_ops: tuple[SDOps, ...]
+    fuse_rule: FuseRule
     module_ops: tuple[ModuleOps, ...] = ()
-    fuse_rule: FuseRule = bf16_fuse_rule
+
+
+def compose_quantization(builder: SimpleBuilder[_Model], policy: QuantizationPolicy) -> SimpleBuilder[_Model]:
+    """Append the policy's checkpoint stages and module operations and use its fuse rule.
+    Compose before compilation: compiled blocks no longer match the policy's module operations.
+    """
+    return replace(
+        builder,
+        sd_ops=(*builder.sd_ops, *policy.sd_ops),
+        module_ops=(*builder.module_ops, *policy.module_ops),
+        fuse_rule=policy.fuse_rule,
+    )

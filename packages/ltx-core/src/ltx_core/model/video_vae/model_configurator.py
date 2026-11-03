@@ -1,11 +1,12 @@
-import dataclasses
+from collections.abc import Mapping
+from hashlib import sha256
 from pathlib import Path
 
 import safetensors
 import torch
 
-from ltx_core.loader.sd_ops import KeyValueOperationResult, SDOps
-from ltx_core.loader.sft_loader import SafetensorsModelStateDictLoader
+from ltx_core.loader.checkpoint import CheckpointReader
+from ltx_core.loader.sd_ops import KeyMatching, KeyReplacement, KeyValueOperation, SDOps
 from ltx_core.model.model_protocol import ModelConfigurator
 from ltx_core.model.video_vae.enums import LogVarianceType, NormLayerType, PaddingModeType
 from ltx_core.model.video_vae.transformer.dsl_kernels import (
@@ -30,7 +31,8 @@ def is_diffusion_video_vae(checkpoint_path: str) -> bool:
     A standalone conv-VAE extract must still get conv SDOps / memory-efficient
     decode.
     """
-    metadata = SafetensorsModelStateDictLoader().metadata(checkpoint_path)
+    with CheckpointReader.open((Path(checkpoint_path),)) as reader:
+        metadata = reader.read_checkpoint_metadata()
     return _vae_class_name_from_metadata(metadata) != _CONV_VAE_CLASS_NAME
 
 
@@ -223,8 +225,13 @@ def diffvae_tiling_geometry_from_vae_config(config: dict) -> dict:
     }
 
 
-def estimate_diffusion_decoder_weight_bytes(checkpoint_path: str | Path) -> int:
-    """Sum on-disk bf16-sized nbytes for ``vae.decoder`` / ``decoder`` tensors (header only)."""
+def estimate_diffusion_decoder_weight_bytes(
+    checkpoint_path: str | Path,
+    *,
+    dtype: torch.dtype = torch.bfloat16,
+) -> int:
+    """Sum on-disk nbytes for ``vae.decoder`` / ``decoder`` tensors (header only) at ``dtype``."""
+    element_size = dtype.itemsize
     path = Path(checkpoint_path)
     total = 0
     with safetensors.safe_open(path, framework="pt", device="cpu") as handle:
@@ -235,7 +242,7 @@ def estimate_diffusion_decoder_weight_bytes(checkpoint_path: str | Path) -> int:
             n = 1
             for dim in shape:
                 n *= int(dim)
-            total += n * 2  # bf16
+            total += n * element_size
     return total
 
 
@@ -252,8 +259,13 @@ class VideoDecoderConfigurator(ModelConfigurator[VideoDecoder]):
 
 # Accept both monolithic ``vae.*`` prefixes and Comfy-split bare ``encoder.*`` /
 # ``decoder.*`` keys (standalone video VAE files under ``vae/``).
+# LTX-2.0 checkpoints also store latent statistics the VAE does not own; only mean-of-means and std-of-means bind.
+_UNUSED_LATENT_STATISTICS = (
+    "per_channel_statistics.channel",
+    "per_channel_statistics.mean-of-stds",
+)
 VAE_DECODER_COMFY_KEYS_FILTER = (
-    SDOps("VAE_DECODER_COMFY_KEYS_FILTER")
+    SDOps("VAE_DECODER_COMFY_KEYS_FILTER", excluded_prefixes=_UNUSED_LATENT_STATISTICS)
     .with_matching(prefix="vae.decoder.")
     .with_matching(prefix="vae.per_channel_statistics.")
     .with_matching(prefix="decoder.")
@@ -265,7 +277,7 @@ VAE_DECODER_COMFY_KEYS_FILTER = (
 )
 
 VAE_ENCODER_COMFY_KEYS_FILTER = (
-    SDOps("VAE_ENCODER_COMFY_KEYS_FILTER")
+    SDOps("VAE_ENCODER_COMFY_KEYS_FILTER", excluded_prefixes=_UNUSED_LATENT_STATISTICS)
     .with_matching(prefix="vae.encoder.")
     .with_matching(prefix="vae.per_channel_statistics.")
     .with_matching(prefix="encoder.")
@@ -276,213 +288,159 @@ VAE_ENCODER_COMFY_KEYS_FILTER = (
 )
 
 
-def _split_fused_qkv_param(key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
-    """Split fused ``...qkv.weight`` / ``...qkv.bias`` into ``to_q`` / ``to_k`` / ``to_v``.
-    Checkpoints store a single Linear(dim, 3*dim) under ``qkv.{weight,bias}``;
-    ``QKVProjections`` owns three separate linears, so the loader rewrites keys here.
-    """
-    if value.shape[0] % 3 != 0:
-        msg = f"fused QKV param {key!r} leading dim {value.shape[0]} is not divisible by 3"
-        raise ValueError(msg)
-    d = value.shape[0] // 3
-    # key is "...qkv.weight" or "...qkv.bias"
-    leaf = "weight" if key.endswith(".weight") else "bias"
-    prefix = key[: -len(leaf)]  # "...qkv."
-    return [
-        KeyValueOperationResult(f"{prefix}to_q.{leaf}", value[:d].detach().clone()),
-        KeyValueOperationResult(f"{prefix}to_k.{leaf}", value[d : 2 * d].detach().clone()),
-        KeyValueOperationResult(f"{prefix}to_v.{leaf}", value[2 * d :].detach().clone()),
-    ]
-
-
-_RAW_DIFFUSION_DECODER_PREFIX = "vae.decoder."
-_BARE_DIFFUSION_DECODER_PREFIX = "decoder."
-_K_NORM_SUFFIX = ".attn.k_norm.weight"
-_CONTEXT_PROJ_WEIGHT_SUFFIX = ".context_proj.weight"
-_CONTEXT_PROJ_BIAS_SUFFIX = ".context_proj.bias"
+_DIFFUSION_DECODER_PREFIXES = ("vae.decoder.", "decoder.")
+# Linear weight leaf -> sibling gate folded into it (W <- g * W, b <- g * b).
+_GATE_FOLD_TARGETS = (
+    (".attn.proj.weight", ".gate_msa"),
+    (".mlp.w_down.weight", ".gate_mlp"),
+    (".context_proj.weight", ".gate_ctx"),
+)
 _TYPE_EMB_KEY = "type_emb"
 _CONV_IN_WEIGHT_KEY = "conv_in.weight"
 _UPSAMPLE3_WEIGHT_KEY = "upsamples.3.proj.weight"
 _UPSAMPLE3_BIAS_KEY = "upsamples.3.proj.bias"
-_GATE_PARAM_SUFFIXES = (".gate_msa", ".gate_mlp", ".gate_ctx")
-# Post-rename Linear leaf → sibling gate key suffix (folded W←g·W, b←g·b).
-_GATE_FOLD_TARGETS: tuple[tuple[str, str], ...] = (
-    (".attn.proj.weight", ".gate_msa"),
-    (".attn.proj.bias", ".gate_msa"),
-    (".mlp.w_down.weight", ".gate_mlp"),
-    (".mlp.w_down.bias", ".gate_mlp"),
-    (".context_proj.weight", ".gate_ctx"),
-    (".context_proj.bias", ".gate_ctx"),
-)
+_CONTEXT_PROJ_WEIGHT_SUFFIX = ".context_proj.weight"
+_CONTEXT_PROJ_BIAS_SUFFIX = ".context_proj.bias"
+_K_NORM_SUFFIX = ".attn.k_norm.weight"
 
 
 def _strip_diffusion_decoder_prefix(key: str) -> str | None:
-    """Strip ``vae.decoder.`` or bare ``decoder.``; return None if neither matches."""
-    if key.startswith(_RAW_DIFFUSION_DECODER_PREFIX):
-        return key.removeprefix(_RAW_DIFFUSION_DECODER_PREFIX)
-    if key.startswith(_BARE_DIFFUSION_DECODER_PREFIX):
-        return key.removeprefix(_BARE_DIFFUSION_DECODER_PREFIX)
+    """Strip ``vae.decoder.`` or bare ``decoder.``; keep channel statistics; None for other keys."""
+    for prefix in _DIFFUSION_DECODER_PREFIXES:
+        if key.startswith(prefix):
+            return key.removeprefix(prefix)
+    if key.startswith("vae.per_channel_statistics."):
+        return key.removeprefix("vae.")
+    if key.startswith("per_channel_statistics."):
+        return key
     return None
 
 
-def _read_diff_vae_gates(checkpoint_path: str | Path) -> dict[str, torch.Tensor]:
-    """Return ``{post_rename_gate_key: tensor}`` for every DiffVAE ``gate_*``.
-    Keys are stripped of ``vae.decoder.`` / bare ``decoder.`` so they match the
-    names the loader passes to kv-ops after SDOps rename. Streaming load is
-    one-key-at-a-time, so siblings must be pre-read before fold ops run (same
-    pattern as ``_read_scales`` / ``_build_prequant_fold_sd_ops`` in fp8_cast).
-    """
-    out: dict[str, torch.Tensor] = {}
-    with safetensors.safe_open(str(checkpoint_path), framework="pt", device="cpu") as handle:
-        for key in handle.keys():  # noqa: SIM118
-            stripped = _strip_diffusion_decoder_prefix(key)
-            if stripped is None or not key.endswith(_GATE_PARAM_SUFFIXES):
-                continue
-            out[stripped] = handle.get_tensor(key)
-    return out
-
-
-def _drop_coarse_param(_key: str, _value: torch.Tensor) -> list[KeyValueOperationResult]:
-    """Drop bundled DiffVAE preview/coarse head weights (``coarse_*``)."""
-    return []
-
-
-def _gate_key_for_fold_target(param_key: str) -> str | None:
-    for leaf, gate_suffix in _GATE_FOLD_TARGETS:
-        if param_key.endswith(leaf):
-            return param_key[: -len(leaf)] + gate_suffix
-    return None
-
-
-def _fold_gate_into_linear(
-    param_key: str, value: torch.Tensor, gates: dict[str, torch.Tensor]
-) -> list[KeyValueOperationResult]:
-    """Fold a static gate into a Linear weight/bias when present; else pass through."""
-    gate_key = _gate_key_for_fold_target(param_key)
-    if gate_key is None:
-        return [KeyValueOperationResult(param_key, value)]
-    gate = gates.get(gate_key)
-    if gate is None:
-        return [KeyValueOperationResult(param_key, value)]
-    gate_f = gate.to(device=value.device, dtype=torch.float32)
-    value_f = value.to(dtype=torch.float32)
-    if value.ndim == 2:
-        folded = gate_f.unsqueeze(1) * value_f
-    elif value.ndim == 1:
-        folded = gate_f * value_f
-    else:
-        raise ValueError(f"Unsupported param rank {value.ndim} for gate fold on {param_key}")
-    return [KeyValueOperationResult(param_key, folded.to(dtype=value.dtype))]
-
-
-def _build_diffusion_vae_decoder_sd_ops(
-    gates: dict[str, torch.Tensor],
-    *,
-    stage4_hop: "_Stage4Hop | None" = None,
-) -> SDOps:
-    """DiffVAE decoder SDOps: rename, QKV split, coarse drop, gate fold/drop.
-    *gates* is keyed by post-rename gate param names (see ``_read_diff_vae_gates``).
-    Empty map (bundled n1 / QKV unit tests): fold is a no-op; drop never fires.
-    *stage4_hop* additionally packs the stage-4 upsample into every block's
-    ``context_proj``, which is what lets the fused CuTe DSL block read stage-4 directly.
-    """
-
-    def _drop_gate(gate_key: str, _value: torch.Tensor) -> list[KeyValueOperationResult]:
-        if gate_key not in gates:
-            raise ValueError(
-                f"Gate key {gate_key!r} has no matching entry in the pre-read gates dict; "
-                f"_read_diff_vae_gates and the loader's rename map have drifted"
-            )
-        return []
-
-    def _on_attn_proj(param_key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
-        return _fold_gate_into_linear(param_key, value, gates)
-
-    def _on_mlp_w_down(param_key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
-        return _fold_gate_into_linear(param_key, value, gates)
-
-    def _on_context_proj(param_key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
-        return _fold_gate_into_linear(param_key, value, gates)
-
-    def _on_context_proj_weight(param_key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
-        folded = _fold_gate_into_linear(param_key, value, gates)
-        if stage4_hop is None:
-            return folded
-        return folded + stage4_hop.fused_results(param_key, folded[0].new_value, gates)
-
-    # Drop/fold ops before QKV split so first-match kv-ops never mis-route.
-    # Match both monolith ``vae.decoder.*`` and Comfy-split bare ``decoder.*``.
+def _diffusion_prefix_stage() -> SDOps:
+    """Normalize monolith ``vae.decoder.*`` and Comfy-split bare ``decoder.*`` keys."""
     return (
-        SDOps("DIFFUSION_VAE_DECODER_COMFY_KEYS_FILTER")
+        SDOps("diffvae-prefix")
         .with_matching(prefix="vae.decoder.")
         .with_matching(prefix="decoder.")
-        .with_replacement("vae.decoder.", "")
-        .with_replacement("decoder.", "")
-        .with_replacement("t_embedder.mlp.0.", "t_embedder.timestep_embedder.linear_1.")
-        .with_replacement("t_embedder.mlp.2.", "t_embedder.timestep_embedder.linear_2.")
         .with_matching(prefix="vae.per_channel_statistics.")
         .with_matching(prefix="per_channel_statistics.")
+        .with_replacement("vae.decoder.", "")
+        .with_replacement("decoder.", "")
         .with_replacement("vae.per_channel_statistics.", "per_channel_statistics.")
-        .with_kv_operation(operation=_drop_coarse_param, key_prefix="coarse_")
-        .with_kv_operation(operation=_drop_gate, key_suffix=".gate_msa")
-        .with_kv_operation(operation=_drop_gate, key_suffix=".gate_mlp")
-        .with_kv_operation(operation=_drop_gate, key_suffix=".gate_ctx")
-        .with_kv_operation(operation=_on_attn_proj, key_suffix=".attn.proj.weight")
-        .with_kv_operation(operation=_on_attn_proj, key_suffix=".attn.proj.bias")
-        .with_kv_operation(operation=_on_mlp_w_down, key_suffix=".mlp.w_down.weight")
-        .with_kv_operation(operation=_on_mlp_w_down, key_suffix=".mlp.w_down.bias")
-        .with_kv_operation(operation=_on_context_proj_weight, key_suffix=".context_proj.weight")
-        .with_kv_operation(operation=_on_context_proj, key_suffix=".context_proj.bias")
-        .with_kv_operation(operation=_split_fused_qkv_param, key_suffix=".qkv.weight")
-        .with_kv_operation(operation=_split_fused_qkv_param, key_suffix=".qkv.bias")
+        .with_replacement("t_embedder.mlp.0.", "t_embedder.timestep_embedder.linear_1.")
+        .with_replacement("t_embedder.mlp.2.", "t_embedder.timestep_embedder.linear_2.")
     )
 
 
-# Empty-gate build: QKV/t_embedder/coarse SDOps for unit tests. Weight loading of
-# gated (standalone distilled) checkpoints must use ``video_decoder_sd_ops_for_checkpoint``.
-DIFFUSION_VAE_DECODER_COMFY_KEYS_FILTER = _build_diffusion_vae_decoder_sd_ops({})
+def _split_fused_qkv(key: str, inputs: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Split fused ``...qkv.weight`` / ``...qkv.bias`` into the ``to_q`` / ``to_k`` / ``to_v`` linears."""
+    value = inputs[key]
+    if value.shape[0] % 3:
+        raise ValueError(f"fused QKV {key!r} leading dimension is not divisible by 3")
+    leaf = "weight" if key.endswith(".weight") else "bias"
+    width = value.shape[0] // 3
+    prefix = key[: -len(leaf)]
+    return {
+        f"{prefix}to_{part}.{leaf}": chunk.detach().clone()
+        for part, chunk in zip(("q", "k", "v"), value.split(width, dim=0), strict=True)
+    }
 
 
-def _checkpoint_has_type_emb(checkpoint_path: str | Path) -> bool:
-    """Whether the checkpoint carries the keyframe ``type_emb`` tag."""
-    with safetensors.safe_open(str(checkpoint_path), framework="pt", device="cpu") as handle:
-        return any(_strip_diffusion_decoder_prefix(key) == _TYPE_EMB_KEY for key in handle.keys())  # noqa: SIM118
+def _drop(_key: str, _inputs: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {}
 
 
-def _emit_zero_type_emb(param_key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
+def _diffusion_qkv_and_coarse_stage() -> SDOps:
+    """Split fused QKV tensors and drop the bundled preview/coarse head (``coarse_*``)."""
+    return (
+        SDOps("diffvae-qkv-and-coarse")
+        .with_kv_operation(_drop, key_prefix="coarse_")
+        .with_kv_operation(_split_fused_qkv, key_suffix=".qkv.weight")
+        .with_kv_operation(_split_fused_qkv, key_suffix=".qkv.bias")
+    )
+
+
+def _fold_gate(weight_key: str, inputs: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Fold a static gate into its Linear weight and bias, consuming the gate; pass through without one."""
+    weight = inputs[weight_key]
+    suffix, gate_suffix = next((pair for pair in _GATE_FOLD_TARGETS if weight_key.endswith(pair[0])), (None, None))
+    if suffix is None or gate_suffix is None:
+        raise ValueError(f"unsupported gate-fold target: {weight_key!r}")
+    gate_key = weight_key.removesuffix(suffix) + gate_suffix
+    bias_key = weight_key.removesuffix(".weight") + ".bias"
+    gate = inputs.get(gate_key)
+    bias = inputs.get(bias_key)
+    if gate is None:
+        return dict(inputs)
+    if gate.ndim != 1 or gate.shape[0] != weight.shape[0]:
+        raise ValueError(f"gate {gate_key!r} disagrees with {weight_key!r}")
+    folded = (weight.float() * gate.float().unsqueeze(1)).to(weight.dtype)
+    result = {weight_key: folded}
+    if bias is not None:
+        if bias.shape != gate.shape:
+            raise ValueError(f"gate {gate_key!r} disagrees with {bias_key!r}")
+        result[bias_key] = (bias.float() * gate.float()).to(bias.dtype)
+    return result
+
+
+def _diffusion_gate_fold_stage() -> SDOps:
+    """Fold standalone distilled checkpoints' gates so they load into the ungated ``DiffusionNABlock``."""
+    stage = SDOps("diffvae-gate-fold")
+    for suffix, gate_suffix in _GATE_FOLD_TARGETS:
+        auxiliary_key_specs = (
+            (KeyMatching(suffix=suffix), KeyReplacement(suffix, gate_suffix)),
+            (KeyMatching(suffix=".weight"), KeyReplacement(".weight", ".bias")),
+        )
+        stage = stage.with_kv_operation(
+            KeyValueOperation(_fold_gate, auxiliary_key_specs=auxiliary_key_specs), key_suffix=suffix
+        )
+    return stage
+
+
+def _emit_zero_type_emb(key: str, inputs: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Pass ``conv_in.weight`` through and synthesize a zero ``type_emb`` beside it.
     ``type_emb`` is registered unconditionally on the decoder but only exists in
-    keyframe-trained checkpoints. The loader does a non-strict ``assign=True`` load onto a
-    meta model, so a missing parameter would stay on the meta device -- and
-    ``_check_uninitialized`` then returns the whole decoder still on meta, breaking every
-    pre-keyframe checkpoint. Synthesizing zeros here keeps those checkpoints loadable and
-    is exactly the no-op the tag has when untrained (it is added to the keyframe latents,
+    keyframe-trained checkpoints. Zeros keep pre-keyframe checkpoints loadable and are
+    exactly the no-op the tag has when untrained (it is added to the keyframe latents,
     and zero means "no tag"). Attached to ``conv_in.weight`` because it always exists and
     its ``(out, in)`` shape carries the latent width.
     """
-    return [
-        KeyValueOperationResult(param_key, value),
-        KeyValueOperationResult(_TYPE_EMB_KEY, torch.zeros(value.shape[1], dtype=value.dtype)),
-    ]
+    value = inputs[key]
+    return {key: value, _TYPE_EMB_KEY: torch.zeros(value.shape[1], dtype=value.dtype, device=value.device)}
 
 
-def _emit_na_softmax_bound(param_key: str, value: torch.Tensor) -> list[KeyValueOperationResult]:
+def _diffusion_type_emb_stage() -> SDOps:
+    return SDOps("diffvae-zero-type-emb").with_kv_operation(_emit_zero_type_emb, key_suffix=_CONV_IN_WEIGHT_KEY)
+
+
+def _softmax_row_bound(value: torch.Tensor) -> torch.Tensor:
+    from ltx_kernels.vae import softmax_row_bound  # noqa: PLC0415
+
+    return softmax_row_bound(value)
+
+
+def _emit_na_softmax_bound(key: str, inputs: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Pass ``attn.k_norm.weight`` through and emit the DSL kernel's softmax bound beside it.
     The CuTe DSL neighborhood-attention kernel replaces the online row max with a fixed
     per-row offset built from ``sqrt(head_dim) * max|k_norm.weight|``. Deriving it here
     means it is computed once, during load, into the buffer
     ``DiffVAEMode.BLACKWELL_DSL`` registered -- rather than per forward, where reading it
     off the weight would be a device-to-host sync inside a compiled region.
-    The extra key is harmless when the kernel is not in use: loading is not strict, so
-    a model without the buffer ignores it.
     """
-    from ltx_kernels.vae import softmax_row_bound  # noqa: PLC0415
+    value = inputs[key]
+    bound_key = key.removesuffix(_K_NORM_SUFFIX) + f".attn.{NA_SOFTMAX_BOUND_BUFFER}"
+    return {key: value, bound_key: _softmax_row_bound(value)}
 
-    bound_key = param_key.removesuffix(_K_NORM_SUFFIX) + f".attn.{NA_SOFTMAX_BOUND_BUFFER}"
-    return [
-        KeyValueOperationResult(param_key, value),
-        KeyValueOperationResult(bound_key, softmax_row_bound(value)),
-    ]
+
+def _abstract_na_softmax_bound(key: str, inputs: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    bound_key = key.removesuffix(_K_NORM_SUFFIX) + f".attn.{NA_SOFTMAX_BOUND_BUFFER}"
+    return {key: inputs[key], bound_key: torch.empty((), dtype=torch.float32, device="meta")}
+
+
+def _diffusion_softmax_bound_stage() -> SDOps:
+    return SDOps("diffvae-na-softmax-bound").with_kv_operation(
+        KeyValueOperation(_emit_na_softmax_bound, _abstract_na_softmax_bound), key_suffix=_K_NORM_SUFFIX
+    )
 
 
 def pack_fused_upsample_ctx_weights(
@@ -501,74 +459,64 @@ def pack_fused_upsample_ctx_weights(
     return pack_fused_ctx_weights(w_upsample, b_upsample, w_ctx, b_ctx)
 
 
-@dataclasses.dataclass(frozen=True)
-class _Stage4Hop:
-    """``upsamples[3].proj`` and every ``context_proj.bias``, pre-read from a checkpoint.
-    The fused weight a block needs is built from three tensors that arrive at three
-    different keys, and a streaming load sees one key at a time -- so the two the
-    ``context_proj.weight`` op cannot wait for are read up front. The upsample is one
-    tensor for the whole decoder; the biases are one small vector per block. (Same
-    pattern as :func:`_read_diff_vae_gates`, which pre-reads the gates for the fold.)
-    """
+def _stage4_fusion(context_keys: tuple[str, ...]) -> KeyValueOperation:
+    """Pack ``upsamples.3.proj`` into every gate-folded ``context_proj`` the fused DSL block reads."""
 
-    upsample_weight: torch.Tensor
-    upsample_bias: torch.Tensor
-    context_biases: dict[str, torch.Tensor]  # post-rename ``....context_proj.bias``
+    def outputs(tensors: Mapping[str, torch.Tensor], fuse: bool) -> dict[str, torch.Tensor]:
+        if _UPSAMPLE3_BIAS_KEY not in tensors:
+            raise ValueError(f"stage-4 fusion needs {_UPSAMPLE3_BIAS_KEY}")
+        result = dict(tensors)
+        for weight_key in (key for key in context_keys if key.endswith(_CONTEXT_PROJ_WEIGHT_SUFFIX)):
+            bias_key = weight_key.removesuffix(".weight") + ".bias"
+            if bias_key not in tensors:
+                raise ValueError(f"stage-4 fusion needs {bias_key!r}")
+            prefix = weight_key.removesuffix(_CONTEXT_PROJ_WEIGHT_SUFFIX)
+            if fuse:
+                weight, bias = pack_fused_upsample_ctx_weights(
+                    tensors[_UPSAMPLE3_WEIGHT_KEY], tensors[_UPSAMPLE3_BIAS_KEY], tensors[weight_key], tensors[bias_key]
+                )
+            else:
+                weight = torch.empty(
+                    tensors[_UPSAMPLE3_WEIGHT_KEY].shape, dtype=tensors[weight_key].dtype, device="meta"
+                )
+                bias = torch.empty(tensors[_UPSAMPLE3_BIAS_KEY].shape, dtype=tensors[bias_key].dtype, device="meta")
+            result[f"{prefix}.{FUSED_CTX_WEIGHT_BUFFER}"] = weight
+            result[f"{prefix}.{FUSED_CTX_BIAS_BUFFER}"] = bias
+        return result
 
-    @classmethod
-    def read(cls, checkpoint_path: str | Path) -> "_Stage4Hop":
-        upsample_weight = upsample_bias = None
-        context_biases: dict[str, torch.Tensor] = {}
-        with safetensors.safe_open(str(checkpoint_path), framework="pt", device="cpu") as handle:
-            for key in handle.keys():  # noqa: SIM118
-                short = _strip_diffusion_decoder_prefix(key)
-                if short is None:
-                    continue
-                if short == _UPSAMPLE3_WEIGHT_KEY:
-                    upsample_weight = handle.get_tensor(key)
-                elif short == _UPSAMPLE3_BIAS_KEY:
-                    upsample_bias = handle.get_tensor(key)
-                elif short.endswith(_CONTEXT_PROJ_BIAS_SUFFIX):
-                    context_biases[short] = handle.get_tensor(key)
-        if upsample_weight is None or upsample_bias is None:
-            raise ValueError(
-                f"DiffVAE checkpoint {checkpoint_path!r} has no {_UPSAMPLE3_WEIGHT_KEY}, which "
-                "na_dsl_kernel needs to fuse the stage-4 hop into context_proj"
-            )
-        return cls(upsample_weight, upsample_bias, context_biases)
+    return KeyValueOperation(
+        lambda _key, tensors: outputs(tensors, fuse=True),
+        lambda _key, tensors: outputs(tensors, fuse=False),
+        auxiliary_key_specs=(_UPSAMPLE3_BIAS_KEY, *context_keys),
+    )
 
-    def fused_results(
-        self, weight_key: str, folded_weight: torch.Tensor, gates: dict[str, torch.Tensor]
-    ) -> list[KeyValueOperationResult]:
-        """The two fused buffers for the block owning ``weight_key``.
-        ``folded_weight`` is that block's already gate-folded ``context_proj.weight``; the
-        bias gets the same fold here, so the packed pair carries ``gate_ctx`` exactly once
-        and matches what the unfused ``context_proj`` would have computed.
-        """
-        prefix = weight_key.removesuffix(_CONTEXT_PROJ_WEIGHT_SUFFIX)
-        bias_key = prefix + _CONTEXT_PROJ_BIAS_SUFFIX
-        raw_bias = self.context_biases.get(bias_key)
-        if raw_bias is None:
-            raise ValueError(f"No pre-read {bias_key!r} to fuse alongside {weight_key!r}")
-        folded_bias = _fold_gate_into_linear(bias_key, raw_bias, gates)[0].new_value
-        weight, bias = pack_fused_upsample_ctx_weights(
-            self.upsample_weight, self.upsample_bias, folded_weight, folded_bias
-        )
-        return [
-            KeyValueOperationResult(f"{prefix}.{FUSED_CTX_WEIGHT_BUFFER}", weight),
-            KeyValueOperationResult(f"{prefix}.{FUSED_CTX_BIAS_BUFFER}", bias),
-        ]
+
+def _diffusion_stage4_fusion_stage(context_keys: tuple[str, ...]) -> SDOps:
+    """Name the fusion by its context key set, which the checkpoint header selects."""
+    digest = sha256("\0".join(context_keys).encode()).hexdigest()[:12]
+    return SDOps(f"diffvae-stage4-fusion:{digest}").with_kv_operation(
+        _stage4_fusion(context_keys), key_suffix=_UPSAMPLE3_WEIGHT_KEY
+    )
+
+
+# Header-independent DiffVAE decoder stages: prefixes, QKV split, coarse drop and gate fold.
+# ``video_decoder_sd_ops_for_checkpoint`` adds what a checkpoint's header calls for.
+DIFFUSION_VAE_DECODER_COMFY_KEYS_FILTER = (
+    _diffusion_prefix_stage(),
+    _diffusion_qkv_and_coarse_stage(),
+    _diffusion_gate_fold_stage(),
+)
 
 
 def video_decoder_sd_ops_for_checkpoint(
-    checkpoint_path: str,
+    checkpoint_path: str | Path,
     *,
     diffusion_vae: bool | None = None,
     na_dsl_kernel: bool = False,
-) -> SDOps:
-    """Pick decoder SDOps from checkpoint metadata (conv vs diffusion).
-    For diffusion VAEs, pre-reads ``gate_*`` and builds fold/drop ops so standalone
-    distilled checkpoints load into the ungated ``DiffusionNABlock``.
+) -> tuple[SDOps, ...]:
+    """Pick decoder SDOps stages from checkpoint metadata (conv vs diffusion).
+    For diffusion VAEs, the header selects the stages: a zero ``type_emb`` when the
+    checkpoint has none, and every gate must have its fold target.
     ``na_dsl_kernel`` additionally derives the CuTe DSL kernel's softmax bound from each
     ``k_norm`` weight and fuses ``upsamples[3]`` into every block's ``context_proj``, so
     the fused block reads stage-4 directly instead of a full-resolution context. Must be
@@ -579,16 +527,28 @@ def video_decoder_sd_ops_for_checkpoint(
     skip a second metadata open.
     """
     if diffusion_vae is None:
-        diffusion_vae = is_diffusion_video_vae(checkpoint_path)
+        diffusion_vae = is_diffusion_video_vae(str(checkpoint_path))
     if not diffusion_vae:
-        return VAE_DECODER_COMFY_KEYS_FILTER
-    gates = _read_diff_vae_gates(checkpoint_path)
+        return (VAE_DECODER_COMFY_KEYS_FILTER,)
+    with CheckpointReader.open((Path(checkpoint_path),)) as reader:
+        _, metadata = reader.scan()
+    keys = {short for key in metadata if (short := _strip_diffusion_decoder_prefix(key)) is not None}
+    for suffix, gate_suffix in _GATE_FOLD_TARGETS:
+        for gate in (key for key in keys if key.endswith(gate_suffix)):
+            target = gate.removesuffix(gate_suffix) + suffix
+            if target not in keys:
+                raise ValueError(f"gate {gate!r} has no fold target {target!r}")
+    stages = list(DIFFUSION_VAE_DECODER_COMFY_KEYS_FILTER)
+    if _TYPE_EMB_KEY not in keys:
+        stages.append(_diffusion_type_emb_stage())
     if na_dsl_kernel:
-        ops = _build_diffusion_vae_decoder_sd_ops(gates, stage4_hop=_Stage4Hop.read(checkpoint_path)).with_kv_operation(
-            operation=_emit_na_softmax_bound, key_suffix=_K_NORM_SUFFIX
+        if _UPSAMPLE3_WEIGHT_KEY not in keys or _UPSAMPLE3_BIAS_KEY not in keys:
+            raise ValueError(
+                f"DiffVAE checkpoint {checkpoint_path!r} has no {_UPSAMPLE3_WEIGHT_KEY} and bias, which "
+                "na_dsl_kernel needs to fuse the stage-4 hop into context_proj"
+            )
+        context = tuple(
+            sorted(key for key in keys if key.endswith((_CONTEXT_PROJ_WEIGHT_SUFFIX, _CONTEXT_PROJ_BIAS_SUFFIX)))
         )
-    else:
-        ops = _build_diffusion_vae_decoder_sd_ops(gates)
-    if not _checkpoint_has_type_emb(checkpoint_path):
-        ops = ops.with_kv_operation(operation=_emit_zero_type_emb, key_suffix=_CONV_IN_WEIGHT_KEY)
-    return ops
+        stages.extend((_diffusion_stage4_fusion_stage(context), _diffusion_softmax_bound_stage()))
+    return tuple(stages)

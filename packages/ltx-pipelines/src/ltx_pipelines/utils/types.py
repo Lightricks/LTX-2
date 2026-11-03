@@ -37,6 +37,19 @@ class PipelineOutput(NamedTuple):
 
 
 @dataclass(frozen=True)
+class EncodedAudio:
+    """Source audio loaded for a clip: its audio VAE latent and the waveform it was encoded from.
+    Attributes:
+        latent: Audio VAE latent cropped to the clip plus one frame, so every chunk's slice is filled.
+        source: Original waveform trimmed to the clip. Pipelines return it as the output
+            audio when no stage denoises ``latent``, instead of a lossy VAE decode.
+    """
+
+    latent: torch.Tensor
+    source: Audio
+
+
+@dataclass(frozen=True)
 class ImageReplace:
     """Pin a still by replacing the latent that starts at a pixel-frame index.
     ``frame_idx`` is zero-based on the decoded video timeline, not a latent index. Because the
@@ -280,6 +293,8 @@ class Denoiser(Protocol):
         audio_state: LatentState | None,
         sigmas: torch.Tensor,
         step_index: int,
+        v_context: torch.Tensor | None = None,
+        a_context: torch.Tensor | None = None,
     ) -> VideoAudio[DenoisedLatentResult]: ...
 
 

@@ -13,6 +13,13 @@ class DisposableProtocol(Protocol):
     def dispose(self) -> None: ...
 
 
+@runtime_checkable
+class TrimCachedWeights(Protocol):
+    """Release builder-owned weight storage when the caller requests allocator trimming."""
+
+    def trim_cached_weights(self) -> None: ...
+
+
 class Disposable(DisposableProtocol):
     """Mixin providing :meth:`dispose`; use as ``class Foo(nn.Module, Disposable)``."""
 
