@@ -35,7 +35,7 @@ guide = ImageConditioningInput.guide("guide.png", frame_idx=80, strength=0.8)
 
 ## HDR / EXR Conditioning
 
-Standard pipelines accept OpenEXR stills (`.exr`) and EXR-frame folders as image / video conditioning when you pass `--hdr {SRGB_LINEAR,ACESCG,ACESCCT}` to declare the source colour space. HDR runs decode to half-float EXR frames plus a BT.2020/HLG master.
+Standard pipelines accept OpenEXR stills (`.exr`) and EXR-frame folders as image / video conditioning when you pass `--hdr {SRGB_LINEAR,ACESCG,ACESCCT,ACES2065_1}` to declare the source colour space. HDR runs decode to half-float EXR frames plus a BT.2020/HLG master.
 
 See [HDR Support](hdr.md) for colour-space semantics, CLI constraints (no EXR/SDR mix, retake `--frame-rate` rules), and examples.
 ## Generated Keyframe Slots

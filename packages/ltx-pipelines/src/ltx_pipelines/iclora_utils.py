@@ -143,7 +143,8 @@ def append_ic_lora_reference_video_conditionings(  # noqa: PLR0912, PLR0913
         if is_exr_dir(video_path):
             if color_space is None:
                 raise ValueError(
-                    "EXR input requires --hdr {SRGB_LINEAR,ACESCG,ACESCCT} to declare the source colour space."
+                    "EXR input requires --hdr {SRGB_LINEAR,ACESCG,ACESCCT,ACES2065_1} "
+                    "to declare the source colour space."
                 )
             video = torch.cat(
                 list(

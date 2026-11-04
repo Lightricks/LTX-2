@@ -277,7 +277,7 @@ def video_latent_from_file(
     if is_exr_dir(file_path):
         if color_space is None:
             raise ValueError(
-                "EXR input requires --hdr {SRGB_LINEAR,ACESCG,ACESCCT} to declare the source colour space."
+                "EXR input requires --hdr {SRGB_LINEAR,ACESCG,ACESCCT,ACES2065_1} to declare the source colour space."
             )
         # Center-crop matches the SDR video_preprocess path used for mp4 inputs.
         frame_start = round(start_time * fps)

@@ -70,8 +70,11 @@ def to_hdr_linear(
     out_primaries: Primaries = Primaries.REC709,
 ) -> Tensor:
     """Decompress ACEScct [0, 1] to scene-linear HDR in ``out_primaries``."""
-    linear_acescg = _decompress(working.float())
-    return Primaries.AP1.to(out_primaries, linear_acescg).clamp(min=0.0)
+    linear_acescg = _decompress(working.float()).clamp(min=0.0)
+    out = Primaries.AP1.to(out_primaries, linear_acescg)
+    if out_primaries is Primaries.AP0:
+        return out
+    return out.clamp(min=0.0)
 
 
 def srgb_eotf_to_linear(srgb: Tensor) -> Tensor:

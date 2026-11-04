@@ -1,6 +1,6 @@
 [project]
 name = "ltx-pipelines"
-version = "1.6.0"
+version = "1.6.1"
 description = "Pipelines implementation for Lightricks' LTX-2 model"
 readme = "README.md"
 license = "Apache-2.0"

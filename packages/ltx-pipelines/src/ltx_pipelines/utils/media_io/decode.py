@@ -52,7 +52,9 @@ _INT_FORMAT_MAX: dict[str, float] = {
 }
 
 
-_EXR_NEEDS_COLOR_SPACE = "EXR input requires --hdr {SRGB_LINEAR,ACESCG,ACESCCT} to declare the source colour space."
+_EXR_NEEDS_COLOR_SPACE = (
+    "EXR input requires --hdr {SRGB_LINEAR,ACESCG,ACESCCT,ACES2065_1} to declare the source colour space."
+)
 
 
 def load_image_and_preprocess(

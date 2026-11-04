@@ -11,7 +11,7 @@ Do you have an audio file to drive generation?
 │
 Do you need HDR / EXR I/O?
 ├─ YES → Do you have EXR stills or EXR-frame folders for a standard pipeline?
-│  ├─ YES → Use Distilled / TI2V / Retake / IC-LoRA with `--hdr {SRGB_LINEAR,ACESCG,ACESCCT}`
+│  ├─ YES → Use Distilled / TI2V / Retake / IC-LoRA with `--hdr {SRGB_LINEAR,ACESCG,ACESCCT,ACES2065_1}`
 │  │         (see [HDR Support](hdr.md); EXR + BT.2020/HLG output)
 │  └─ NO → Use HDRICLoraPipeline (SDR video → ACEScct HDR; HLG master + EXR)
 │

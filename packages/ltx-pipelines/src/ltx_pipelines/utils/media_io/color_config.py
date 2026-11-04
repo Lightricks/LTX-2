@@ -19,6 +19,7 @@ class EXRColorSpace(enum.Enum):
     SRGB_LINEAR = "srgb_linear"
     ACESCG = "acescg"
     ACESCCT = "acescct"
+    ACES2065_1 = "aces2065-1"
 
     @property
     def is_log_working(self) -> bool:
@@ -26,11 +27,18 @@ class EXRColorSpace(enum.Enum):
         return self is EXRColorSpace.ACESCCT
 
     @property
+    def is_aces_container(self) -> bool:
+        """True when frames should be written as a SMPTE ST 2065-4 ACES container."""
+        return self is EXRColorSpace.ACES2065_1
+
+    @property
     def source_primaries(self) -> Primaries:
         match self:
             case EXRColorSpace.ACESCG | EXRColorSpace.ACESCCT:
                 return Primaries.AP1
-            case _:
+            case EXRColorSpace.ACES2065_1:
+                return Primaries.AP0
+            case EXRColorSpace.SRGB_LINEAR:
                 return Primaries.REC709
 
 
@@ -80,7 +88,9 @@ def resolve_hdr_color_space(
     ``None`` means SDR.
     """
     if _has_exr_input(images, video_paths) and hdr is None:
-        raise ValueError("EXR input requires --hdr {SRGB_LINEAR,ACESCG,ACESCCT} to declare the source colour space.")
+        raise ValueError(
+            "EXR input requires --hdr {SRGB_LINEAR,ACESCG,ACESCCT,ACES2065_1} to declare the source colour space."
+        )
     return hdr
 
 

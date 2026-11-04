@@ -199,11 +199,11 @@ Seam keyframes are on by default. Pass `--no-keyframes` for plain IC-LoRA. When 
 
 Native EXR `--hdr` conditioning on the other pipelines is a separate path; see [HDR Support](hdr.md).
 
-**Extra CLI arguments:** `--input` (required), `--output-path` (required), `--exr-colorspace` (`acescg` / `acescct` / `srgb_linear`; default `acescg`), `--hdr-lora` (required), `--text-embeddings` (required), `--distilled-checkpoint-path` or `--transformer-path`, `--video-vae-path` (needed with keyframes, the default), `--input-colorspace`, `--frame-rate` (EXR directories only), `--seed`, `--high-quality`, `--offload`, `--no-quantization`, `--diffvae-optimization`, `--no-keyframes`, `--keyframe-strength`.
+**Extra CLI arguments:** `--input` (required), `--output-path` (required), `--exr-colorspace` (`acescg` / `acescct` / `srgb_linear` / `aces2065-1`; default `acescg`), `--hdr-lora` (required), `--text-embeddings` (required), `--distilled-checkpoint-path` or `--transformer-path`, `--video-vae-path` (needed with keyframes, the default), `--input-colorspace`, `--frame-rate` (EXR directories only), `--seed`, `--high-quality`, `--offload`, `--no-quantization`, `--diffvae-optimization`, `--no-keyframes`, `--keyframe-strength`.
 
 **Constraints:** Source frame count must be 8k+1. `--frame-rate` is required for EXR folders and must not be set for MP4/MOV.
 
-**Use when:** You need ACEScct HDR from an SDR video (or linear Rec.709 / ACEScg / ACEScct EXR folder) for HLG masters and EXR grading.
+**Use when:** You need ACEScct HDR from an SDR video (or linear Rec.709 / ACEScg / ACEScct / ACES2065-1 EXR folder) for HLG masters and EXR grading.
 
 ---
 

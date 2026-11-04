@@ -37,6 +37,7 @@ class ExrSequenceWriter:
             raise RuntimeError("EXR writer is already finished")
         primaries = color_space.source_primaries
         colorspace_tag = exr_colorspace_tag(color_space)
+        aces_container = color_space.is_aces_container
         for frame in _to_exr_space(video, color_space):
             frame_path = self._staging / f"frame_{self._frame_index:05d}.exr"
             self._pending.append(
@@ -47,6 +48,7 @@ class ExrSequenceWriter:
                     True,
                     primaries,
                     colorspace_tag,
+                    aces_container=aces_container,
                 )
             )
             self._frame_index += 1

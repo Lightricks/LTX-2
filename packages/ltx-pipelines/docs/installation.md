@@ -86,6 +86,43 @@ Use `--help` with any pipeline module to see all available options and parameter
 
 For native EXR conditioning and HDR encode on the standard pipelines, see [HDR Support](hdr.md).
 
+## Calling pipelines from Python
+
+Pipelines are importable classes as well as CLI modules. The CLI `main()` functions run under
+`torch.inference_mode()`; pipeline `__call__` methods do not, so a pipeline can also run inside a
+training loop that records gradients. For inference from Python, wrap the whole call, including
+prompt encoding, in `torch.inference_mode()`:
+
+```python
+import torch
+
+from ltx_pipelines import DistilledPipeline
+from ltx_pipelines.utils.media_io import encode_video
+from ltx_pipelines.utils.model_paths import ModelPaths
+
+pipeline = DistilledPipeline(
+    model_paths=ModelPaths.from_monolith("path/to/distilled.safetensors", "path/to/gemma"),
+    spatial_upsampler_path="path/to/upsampler.safetensors",
+    loras=[],
+)
+with torch.inference_mode():
+    output = pipeline(
+        prompt="A beautiful sunset over the ocean",
+        seed=10,
+        height=512,
+        width=768,
+        frame_rate=24.0,
+        images=[],
+        num_frames=121,
+    )
+    encode_video(output.video, 24.0, output.audio, "output.mp4", video_chunks_number=None)
+```
+
+Without `torch.inference_mode()` (or `torch.no_grad()`), autograd records the forward passes:
+the text encoder's outputs keep a reference to the encoder and its activations after prompt
+encoding, which can hold tens of GiB of device memory and run out of memory later in the
+pipeline. `model.eval()` does not disable autograd.
+
 ## Common CLI flags
 
 These flags are shared across the pipeline CLIs (they come from a common base parser); run a module with `--help` for its full set.
@@ -97,7 +134,7 @@ These flags are shared across the pipeline CLIs (they come from a common base pa
 - `--compile [key=value ...]` - enable `torch.compile`. Bare `--compile` compiles without CUDA graphs. CUDA-graph modes (`capture=true`, `mode=reduce-overhead`, `mode=max-autotune`) need `--offload cpu` or `disk` on single GPU (streaming reuses GPU weight slots; a registry by itself does not). `capture=true` captures one graph per (shape, perturbation); `max_video_tokens` / `max_audio_tokens` size a shared **static input** pool so those graphs do not each allocate their own activation buffers. See [Compilation](optimization.md#compilation-torchcompile).
 - `--lora <path> [strength]` - apply a LoRA (repeatable; default strength 1.0).
 - `--enhance-prompt` - rewrite the prompt with the built-in enhancer before generation.
-- `--hdr {SRGB_LINEAR,ACESCG,ACESCCT}` - on pipelines that accept image / video conditioning (not Dub-It, HDR IC-LoRA, or T2A): declare the source colour space for EXR stills / EXR-frame folders. Required whenever any EXR input is passed; omit for SDR. With `--hdr` set, encode writes half EXR frames plus a BT.2020/HLG master. See [HDR Support](hdr.md).
+- `--hdr {SRGB_LINEAR,ACESCG,ACESCCT,ACES2065_1}` - on pipelines that accept image / video conditioning (not Dub-It, HDR IC-LoRA, or T2A): declare the source colour space for EXR stills / EXR-frame folders. Required whenever any EXR input is passed; omit for SDR. With `--hdr` set, encode writes half EXR frames plus a BT.2020/HLG master. See [HDR Support](hdr.md).
 - `--marker-root-path <dir>` - optional local `path/to/marking` pack for post-hoc VideoSeal (SDR pixels) and AudioSeal (stereo PCM). Requires `uv sync --extra videoseal --extra audioseal`. HDR encode skips video stamping and still stamps audio. See [VideoSeal marking](marking.md).
 - `--video-vae-path <path>` - video VAE `.safetensors` (encoder + decoder). Split: the `vae/` component. Monolith: optional override of the VAE bundled in `--checkpoint-path`/`--distilled-checkpoint-path`. When it is a diffusion VAE, decoding builds a `DiffusionVideoDecoder`, which for best performance requires the `natten` extra. See [Optimization Tips](optimization.md#diffusion-vae-decoder).
 - `--diffvae-optimization {chunked_eager,chunked_compile,combined_compile,blackwell_dsl}` - DiffVAE decode preset (ignored for convolutional VAEs). `blackwell_dsl` is the fast path on datacenter Blackwell.

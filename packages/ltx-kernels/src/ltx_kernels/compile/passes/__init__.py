@@ -11,7 +11,7 @@ from ltx_kernels.compile.passes.fuse_trailing_quantize import (
 from ltx_kernels.compile.passes.fused_send_recv import CoalescedExchangeBarrierPass, FusedSendRecvPass
 from ltx_kernels.compile.passes.gated_attention import GatedAttentionPass
 from ltx_kernels.compile.passes.grouped_upcast import GroupedUpcastPass
-from ltx_kernels.compile.passes.linear_gelu import LinearGELUPass
+from ltx_kernels.compile.passes.linear_gelu import LinearGELUNoBiasPass, LinearGELUPass
 from ltx_kernels.compile.passes.pre_attention import PreAttentionPass
 from ltx_kernels.compile.passes.rms_fma import RMSFmaAdaLNPass, RMSFmaPass
 from ltx_kernels.compile.passes.sdpa_select import SDPASelectPass
@@ -20,7 +20,8 @@ from ltx_kernels.compile.passes.sdpa_select import SDPASelectPass
 def inductor_passes() -> list[PassBase]:
     """The passes worth running when inductor compiles what is left.
     :class:`PreAttentionPass` + :class:`GatedAttentionPass` + :class:`LinearGELUPass`
-    is the fastest combination measured end to end; the passes :func:`eager_passes`
+    is the fastest combination measured end to end (:class:`LinearGELUNoBiasPass` is the
+    same fusion for bias-free FFNs, which LinearGELUPass cannot match); the passes :func:`eager_passes`
     adds cost more there than they save, alone and together, by cutting inductor's own
     fusion across the block. The quantize passes are inert unless
     ``ltx_core.quantization.blockwise`` installs the linears that emit
@@ -36,6 +37,7 @@ def inductor_passes() -> list[PassBase]:
         PreAttentionPass(hidden_dim=2048, heads=32, eps=1e-6),
         GatedAttentionPass(),
         LinearGELUPass(),
+        LinearGELUNoBiasPass(),
         FusedSendRecvPass(),
         CoalescedExchangeBarrierPass(),
         BlockwiseQuantizeCSE(),
@@ -76,6 +78,7 @@ __all__ = [
     "GatedAttentionPass",
     "GatedAttentionTrailingQuantizePass",
     "GroupedUpcastPass",
+    "LinearGELUNoBiasPass",
     "LinearGELUPass",
     "PreAttentionPass",
     "RMSFmaAdaLNPass",

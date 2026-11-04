@@ -8,13 +8,14 @@ For the separate video-to-video HDR IC-LoRA path (ACEScct SDR→HDR, optional DF
 
 ### Colour spaces
 
-CLI flag: `--hdr {SRGB_LINEAR,ACESCG,ACESCCT}` (enum [`EXRColorSpace`](../src/ltx_pipelines/utils/media_io/color_config.py)).
+CLI flag: `--hdr {SRGB_LINEAR,ACESCG,ACESCCT,ACES2065_1}` (enum [`EXRColorSpace`](../src/ltx_pipelines/utils/media_io/color_config.py)).
 
 | Value | Source meaning | Load behaviour |
 | ----- | -------------- | -------------- |
 | `SRGB_LINEAR` | Scene-linear Rec.709 / sRGB-tagged EXR | Compress to ACEScct for the VAE |
-| `ACESCG` | Scene-linear ACEScg EXR | Compress to ACEScct for the VAE |
+| `ACESCG` | Scene-linear ACEScg (AP1) EXR | Compress to ACEScct for the VAE |
 | `ACESCCT` | Already ACEScct log codes | Pass through (no load-time transfer) |
+| `ACES2065_1` | Scene-linear ACES2065-1 (AP0) EXR | Compress to ACEScct for the VAE |
 
 `None` (omitting `--hdr`) means SDR: ordinary image/video inputs and H.264 output.
 
@@ -30,7 +31,7 @@ CLI flag: `--hdr {SRGB_LINEAR,ACESCG,ACESCCT}` (enum [`EXRColorSpace`](../src/lt
 
 When `--hdr` is set, `encode_video` writes:
 
-- **EXR**: half-float frames under `<output_stem>_exr/frame_XXXXX.exr`, tagged to match the chosen colour space (linear or ACEScct log).
+- **EXR**: half-float frames under `<output_stem>_<color_space>_exr/frame_XXXXX.exr`, tagged to match the chosen colour space (linear or ACEScct log). `SRGB_LINEAR`, `ACESCG`, and `ACESCCT` use ZIP compression; `ACES2065_1` writes uncompressed SMPTE ST 2065-4 ACES containers (`compression="none"`, `acesImageContainerFlag=1`, `adoptedNeutral`).
 - **HLG master**: 10-bit BT.2020/HLG HEVC (`libx265`) at the `--output-path` (Rec.709 scene-linear → HLG).
 
 VAE decode runs in **float32** for HDR (SDR stays bf16).

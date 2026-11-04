@@ -34,6 +34,8 @@ def exr_colorspace_tag(color_space: EXRColorSpace) -> str:
             return "ACEScg"
         case EXRColorSpace.SRGB_LINEAR:
             return "sRGB"
+        case EXRColorSpace.ACES2065_1:
+            return "ACES2065-1"
 
 
 def is_exr_dir(path: str | Path) -> bool:
@@ -88,8 +90,8 @@ def load_exr_as_hdr_conditioning(
     """Load EXR still(s) as HDR conditioning for the VAE.
     ``path`` may be a single ``.exr`` or a directory of ``*.exr`` frames (sorted
     lexicographically). Colour handling follows ``color_space``:
-    * ``SRGB_LINEAR`` / ``ACESCG`` — compress via :func:`~ltx_core.hdr.to_acescct_working_space`
-      from the matching source primaries.
+    * ``SRGB_LINEAR`` / ``ACESCG`` / ``ACES2065_1`` — compress via
+      :func:`~ltx_core.hdr.to_acescct_working_space` from the matching source primaries.
     * ``ACESCCT`` — already working-space log codes; clamp then :func:`to_vae_range`
       (no transfer).
     Yields:
@@ -156,20 +158,31 @@ def save_exr_tensor(
     half: bool = True,
     primaries: Primaries = Primaries.REC709,
     color_space: str = "sRGB",
+    *,
+    aces_container: bool = False,
 ) -> None:
     """Save a single tensor frame as EXR, tagged with its colour space.
     Args:
         tensor: ``[H, W, C]`` or ``[C, H, W]`` float tensor.
         file_path: Output path (e.g. ``frame_0000.exr``).
-        half: Write float16 with ZIP compression (default True).
+        half: Write float16 (default True). ZIP compression is used unless
+            ``aces_container`` is True, which writes uncompressed half-float
+            per SMPTE ST 2065-4.
         primaries: Colour gamut for the ``chromaticities`` tag.
-        color_space: Value for the ``colorSpace`` tag, describing the transfer
-            encoding (e.g. ``"sRGB"``/``"ACEScg"`` for linear, ``"ACEScct"``/
-            ``"LogC3"`` for log).
+        color_space: Value for the ``colorSpace`` tag, describing the colour
+            space / transfer encoding (e.g. ``"sRGB"``/``"ACEScg"``/``"ACES2065-1"``
+            for linear, ``"ACEScct"``/``"LogC3"`` for log).
+        aces_container: Write SMPTE ST 2065-4 ACES container attributes
+            (``acesImageContainerFlag=1``, ``adoptedNeutral``, ``compression="none"``).
+            Requires ``half=True`` and ``primaries=Primaries.AP0``.
     """
+    if aces_container and primaries is not Primaries.AP0:
+        raise ValueError(f"ACES container (SMPTE ST 2065-4) requires Primaries.AP0; got {primaries!r}.")
     if tensor.dim() == 3 and tensor.shape[0] == 3:
         tensor = tensor.permute(1, 2, 0)
     use_half = half or tensor.dtype in (torch.float16, torch.half)
+    if aces_container and not use_half:
+        raise ValueError("ACES container (SMPTE ST 2065-4) requires 16-bit half-float (half=True).")
     img_np = np.ascontiguousarray(tensor.cpu().numpy().astype(np.float32))
     file_path = str(file_path)
 
@@ -177,9 +190,12 @@ def save_exr_tensor(
     fmt = OpenImageIO.HALF if use_half else OpenImageIO.FLOAT
     spec = OpenImageIO.ImageSpec(w, h, 3, fmt)
     spec.channelnames = ("R", "G", "B")
-    spec.attribute("compression", "zip")
+    spec.attribute("compression", "none" if aces_container else "zip")
     spec.attribute("chromaticities", "float[8]", primaries.exr_chromaticities)
     spec.attribute("colorSpace", color_space)
+    if aces_container:
+        spec.attribute("acesImageContainerFlag", 1)
+        spec.attribute("adoptedNeutral", OpenImageIO.TypeFloat2, primaries.whitepoint)
 
     out = OpenImageIO.ImageOutput.create(file_path)
     if out is None:

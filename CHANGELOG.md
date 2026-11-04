@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.6.1 - 2026-11-04
+
+### Added
+
+- `EXRColorSpace.ACES2065_1` (`aces2065-1` / `ACES2065_1`) and `Primaries.AP0` add SMPTE ST 2065-1 (AP0 linear, D60 whitepoint) input and output support on `--hdr`, `--exr-colorspace`, and `--input-colorspace`. `ACES2065-1` EXR outputs are written to `<stem>_aces2065-1_exr/` as SMPTE ST 2065-4 compliant uncompressed half-float containers (`compression="none"`, `acesImageContainerFlag=1`, `adoptedNeutral`).
+
+### Changed
+
+- `DubItPipeline.__call__` and `TI2VidTwoStagesHQPipeline.__call__` no longer enter `torch.inference_mode()` themselves, like the other single-GPU pipelines, so they can run where gradients are recorded. The `ltx_pipelines.dubit` and `ltx_pipelines.ti2vid_two_stages_hq` CLIs still run under `inference_mode`; Python callers should wrap the call in `with torch.inference_mode():` (see [Calling pipelines from Python](packages/ltx-pipelines/docs/installation.md#calling-pipelines-from-python)).
+- `to_hdr_linear` clamps sub-black decompressed `ACEScct` values at `0.0` in `AP1` before converting to `out_primaries` (so negative `AP1` undershoot below the `ACEScct` toe intercept no longer mixes across channels when converting to `Rec.709` for `srgb_linear` EXRs and HLG masters), and preserves negative out-of-`AP1`-gamut lobes when `out_primaries=Primaries.AP0`.
+- The `ltx_kernels_inductor` compile backend also fuses bias-free linear projections followed by tanh GELU (new `LinearGELUNoBiasPass`), such as the LTX-2.5 video feed-forward. `ltx_kernels::linear_gelu` accepts `bias=None`.
+
 ## 1.6.0 - 2026-11-03
 
 ### Fixed

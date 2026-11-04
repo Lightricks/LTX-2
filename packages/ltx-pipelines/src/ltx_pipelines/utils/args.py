@@ -3,7 +3,7 @@ import enum
 import json
 import logging
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +41,7 @@ class HDRICLoraInputColorSpace(str, enum.Enum):
     SRGB = "srgb"
     ACESCG = "acescg"
     ACESCCT = "acescct"
+    ACES2065_1 = "aces2065-1"
 
 
 _VIDEO_GAMMA: dict[HDRICLoraInputColorSpace, bool] = {
@@ -52,25 +53,35 @@ _EXR_SPACES: dict[HDRICLoraInputColorSpace, EXRColorSpace] = {
     HDRICLoraInputColorSpace.SRGB: EXRColorSpace.SRGB_LINEAR,
     HDRICLoraInputColorSpace.ACESCG: EXRColorSpace.ACESCG,
     HDRICLoraInputColorSpace.ACESCCT: EXRColorSpace.ACESCCT,
+    HDRICLoraInputColorSpace.ACES2065_1: EXRColorSpace.ACES2065_1,
+}
+
+_EXR_COLOR_SPACE_ALIASES: dict[str, EXRColorSpace] = {
+    alias: cs for cs in EXRColorSpace for alias in (cs.name.lower(), cs.value)
 }
 
 _VIDEO_SUFFIXES = frozenset({".mp4", ".mov"})
+
+
+def _make_exr_colorspace_parser(flag: str, choices_display: Sequence[str]) -> Callable[[str], EXRColorSpace]:
+    """Build an argparse ``type=`` converter accepting ``EXRColorSpace`` by value or enum name."""
+
+    def _parse(value: str) -> EXRColorSpace:
+        cs = _EXR_COLOR_SPACE_ALIASES.get(value.lower())
+        if cs is None:
+            raise argparse.ArgumentTypeError(f"invalid {flag} {value!r}; choose from {', '.join(choices_display)}")
+        return cs
+
+    return _parse
 
 
 def add_hdr_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Add ``--hdr`` colour-space flag. Behaviour is implemented in ``media_io``."""
     names = [m.name for m in EXRColorSpace]
 
-    def _parse_hdr(value: str) -> EXRColorSpace:
-        key = value.upper()
-        try:
-            return EXRColorSpace[key]
-        except KeyError as exc:
-            raise argparse.ArgumentTypeError(f"invalid --hdr {value!r}; choose from {', '.join(names)}") from exc
-
     parser.add_argument(
         "--hdr",
-        type=_parse_hdr,
+        type=_make_exr_colorspace_parser("--hdr", names),
         choices=[EXRColorSpace[n] for n in names],
         default=None,
         metavar="{" + ",".join(names) + "}",
@@ -469,7 +480,7 @@ def _verify_media_path_args(namespace: argparse.Namespace) -> None:
     Rules:
     * ``--image``: a still file (``.exr`` or PNG/JPEG). Not a directory.
     * ``--video-conditioning`` / ``--video-path``: a video file or an EXR-frame folder.
-    * Any EXR still/folder requires ``--hdr {SRGB_LINEAR,ACESCG,ACESCCT}``.
+    * Any EXR still/folder requires ``--hdr {SRGB_LINEAR,ACESCG,ACESCCT,ACES2065_1}``.
     * ``--image`` + ``--video-conditioning`` (and multiples of each) must be all EXR or all
       non-EXR — no mix. ``--conditioning-attention-mask`` is always SDR and is not checked.
     * Retake ``--frame-rate``: required for EXR folders, forbidden for video files.
@@ -521,7 +532,9 @@ def _verify_media_path_args(namespace: argparse.Namespace) -> None:
             _verify_sequence_frame_rate("--video-path", video_path, namespace.frame_rate)
 
     if any(is_exr for _, _, is_exr in modality) and getattr(namespace, "hdr", None) is None:
-        raise SystemExit("EXR input requires --hdr {SRGB_LINEAR,ACESCG,ACESCCT} to declare the source colour space.")
+        raise SystemExit(
+            "EXR input requires --hdr {SRGB_LINEAR,ACESCG,ACESCCT,ACES2065_1} to declare the source colour space."
+        )
 
 
 class _PipelineArgumentParser(argparse.ArgumentParser):
@@ -1167,15 +1180,7 @@ def hdr_ic_lora_arg_parser(params: PipelineParams = LTX_2_4_PARAMS) -> argparse.
     Media checks (``--input`` / ``--input-colorspace`` / ``--frame-rate``) run inside
     :class:`_PipelineArgumentParser.parse_args`.
     """
-
-    def _parse_exr_colorspace(value: str) -> EXRColorSpace:
-        key = value.upper()
-        try:
-            return EXRColorSpace[key]
-        except KeyError as exc:
-            raise argparse.ArgumentTypeError(
-                f"invalid --exr-colorspace {value!r}; choose from {', '.join(cs.value for cs in EXRColorSpace)}"
-            ) from exc
+    exr_values = [cs.value for cs in EXRColorSpace]
 
     parser = _PipelineArgumentParser(
         description="ACEScct SDR→HDR IC-LoRA (one-stage). CLI: IDT + EXR/HLG via encode_video.",
@@ -1187,7 +1192,7 @@ def hdr_ic_lora_arg_parser(params: PipelineParams = LTX_2_4_PARAMS) -> argparse.
         required=True,
         help=(
             "One input: MP4/MOV when --input-colorspace is srgb_gamma or srgb, or a directory of "
-            "*.exr frames when srgb, acescg, or acescct. "
+            "*.exr frames when srgb, acescg, acescct, or aces2065-1. "
             "Output length matches the source; any frame count is padded to 8k+1 internally."
         ),
     )
@@ -1199,13 +1204,13 @@ def hdr_ic_lora_arg_parser(params: PipelineParams = LTX_2_4_PARAMS) -> argparse.
     )
     parser.add_argument(
         "--exr-colorspace",
-        type=_parse_exr_colorspace,
+        type=_make_exr_colorspace_parser("--exr-colorspace", exr_values),
         choices=list(EXRColorSpace),
         default=EXRColorSpace.ACESCG,
-        metavar="{" + ",".join(cs.value for cs in EXRColorSpace) + "}",
+        metavar="{" + ",".join(exr_values) + "}",
         help=(
             "Colour space of the EXR sidecar beside --output-path. "
-            "acescg / srgb_linear write scene-linear; acescct writes VAE log codes. "
+            "acescg / srgb_linear / aces2065-1 write scene-linear; acescct writes VAE log codes. "
             "HLG master is always BT.2020/HLG. Default: acescg."
         ),
     )
@@ -1233,7 +1238,9 @@ def hdr_ic_lora_arg_parser(params: PipelineParams = LTX_2_4_PARAMS) -> argparse.
         default=HDRICLoraInputColorSpace.SRGB_GAMMA,
         help=(
             "Source encoding: srgb_gamma=display MP4/MOV (EOTF→ACEScct); "
-            "srgb=linear Rec.709 MP4/MOV or EXR directory; acescg/acescct=EXR directory."
+            "srgb=linear Rec.709 MP4/MOV or EXR directory; "
+            "acescg=linear AP1 EXR directory; acescct=log AP1 EXR directory; "
+            "aces2065-1=linear AP0 EXR directory."
         ),
     )
     parser.add_argument(

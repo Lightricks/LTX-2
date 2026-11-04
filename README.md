@@ -154,7 +154,7 @@ See **[LTX-2.3 models](MODELS-LTX-2.3.md)** for the full list.
 * **[RetakePipeline](packages/ltx-pipelines/src/ltx_pipelines/retake.py)** - Regenerate a specific time region of an existing video
 * **[HDRICLoraPipeline](packages/ltx-pipelines/src/ltx_pipelines/hdr_ic_lora.py)** - Video-to-video SDR→HDR with an HDR IC-LoRA, writing a BT.2020/HLG master plus an ACEScct EXR sequence for EXR export and grading
 * **[DubItPipeline](packages/ltx-pipelines/src/ltx_pipelines/dubit.py)** - Dub-It: rephrasing while matching speaker identity and lip movements (distilled model, single IC-LoRA, two stages).
-* **Native HDR / EXR** — standard pipelines accept EXR stills and EXR-frame folders with `--hdr {SRGB_LINEAR,ACESCG,ACESCCT}` and write half EXR frames plus a BT.2020/HLG master. See [HDR Support](packages/ltx-pipelines/docs/hdr.md).
+* **Native HDR / EXR** — standard pipelines accept EXR stills and EXR-frame folders with `--hdr {SRGB_LINEAR,ACESCG,ACESCCT,ACES2065_1}` and write half EXR frames plus a BT.2020/HLG master. See [HDR Support](packages/ltx-pipelines/docs/hdr.md).
 
 ### ⚡ Optimization Tips
 

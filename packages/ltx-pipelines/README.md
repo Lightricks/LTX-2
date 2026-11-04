@@ -32,7 +32,7 @@ python -m ltx_pipelines.ti2vid_two_stages \
 
 DFR uses the **same distilled transformer** as DistilledPipeline, plus `--detailing-lora` (no `--distilled-lora`). Copy-paste commands, 4K sizes, fps, and memory: [Running DFR](docs/pipelines.md#running-dfr).
 
-See [Installation & Usage](docs/installation.md) for full setup, CLI modules, and shared flags.
+See [Installation & Usage](docs/installation.md) for full setup, CLI modules, and shared flags. To call a pipeline from Python, wrap the call in `torch.inference_mode()`: see [Calling pipelines from Python](docs/installation.md#calling-pipelines-from-python).
 
 ## 📚 Documentation
 
