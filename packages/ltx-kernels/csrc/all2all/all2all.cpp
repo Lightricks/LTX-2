@@ -12,6 +12,13 @@
  * operations on barrier counters.
  */
 
+// <Python.h> must be the first thing in the translation unit: pyconfig.h defines
+// _POSIX_C_SOURCE / _XOPEN_SOURCE unconditionally, and if glibc's <features.h> has already
+// set them to a different level (202405L on recent glibc under _GNU_SOURCE) GCC reports an
+// unnamed "redefined" warning that -Werror makes fatal. torch/python.h wraps <Python.h> in
+// push_macro / undef / pop_macro; pybind11's wrapper does not, so it must not lead.
+#include <torch/python.h>
+
 #include <ATen/cuda/CUDAContext.h>
 #include <ATen/cuda/CUDADataType.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -20,7 +27,6 @@
 #include <cuda_runtime.h>
 #include <memory>
 #include <pybind11/functional.h>
-#include <torch/python.h>
 
 #include "all2all.hpp"
 #include "cuda/api.cuh"
