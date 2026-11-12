@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.6.2 - 2026-11-12
+
+### Added
+
+- `OutOfClipGuideRepeat` (`ltx_pipelines.chunks`) selects which chunks receive an image guide outside the clip in chunked runs: `ONCE` (default) gives a guide before the clip only to the chunk owning frame 0 and one after it only to the chunk owning the last frame; `PER_CHUNK` gives it to every chunk at the same offset from that chunk's window (`-1` sits just before each window). Pass it as `out_of_clip_guides` to `images_for_chunk` / `image_conditionings_for_chunk` and `ICLoraPipeline.__call__` / `stream_chunks`, or on the `ltx_pipelines.ic_lora` CLI as `--out-of-clip-guides once|per-chunk`.
+
+### Changed
+
+- Image guides (`ImageConditioningInput.guide()`, or `.at()` / `--image` at a non-zero frame) are no longer limited to the clip: a negative `frame_idx` places the keyframe before frame 0 (e.g. `-1` for a first-frame look still) and `frame_idx >= num_frames` places it after the last frame. In chunked runs a guide before the clip goes only to the chunk that owns frame 0 and a guide after it only to the chunk that owns the last frame, at its true offset from that chunk's window. `ImageReplace` bindings must still lie inside the clip.
+
 ## 1.6.1 - 2026-11-04
 
 ### Added

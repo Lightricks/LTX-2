@@ -302,7 +302,7 @@ class DubItPipeline:
 
             def encode(enc: VideoEncoder) -> list[ConditioningItem]:
                 items = [
-                    *image_conditionings_for_chunk(chunk, images=images, video_encoder=enc),
+                    *image_conditionings_for_chunk(chunk, images=images, num_frames=num_frames, video_encoder=enc),
                     *reference_video_conditionings_for_chunk(
                         chunk,
                         video_conditioning=[(reference_video_path, reference_strength)],

@@ -65,7 +65,10 @@ class ImageReplace:
 
 @dataclass(frozen=True)
 class ImageGuide:
-    """Guide the clip with a keyframe at a zero-based decoded pixel-frame index."""
+    """Guide the clip with a keyframe at a zero-based decoded pixel-frame index.
+    The index may lie outside the clip: negative values place the keyframe before frame 0 and
+    values ``>= num_frames`` place it after the last frame.
+    """
 
     frame_idx: int
 

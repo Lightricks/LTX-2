@@ -9,6 +9,7 @@ and compose the builders they need into ``make_video_conditionings`` /
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from enum import Enum
 
 import torch
 
@@ -29,33 +30,72 @@ from ltx_pipelines.iclora_utils import (
 from ltx_pipelines.utils.helpers import image_conditionings
 from ltx_pipelines.utils.media_io import is_exr_dir
 from ltx_pipelines.utils.media_io.color_config import EXRColorSpace
-from ltx_pipelines.utils.types import LoadedImageConditioning
+from ltx_pipelines.utils.types import ImageGuide, LoadedImageConditioning
 
 
 def assert_image_frames_in_clip(images: Sequence[LoadedImageConditioning], num_frames: int) -> None:
-    """Raise if any image binding index lies outside the planned stitched clip."""
+    """Raise if any replacement index lies outside the planned stitched clip.
+    Guides are skipped: their index only sets the keyframe's RoPE time, so it may sit before
+    frame 0 (e.g. ``-1`` for a look still just before the shot) or past the last frame.
+    """
     for image in images:
-        image.assert_in_clip(num_frames)
+        if not isinstance(image.binding, ImageGuide):
+            image.assert_in_clip(num_frames)
 
 
-def images_for_chunk(chunk: Chunk, images: Sequence[LoadedImageConditioning]) -> list[LoadedImageConditioning]:
-    """Remap clip-level image inputs onto ``chunk``'s stitched kept window."""
-    local_images: list[LoadedImageConditioning] = []
-    for image in images:
-        local_image = image.map_frame_index(chunk.layout.local_frame_index)
-        if local_image is not None:
-            local_images.append(local_image)
-    return local_images
+class OutOfClipGuideRepeat(Enum):
+    """Which chunks receive an image guide whose index lies outside the stitched clip.
+    ``ONCE``: only the chunk owning the nearest clip frame (frame 0 for a guide before the clip,
+    the last frame for one past it), at its true offset from that chunk's window.
+    ``PER_CHUNK``: every chunk, at the same offset from its own window (``-1`` stays local
+    ``-1``; ``num_frames + k`` becomes local ``pixel_frames + k``), so each window sees the guide
+    the way a single-shot clip would.
+    """
+
+    ONCE = "once"
+    PER_CHUNK = "per-chunk"
+
+
+def images_for_chunk(
+    chunk: Chunk,
+    images: Sequence[LoadedImageConditioning],
+    num_frames: int,
+    out_of_clip_guides: OutOfClipGuideRepeat = OutOfClipGuideRepeat.ONCE,
+) -> list[LoadedImageConditioning]:
+    """Remap clip-level image inputs onto ``chunk``'s stitched kept window.
+    An in-clip index belongs to the one chunk whose kept window holds it. An index outside
+    ``[0, num_frames)`` is a guide (replacements are validated inside the clip) and is placed per
+    ``out_of_clip_guides``. With ``ONCE`` ownership is decided on the index clamped into the clip
+    and the local index keeps the unclamped offset from the window start (global ``-1`` stays
+    local ``-1``).
+    """
+
+    def to_local(global_idx: int) -> int | None:
+        if out_of_clip_guides is OutOfClipGuideRepeat.PER_CHUNK:
+            if global_idx < 0:
+                return global_idx
+            if global_idx >= num_frames:
+                return chunk.layout.pixel_frames + global_idx - num_frames
+        owner_idx = min(max(global_idx, 0), num_frames - 1)
+        if chunk.layout.local_frame_index(owner_idx) is None:
+            return None
+        return global_idx - chunk.layout.start_pixel_frame
+
+    return [local for image in images if (local := image.map_frame_index(to_local)) is not None]
 
 
 def image_conditionings_for_chunk(
     chunk: Chunk,
     *,
     images: Sequence[LoadedImageConditioning],
+    num_frames: int,
     video_encoder: VideoEncoder,
+    out_of_clip_guides: OutOfClipGuideRepeat = OutOfClipGuideRepeat.ONCE,
 ) -> list[ConditioningItem]:
-    """Encode image conditionings that land in ``chunk``, at its current latent spatial size."""
-    local = images_for_chunk(chunk, images)
+    """Encode image conditionings that land in ``chunk``, at its current latent spatial size.
+    See :func:`images_for_chunk` for ``out_of_clip_guides``.
+    """
+    local = images_for_chunk(chunk, images, num_frames, out_of_clip_guides)
     if not local or chunk.video is None:
         return []
     height, width = _pixel_hw(chunk)

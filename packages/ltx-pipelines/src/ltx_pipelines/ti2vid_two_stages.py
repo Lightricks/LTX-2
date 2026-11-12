@@ -302,12 +302,13 @@ class TI2VidTwoStagesPipeline:
         assert_image_frames_in_clip(images, num_frames)
 
         def make(chunk: Chunk) -> list[ConditioningItem]:
-            if chunk.video is None or not images_for_chunk(chunk, images):
+            if chunk.video is None or not images_for_chunk(chunk, images, num_frames):
                 return []
             return self.image_conditioner(
                 lambda enc: image_conditionings_for_chunk(
                     chunk,
                     images=images,
+                    num_frames=num_frames,
                     video_encoder=enc,
                 )
             )

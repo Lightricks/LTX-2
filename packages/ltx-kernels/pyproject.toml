@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ltx-kernels"
-version = "1.6.1"
+version = "1.6.2"
 license = "Apache-2.0"
 dependencies = [
     "torch",

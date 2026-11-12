@@ -13,7 +13,7 @@ from ltx_core.loader import LTXV_LORA_COMFY_RENAMING_MAP, LoraPathStrengthAndSDO
 from ltx_core.model.transformer.compiling import CompilationConfig
 from ltx_core.model.video_vae.transformer import DiffVAEMode
 from ltx_core.quantization import QuantizationPolicy
-from ltx_pipelines.chunks import ChunkConfig
+from ltx_pipelines.chunks import ChunkConfig, OutOfClipGuideRepeat
 from ltx_pipelines.marking import AudioMarker, VideoMarker, create_markers
 from ltx_pipelines.utils.constants import (
     DEFAULT_LORA_STRENGTH,
@@ -1070,6 +1070,26 @@ def add_keyframe_decode_arg(parser: argparse.ArgumentParser) -> argparse.Argumen
             "Decode the output video through the keyframe-aware DiffVAE path, using the "
             "generated keyframe slots as anchors. Requires --num-generated-keyframes > 0 and "
             "a keyframe-trained video VAE. Conv VAEs log a warning and decode without anchors."
+        ),
+    )
+    return parser
+
+
+def add_out_of_clip_guides_arg(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Add ``--out-of-clip-guides`` to a chunked pipeline that forwards it to its image conditionings.
+    Opt-in per CLI so the flag is only advertised where it takes effect.
+    """
+    parser.add_argument(
+        "--out-of-clip-guides",
+        type=OutOfClipGuideRepeat,
+        choices=list(OutOfClipGuideRepeat),
+        default=OutOfClipGuideRepeat.ONCE,
+        metavar="{" + ",".join(policy.value for policy in OutOfClipGuideRepeat) + "}",
+        help=(
+            "Which chunks get an --image guide placed outside the clip (e.g. frame -1) when chunking. "
+            "'once' (default): only the first chunk for a guide before the clip, only the last chunk "
+            "for one past it. 'per-chunk': every chunk, at the same offset from its own window "
+            "(-1 sits just before each chunk). Has no effect on a single-window run."
         ),
     )
     return parser

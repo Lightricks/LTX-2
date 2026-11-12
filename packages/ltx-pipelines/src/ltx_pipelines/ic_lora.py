@@ -33,6 +33,7 @@ from ltx_pipelines.chunks import (
     spatially_upsample_chunks,
 )
 from ltx_pipelines.chunks.conditionings import (
+    OutOfClipGuideRepeat,
     assert_image_frames_in_clip,
     image_conditionings_for_chunk,
     reference_video_conditionings_for_chunk,
@@ -48,6 +49,7 @@ from ltx_pipelines.utils.args import (
     add_chunk_layout_args,
     add_generated_keyframes_arg,
     add_keyframe_decode_arg,
+    add_out_of_clip_guides_arg,
     chunk_config_from_args,
     default_2_stage_distilled_arg_parser,
     markers_from_args,
@@ -305,6 +307,7 @@ class _ICLoraRunContext:
     decode_with_keyframes: bool
     color_space: EXRColorSpace | None
     chunk_config: ChunkConfig
+    out_of_clip_guides: OutOfClipGuideRepeat
     encoded_audio: EncodedAudio | None
 
 
@@ -480,6 +483,7 @@ class ICLoraPipeline:
         generated_keyframes: int | Sequence[int] = 0,
         decode_with_keyframes: bool = False,
         chunk_config: ChunkConfig | None = None,
+        out_of_clip_guides: OutOfClipGuideRepeat = OutOfClipGuideRepeat.ONCE,
         audio: AudioInput | None = None,
     ) -> _ICLoraRunContext:
         enhance_prompt_image = images[0].path if images else None
@@ -564,6 +568,7 @@ class ICLoraPipeline:
             decode_with_keyframes=decode_with_keyframes,
             color_space=color_space,
             chunk_config=chunk_config,
+            out_of_clip_guides=out_of_clip_guides,
             encoded_audio=encoded_audio,
         )
 
@@ -585,7 +590,9 @@ class ICLoraPipeline:
                     *image_conditionings_for_chunk(
                         chunk,
                         images=ctx.images,
+                        num_frames=ctx.num_frames,
                         video_encoder=enc,
+                        out_of_clip_guides=ctx.out_of_clip_guides,
                     ),
                     *reference_video_conditionings_for_chunk(
                         chunk,
@@ -648,6 +655,7 @@ class ICLoraPipeline:
         decode_with_keyframes: bool = False,
         color_space: EXRColorSpace | None = None,
         chunk_config: ChunkConfig | None = None,
+        out_of_clip_guides: OutOfClipGuideRepeat = OutOfClipGuideRepeat.ONCE,
         audio: AudioInput | None = None,
         refine_audio: bool = True,
     ) -> PipelineOutput:
@@ -685,6 +693,9 @@ class ICLoraPipeline:
                 overlap planes into the following chunk as fixed keyframe conditioning.
             chunk_config: Optional temporal chunk layout. ``None`` plans one window over
                 the snapped clip (same output as before chunk streaming existed).
+            out_of_clip_guides: Which chunks receive an image guide outside the clip
+                (e.g. ``frame_idx=-1``): ``ONCE`` (default) gives it only to the first or
+                last chunk, ``PER_CHUNK`` to every chunk at the same offset from its window.
             audio: Optional source audio (or the audio track of a video). When set, its
                 audio VAE latent is stage 1's frozen target audio. It must cover
                 ``num_frames / frame_rate`` seconds from ``audio.start_time``.
@@ -718,6 +729,7 @@ class ICLoraPipeline:
             decode_with_keyframes=decode_with_keyframes,
             color_space=color_space,
             chunk_config=chunk_config,
+            out_of_clip_guides=out_of_clip_guides,
             audio=audio,
             refine_audio=refine_audio,
         )
@@ -746,6 +758,7 @@ class ICLoraPipeline:
         decode_with_keyframes: bool = False,
         color_space: EXRColorSpace | None = None,
         chunk_config: ChunkConfig | None = None,
+        out_of_clip_guides: OutOfClipGuideRepeat = OutOfClipGuideRepeat.ONCE,
         audio: AudioInput | None = None,
         refine_audio: bool = True,
     ) -> tuple[Iterator[PlaybackSegment], int, TilingConfig]:
@@ -779,6 +792,7 @@ class ICLoraPipeline:
             generated_keyframes=generated_keyframes,
             decode_with_keyframes=decode_with_keyframes,
             chunk_config=chunk_config,
+            out_of_clip_guides=out_of_clip_guides,
             audio=audio,
         )
         encoded_audio = ctx.encoded_audio
@@ -901,8 +915,10 @@ class ICLoraPipeline:
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     params = resolve_cli_params(distilled=True)
-    parser = add_chunk_layout_args(
-        add_keyframe_decode_arg(add_generated_keyframes_arg(default_2_stage_distilled_arg_parser(params=params)))
+    parser = add_out_of_clip_guides_arg(
+        add_chunk_layout_args(
+            add_keyframe_decode_arg(add_generated_keyframes_arg(default_2_stage_distilled_arg_parser(params=params)))
+        )
     )
     parser.add_argument(
         "--video-conditioning",
@@ -1064,6 +1080,7 @@ def main() -> None:
             generated_keyframes=args.num_generated_keyframes,
             decode_with_keyframes=args.decode_with_keyframes,
             chunk_config=chunk_config,
+            out_of_clip_guides=args.out_of_clip_guides,
             audio=None if args.audio_path is None else AudioInput(Path(args.audio_path), args.audio_start_time),
             refine_audio=args.refine_audio,
         )

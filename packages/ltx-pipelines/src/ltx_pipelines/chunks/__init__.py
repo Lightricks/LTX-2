@@ -1,6 +1,7 @@
 """Long-video chunk generation: Chunk wire, conditioning factories, and chunk operators."""
 
 from ltx_pipelines.chunks.audio import stitch_audio
+from ltx_pipelines.chunks.conditionings import OutOfClipGuideRepeat
 from ltx_pipelines.chunks.export import (
     SequentialVideoFrameSource,
     pipeline_output_from_chunks,
@@ -36,6 +37,7 @@ __all__ = [
     "GeneratedKeyframes",
     "MakeAudioConditionings",
     "MakeVideoConditionings",
+    "OutOfClipGuideRepeat",
     "PlaybackSegment",
     "SequentialVideoFrameSource",
     "VideoConditioningsWithGeneratedKeyframes",
