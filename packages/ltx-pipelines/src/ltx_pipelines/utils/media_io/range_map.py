@@ -12,15 +12,22 @@ def normalize_images(images: torch.Tensor, device: torch.device, dtype: torch.dt
 def to_vae_range(x: torch.Tensor) -> torch.Tensor:
     """Map [0, 1] working-space codes to [-1, 1] (VAE input convention).
     Raises:
-        ValueError: If a host ``x`` is outside ``[0, 1]`` (callers must compress or
-            already hold valid working-space codes — this does not clamp). A CUDA ``x`` is
+        ValueError: If a host ``x`` is non-finite or outside ``[0, 1]`` (callers must compress
+            or already hold valid working-space codes — this does not clamp). A CUDA ``x`` is
             checked asynchronously: a violation fails the stream with a device-side assert.
     """
     if x.is_cuda:
         # Checked on the device: reading the result back would wait for every queued kernel.
-        torch._assert_async(((x >= 0) & (x <= 1)).all(), "to_vae_range expects values in [0, 1]")
-    elif bool((x < 0).any() or (x > 1).any()):
-        raise ValueError(f"to_vae_range expects values in [0, 1]; got min={float(x.min())}, max={float(x.max())}")
+        # NaN makes both comparisons false, so it needs its own check.
+        torch._assert_async(
+            (torch.isfinite(x) & (x >= 0) & (x <= 1)).all(),
+            "to_vae_range expects finite values in [0, 1]",
+        )
+    elif not bool((torch.isfinite(x) & (x >= 0) & (x <= 1)).all()):
+        raise ValueError(
+            f"to_vae_range expects finite values in [0, 1]; "
+            f"got min={float(x.min())}, max={float(x.max())}"
+        )
     return x * 2.0 - 1.0
 
 
