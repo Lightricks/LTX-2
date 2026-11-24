@@ -112,11 +112,6 @@ class SequenceParallelBuilder(Generic[_Model]):
         return self.base.model_config()
 
     @property
-    def keeps_gpu_resident_weights(self) -> bool:
-        """The registry reuses the bound device allocation across builds."""
-        return True
-
-    @property
     def builds_per_shape(self) -> bool:
         """A built model serves any latent shape."""
         return False
@@ -168,11 +163,6 @@ class TiledDataParallelBuilder(Generic[_Model]):
     def model_config(self) -> dict[str, object]:
         """Read checkpoint configuration through the base builder."""
         return self.base.model_config()
-
-    @property
-    def keeps_gpu_resident_weights(self) -> bool:
-        """The registry reuses the bound device allocation across builds."""
-        return True
 
     @property
     def builds_per_shape(self) -> bool:
@@ -305,11 +295,6 @@ class BatchParallelGemmaBuilder:
         return self.base.model_config()
 
     @property
-    def keeps_gpu_resident_weights(self) -> bool:
-        """Each build loads the encoder through the base builder."""
-        return False
-
-    @property
     def builds_per_shape(self) -> bool:
         """A built encoder serves any prompt batch."""
         return False
@@ -427,11 +412,6 @@ class AccelerateGemmaBuilder:
     def model_config(self) -> dict[str, object]:
         """Read checkpoint configuration through the base builder."""
         return self.base.model_config()
-
-    @property
-    def keeps_gpu_resident_weights(self) -> bool:
-        """Weights are dispatched by device map, outside the unit loader's storage."""
-        return False
 
     @property
     def builds_per_shape(self) -> bool:

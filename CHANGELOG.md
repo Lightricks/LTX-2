@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.6.3 - 2026-11-24
+
+### Added
+
+- `DiffusionStage.with_active_weights(active_weights)` returns a copy of the stage whose builds share `active_weights`. Give a pipeline's stages one dict to capture CUDA graphs on a single GPU, e.g. `pipeline.stage = pipeline.stage.with_active_weights({})`. The allocation is separate from weights a `ModelRegistry` retains, so a registry that keeps clean weights on the GPU holds the transformer twice.
+
+### Changed
+
+- The CUDA-graph check (`CompilationConfig(capture=True)`, `mode=reduce-overhead` / `max-autotune`) accepts a `DiffusionStage` on a CUDA device given `active_weights`: the stage's builds bind to that one allocation, which stays assigned between calls until `release_transformer()`. A resident single-GPU stage can now capture CUDA graphs; it used to raise `ValueError`.
+
+### Removed
+
+- `keeps_gpu_resident_weights` from the `ModelBuilder` protocol and every builder: `DiffusionStage` decides CUDA-graph compatibility and whether a build stays assigned from the weight lifetime its caller sets up (`active_weights`, or the `dst` of `SequenceParallelBuilder` / `TiledDataParallelBuilder`).
+
+### Fixed
+
+- CUDA-graph compile modes combined with weight offloading (`--offload cpu|disk`, `StreamingBuilder`) raise `ValueError` instead of being accepted: streamed weights move through reusable device buffers on every call, so a replayed graph read whatever those buffers held. Compile offloaded stages with a non-capturing mode.
+
 ## 1.6.2 - 2026-11-12
 
 ### Added

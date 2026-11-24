@@ -252,11 +252,6 @@ class SimpleBuilder(Generic[_Model]):
         return replace(self, placement_policy=policy)
 
     @property
-    def keeps_gpu_resident_weights(self) -> bool:
-        """Whether this builder guarantees stable GPU weight storage across builds."""
-        return False
-
-    @property
     def builds_per_shape(self) -> bool:
         """Whether a built model serves only the latent shape it was built for."""
         return False

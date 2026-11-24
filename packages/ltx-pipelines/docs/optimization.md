@@ -85,26 +85,23 @@ Compiling the transformer blocks with `torch.compile` speeds up inference. It is
 # Defaults (compile only; no CUDA graphs). Fine with --offload none.
 python -m ltx_pipelines.ti2vid_two_stages --compile --checkpoint-path=...
 
-# CUDA-graph inductor modes: on single GPU add --offload cpu (or disk)
-python -m ltx_pipelines.ti2vid_two_stages \
-    --compile mode=max-autotune fullgraph=true dynamic=true --checkpoint-path=... \
-    --offload cpu
+# CUDA-graph inductor modes (the SP/TDP runners and DFR share one weight allocation; see below)
+python -m ltx_pipelines.ti2vid_two_stages_mgpu \
+    --compile mode=max-autotune fullgraph=true dynamic=true --checkpoint-path=...
 
 # Self-managed block-loop CUDA-graph capture (private static inputs per captured shape)
-python -m ltx_pipelines.distilled \
-    --compile capture=true --distilled-checkpoint-path=... \
-    --offload cpu
+python -m ltx_pipelines.distilled_mgpu \
+    --compile capture=true --distilled-checkpoint-path=...
 
 # Same, with one shared static-input pool sized for this rank's largest shape
-python -m ltx_pipelines.distilled \
+python -m ltx_pipelines.distilled_mgpu \
     --compile capture=true max_video_tokens=24576 max_audio_tokens=128 \
-    --distilled-checkpoint-path=... \
-    --offload cpu
+    --distilled-checkpoint-path=...
 ```
 
 | Field | Values | Default | Notes |
 | ----- | ------ | ------- | ----- |
-| `mode` | `none`, `reduce-overhead`, `max-autotune`, … | `none` | `reduce-overhead`/`max-autotune` enable PyTorch CUDA graphs. On single GPU they need `--offload cpu` or `disk` (see below); the SP/TDP runners already qualify |
+| `mode` | `none`, `reduce-overhead`, `max-autotune`, … | `none` | `reduce-overhead`/`max-autotune` enable PyTorch CUDA graphs. They need a stage whose builds share one weight allocation (see below): the SP/TDP runners and DFR qualify; `--offload` does not |
 | `backend` | `inductor`, `eager`, … | `inductor` | |
 | `fullgraph` | `true`/`false` | `false` | |
 | `dynamic` | `auto`/`true`/`false` | `auto` | the seq dim is marked dynamic separately (see `seq_dim_dynamic`) |
@@ -112,7 +109,7 @@ python -m ltx_pipelines.distilled \
 | `dynamo_config` | JSON object or path to a `.json` | `{"inline_inbuilt_nn_modules": true, "cache_size_limit": 256}` | `torch._dynamo.config` overrides |
 | `seq_dim_dynamic` | `true`/`false` | `true` | mark the block's sequence dim dynamic so one artifact serves any token count; `false` recompiles per token count |
 | `recompile_perturbed_block` | `true`/`false` | `true` | `true` recompiles a separate block graph for the STG-perturbed pass; `false` attaches unconditional runtime masks so the block traces once (single graph) |
-| `capture` | `true`/`false` | `false` | per-block compile + one CUDA graph over the block loop (keyed by shape and perturbation signature). Faster cold-start than `mode=reduce-overhead`. Same single-GPU `--offload` requirement as those modes. Each replay copies activations into **static input buffers**, then runs the graph |
+| `capture` | `true`/`false` | `false` | per-block compile + one CUDA graph over the block loop (keyed by shape and perturbation signature). Faster cold-start than `mode=reduce-overhead`. Same weight-allocation requirement as those modes. Each replay copies activations into **static input buffers**, then runs the graph |
 | `max_video_tokens` | positive integer | `0` | `capture` only: size of the shared **video input** pool (latent tokens, not pixels). `0`: each captured shape keeps its own input buffers. Set to this rank's largest video token count so every shape copies into one pool |
 | `max_audio_tokens` | positive integer | `0` | same, for the audio-input pool. For audio+video jobs that share pools, set both |
 
@@ -120,7 +117,7 @@ python -m ltx_pipelines.distilled \
 
 Capture freezes two kinds of GPU address. They are independent:
 
-**Weight storages (whether capture can run).** Default `--offload none` rebuilds each stage onto **new** GPU weight tensors and raises (`keeps_gpu_resident_weights`). On single GPU, `--offload cpu` or `--offload disk` selects the streaming builder, which reuses the same GPU weight slots across rebuilds. The SP/TDP multi-GPU runners already do this through one shared set of active weights. A model registry by itself does not: the CLI already uses one, and it still raises. `--offload` is not sizing activations.
+**Weight storages (whether capture can run).** Capture needs every build to reuse the GPU weight tensors it recorded, so the stage checks the weight lifetime its caller set up. Default `--offload none` rebuilds each stage onto **new** GPU weight tensors and raises. `--offload cpu` or `disk` also raises: the streaming builder moves weights through device slots on every call, so a graph would replay against whatever the slots held at capture time. The SP/TDP multi-GPU runners share one set of active weights (the builders' `dst`), and DFR shares `active_weights` across its passes. From Python, any CUDA `DiffusionStage` given an `active_weights` dict qualifies: its builds bind to that one allocation, which stays assigned between calls until `release_transformer()`. A model registry by itself does not: the CLI already uses one, and it still raises. The `active_weights` allocation is separate from any weights the registry retains: with a registry whose `RetentionPolicy` keeps clean weights on the GPU, the transformer is held twice (about 35 GiB more for the 22B transformer in bf16). `--offload` is not sizing activations.
 
 **Static input pool (`max_video_tokens` / `max_audio_tokens`).** These flags size the **input** buffers every capture copies into — not the weights. Leave both at `0` and each captured shape allocates its own input set (cost grows with the number of shapes: stage-1, stage-2, DFR tiles, …). Set them to this rank's **largest** token counts and every capture shares one pool sized for that max, so input-buffer VRAM is one shape, not the sum. Too small raises (the capture does not fit the pool). Too large only wastes VRAM. Multi-GPU: the count is what **this rank** denoises after the sequence split, overlap included. Perturbation `block_masks` always share one process-wide pool.
 
@@ -156,14 +153,19 @@ python -m ltx_pipelines.ti2vid_two_stages \
 **Programmatically**, pass a `CompilationConfig` to the pipeline:
 
 ```python
+import torch
+
 from ltx_core.model.transformer.compiling import CompilationConfig
-from ltx_pipelines.utils.types import OffloadMode
 
 pipeline = TI2VidTwoStagesPipeline(
     ...,
     compilation_config=CompilationConfig(mode="reduce-overhead"),
-    offload_mode=OffloadMode.CPU,  # required on single GPU for CUDA-graph modes
 )
+# CUDA-graph modes need every build to reuse one weight allocation: share one active_weights dict across the
+# stages (stage 2 switches the distilled LoRA in place on the same storage).
+active_weights: dict[str, torch.Tensor] = {}
+pipeline.stage_1 = pipeline.stage_1.with_active_weights(active_weights)
+pipeline.stage_2 = pipeline.stage_2.with_active_weights(active_weights)
 ```
 
 **Faster cache loads: `unsafe_skip_cache_dynamic_shape_guards` (unsafe, opt-in).** Inductor's FX-graph cache re-checks the dynamic-shape guards stored with each entry on every lookup. Setting this flag skips that re-check (every entry is treated as a guard hit), which speeds up warm and cross-process cache loads. It is **not enabled by default** because it is a correctness hazard: a kernel first compiled at a small sequence length keeps int32 address arithmetic, and reusing it at a larger sequence length (roughly **>58k tokens/rank**) overflows int32 and reads out of bounds - surfacing as a CUDA illegal memory access or silently corrupted output. Only enable it when your token counts stay within the range the cached kernels were compiled for:

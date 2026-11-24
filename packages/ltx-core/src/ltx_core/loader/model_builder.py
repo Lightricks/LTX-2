@@ -32,11 +32,6 @@ class ModelBuilder(Protocol[_Model_co]):
         ...
 
     @property
-    def keeps_gpu_resident_weights(self) -> bool:
-        """Whether this builder guarantees stable GPU weight storage across builds."""
-        ...
-
-    @property
     def builds_per_shape(self) -> bool:
         """Whether a built model serves only the latent shape it was built for."""
         ...

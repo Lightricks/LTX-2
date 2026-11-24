@@ -35,7 +35,7 @@ class CompilationConfig:
     """``torch.compile`` configuration for transformer blocks. ``None`` keeps eager."""
 
     # torch.compile mode (e.g. "reduce-overhead"); None = default.
-    # reduce-overhead / max-autotune require GPU-resident weights (keeps_gpu_resident_weights).
+    # reduce-overhead / max-autotune require builds that reuse one GPU weight allocation (see DiffusionStage).
     mode: str | None = None
     # torch.compile backend
     backend: str = "inductor"
@@ -52,8 +52,8 @@ class CompilationConfig:
     # True: separate graph for guidance pass; False: single runtime-masked graph
     recompile_perturbed_block: bool = True
     # True: per-block compile + one CUDA graph over the block loop. Faster cold start
-    # than reduce-overhead's 48-block cudagraph tree. Requires GPU-resident weights
-    # (keeps_gpu_resident_weights).
+    # than reduce-overhead's 48-block cudagraph tree. Requires builds that reuse one GPU weight
+    # allocation (see DiffusionStage).
     capture: bool = False
     # Largest video / audio token count the job denoises, used ONLY under `capture` to size the
     # static input buffers every CUDA-graph capture shares, so their cost is that of the largest

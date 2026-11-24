@@ -59,6 +59,8 @@ from ltx_pipelines.utils.types import Denoiser, ModalitySpec, OffloadMode, Video
 
 logger = logging.getLogger(__name__)
 
+_CUDAGRAPH_MODES = frozenset({"reduce-overhead", "max-autotune"})
+
 ModelWrapper = Callable[[torch.nn.Module, LatentTools | None], torch.nn.Module]
 """Wraps a built transformer for one :meth:`DiffusionStage.__call__` (see
 :meth:`DiffusionStage.with_model_wrapper`). Must keep the
@@ -75,12 +77,14 @@ def _unit_lora_request(lora: LoraPathStrengthAndSDOps) -> LoRARequest:
 
 class DiffusionStage:
     """Owns transformer lifecycle. Builds on each call, frees on exit.
-    Under ``AllocatorTrimStrategy.DEFER`` a builder whose weights the registry keeps GPU-resident
-    (``keeps_gpu_resident_weights``) leaves its build assigned instead: every build reassigns those
-    weights, so a dispose would release no memory.
     Stages given one ``active_weights`` dict share one transformer allocation: the first build fills it, and
     later builds, also of copies made with ``with_loras`` and similar, reuse the registry's bound model or rewrite
     only the weights an adapter switch touches. Those builds stay assigned until :meth:`release_transformer`.
+    A :class:`SequenceParallelBuilder` / :class:`TiledDataParallelBuilder` binds to its own ``dst`` dict instead,
+    and under ``AllocatorTrimStrategy.DEFER`` its build stays assigned too.
+    CUDA-graph compilation requires one of these caller-owned allocations on a CUDA device, so every build
+    reuses the weight storage a capture recorded. A :class:`StreamingBuilder` moves weights through device
+    slots on every call and is rejected.
     Replaces the manual build-transformer / ``del transformer`` pattern that
     every pipeline previously repeated.
     """
@@ -298,6 +302,15 @@ class DiffusionStage:
         new._quantization = quantization
         return new
 
+    def with_active_weights(self, active_weights: dict[str, torch.Tensor] | None) -> "DiffusionStage":
+        """Return a new ``DiffusionStage`` whose builds share ``active_weights`` (see the class docstring).
+        Functional: never mutates ``self``. Copies made from the result share the same dict, so they
+        share one transformer allocation until :meth:`release_transformer`.
+        """
+        new = copy.copy(self)
+        new._active_weights = active_weights
+        return new
+
     def with_loras(self, loras: tuple[LoraPathStrengthAndSDOps, ...]) -> "DiffusionStage":
         """Return a new ``DiffusionStage`` built with exactly ``loras`` (replacing the current set)."""
         builder = self._transformer_builder
@@ -316,7 +329,7 @@ class DiffusionStage:
         ``StreamingBuilder`` stays one).
         """
         builder = self._transformer_builder
-        _ensure_cudagraph_compatible_builder(builder, self._compilation_config)
+        self._ensure_cudagraph_compatible()
         prepared = builder if isinstance(builder, SimpleBuilder) else builder.base
         if self._quantization is not None:
             prepared = compose_quantization(prepared, self._quantization)
@@ -347,6 +360,28 @@ class DiffusionStage:
         return self._active_weights is not None and isinstance(self._transformer_builder, SimpleBuilder)
 
     @property
+    def _binds_active_weights(self) -> bool:
+        """Whether every build binds the transformer to one caller-owned allocation."""
+        return self._shares_weights or isinstance(
+            self._transformer_builder, (SequenceParallelBuilder, TiledDataParallelBuilder)
+        )
+
+    def _ensure_cudagraph_compatible(self) -> None:
+        """CUDA-graph compile paths need builds that reuse one GPU weight allocation."""
+        config = self._compilation_config
+        if config is None or not (config.capture or config.mode in _CUDAGRAPH_MODES):
+            return
+        if self._binds_active_weights and self._device.type == "cuda":
+            return
+        raise ValueError(
+            "CompilationConfig capture / mode=reduce-overhead|max-autotune requires every build to reuse one "
+            "GPU weight allocation: a CUDA DiffusionStage given active_weights, or a SequenceParallelBuilder / "
+            "TiledDataParallelBuilder. A plain SimpleBuilder rebuilds onto new tensors, and a StreamingBuilder "
+            "moves streamed weights through device slots on every call; either invalidates CUDA graphs "
+            "(or recaptures repeatedly until Dynamo gives up). Use a non-capturing compile mode with offloading."
+        )
+
+    @property
     def _is_streaming(self) -> bool:
         """Whether the configured builder uses unit streaming."""
         return isinstance(self._transformer_builder, StreamingBuilder)
@@ -370,11 +405,8 @@ class DiffusionStage:
         if self._shares_weights:
             # The shared allocation outlives the call; release_transformer frees it.
             return nullcontext(transformer)
-        if self._transformer_builder.keeps_gpu_resident_weights and (
-            self._alloc_trim_strategy == AllocatorTrimStrategy.DEFER
-        ):
-            # The registry keeps these weights resident and every build reassigns them, so a
-            # dispose would release no memory.
+        if self._binds_active_weights and self._alloc_trim_strategy == AllocatorTrimStrategy.DEFER:
+            # Every build rebinds the builder's dst allocation, so a dispose would release no memory.
             return nullcontext(transformer)
         return gpu_model(transformer, alloc_trim_strategy=self._alloc_trim_strategy)
 
@@ -516,26 +548,6 @@ class RecordingDiffusionStage:
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._stage, name)
-
-
-def _ensure_cudagraph_compatible_builder(
-    builder: ModelBuilder,
-    compilation_config: CompilationConfig | None,
-) -> None:
-    """CUDA-graph compile paths need GPU-resident weights across dispose/rebuild."""
-    if compilation_config is None:
-        return
-    cudagraph_modes = frozenset({"reduce-overhead", "max-autotune"})
-    needs_resident = compilation_config.capture or compilation_config.mode in cudagraph_modes
-    if not needs_resident or isinstance(builder, StreamingBuilder) or builder.keeps_gpu_resident_weights:
-        return
-    raise ValueError(
-        "CompilationConfig capture / mode=reduce-overhead|max-autotune requires a builder "
-        "with keeps_gpu_resident_weights=True (SequenceParallelBuilder / "
-        "TiledDataParallelBuilder, or StreamingBuilder). "
-        "The default SimpleBuilder does not promise stable GPU weight storage across stages, "
-        "which invalidates CUDA graphs (or repeatedly recaptures until Dynamo gives up)."
-    )
 
 
 def _build_state(

@@ -172,11 +172,6 @@ class StreamingBuilder:
         return self.base.model_config()
 
     @property
-    def keeps_gpu_resident_weights(self) -> bool:
-        """Streamed weights move through device slots allocated per build."""
-        return False
-
-    @property
     def builds_per_shape(self) -> bool:
         """A built model serves any latent shape."""
         return False

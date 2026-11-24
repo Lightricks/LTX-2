@@ -89,11 +89,6 @@ class DistributedDecoderBuilder:
         return self._inner.module_ops
 
     @property
-    def keeps_gpu_resident_weights(self) -> bool:
-        """Each build loads the decoder through the inner builder."""
-        return False
-
-    @property
     def builds_per_shape(self) -> bool:
         """A built decoder serves any latent shape."""
         return False

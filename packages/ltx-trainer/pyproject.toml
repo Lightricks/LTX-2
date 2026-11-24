@@ -1,6 +1,6 @@
 [project]
 name = "ltx-trainer"
-version = "1.6.2"
+version = "1.6.3"
 description = "LTX-2 training, democratized."
 readme = "README.md"
 license = "Apache-2.0"
