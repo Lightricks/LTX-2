@@ -269,5 +269,5 @@ def _audio_mask_to_latent(mask_file: Path, latent_t: int) -> torch.Tensor | None
     # Resample to target audio latent length
     mask_resampled = torch.nn.functional.interpolate(
         raw_mask.unsqueeze(0).unsqueeze(0), size=latent_t, mode="nearest"
-    ).squeeze()  # [latent_t]
+    ).reshape(latent_t)
     return (mask_resampled > 0.5).float()
