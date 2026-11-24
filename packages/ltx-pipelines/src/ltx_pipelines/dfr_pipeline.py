@@ -258,6 +258,7 @@ class DFRPipeline:
             return stage
         return stage.with_quantization(with_rowwise_fp8_gemm(policy))
 
+    @torch.inference_mode()
     def __call__(  # noqa: PLR0913, PLR0915
         self,
         prompt: str,
