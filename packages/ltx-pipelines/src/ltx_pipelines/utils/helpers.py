@@ -597,10 +597,13 @@ def assert_resolution(height: int, width: int, is_two_stage: bool, *, divisor: i
     if divisor is None:
         divisor = 64 if is_two_stage else 32
     if height % divisor != 0 or width % divisor != 0:
+        nearest_height = max(1, (height + divisor // 2) // divisor) * divisor
+        nearest_width = max(1, (width + divisor // 2) // divisor) * divisor
         raise ValueError(
             f"Resolution ({height}x{width}) is not divisible by {divisor}. "
             f"For {'two-stage' if is_two_stage else 'one-stage'} pipelines, "
-            f"height and width must be multiples of {divisor}."
+            f"height and width must be multiples of {divisor}. "
+            f"Try height={nearest_height}, width={nearest_width}."
         )
 
 
